@@ -173,6 +173,9 @@ a:focus-visible {
 }
 
 .compat-link {
+  border: 0;
+  background: transparent;
+  padding: 0;
   color: #586b7c;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 9px;

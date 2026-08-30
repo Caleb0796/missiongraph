@@ -5,6 +5,7 @@ interface PulseBarProps {
   eta: number
   counts: Record<DisplayState, number>
   onCatchUp: () => void
+  onReset: () => void
   replaying: boolean
   connectionMode: ConnectionMode
   connectionMessage: string
@@ -24,6 +25,7 @@ export function PulseBar({
   eta,
   counts,
   onCatchUp,
+  onReset,
   replaying,
   connectionMode,
   connectionMessage,
@@ -90,6 +92,9 @@ export function PulseBar({
         <a href="/compat" className="compat-link">
           Compat
         </a>
+        <button type="button" className="compat-link" onClick={onReset}>
+          Reset
+        </button>
         {import.meta.env.DEV && (
           <a href="/tools" className="compat-link">
             Tools

@@ -12,14 +12,16 @@ import {
   type MutationOptions,
   useMissionStore,
 } from '../store/mission-store'
+import {
+  configuredServer,
+  parseStoredIdentity,
+  realtimeTransport,
+  shouldReplaceStoredIdentity,
+  type ClientIdentity,
+} from './client-logic'
 
-const DEFAULT_SERVER = 'http://127.0.0.1:31337'
 const SESSION_KEY = 'missiongraph.session-id'
-
-interface ClientIdentity {
-  project: string
-  token: string
-}
+const IDENTITY_KEY = 'missiongraph.visitor-identity'
 
 interface CloneResponse extends ClientIdentity {
   cursor: string
@@ -32,6 +34,10 @@ interface SnapshotResponse {
 
 interface MutationResponse {
   seq: number
+}
+
+interface BatchMutationResponse {
+  seqs: number[]
 }
 
 interface ErrorBody {
@@ -52,11 +58,20 @@ export class TransportError extends Error {
   }
 }
 
-const logicalServer = (import.meta.env.VITE_MG_SERVER ?? DEFAULT_SERVER).replace(
-  /\/$/,
-  '',
-)
-const requestBase = import.meta.env.DEV ? '/mg' : logicalServer
+const serverConfiguration = (() => {
+  try {
+    return {
+      ...configuredServer(import.meta.env.VITE_MG_SERVER, import.meta.env.DEV),
+      error: null,
+    }
+  } catch (error) {
+    return {
+      logicalServer: null,
+      requestBase: null,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+})()
 const debounceTimers = new Map<
   string,
   { timer: number; resolve: (cursor: number) => void }
@@ -64,9 +79,15 @@ const debounceTimers = new Map<
 let identity: ClientIdentity | null = null
 let seededDevProject = false
 let socket: WebSocket | null = null
+let eventSource: EventSource | null = null
 let reconnectTimer: number | null = null
+let failedWebSockets = 0
 let mutationQueue = Promise.resolve()
 let initialization: Promise<void> | null = null
+
+export type MutationBatchItem = {
+  [T in EvType]: { type: T; payload: EventPayloadMap[T] }
+}[EvType]
 
 function sessionId() {
   const existing = sessionStorage.getItem(SESSION_KEY)
@@ -77,22 +98,37 @@ function sessionId() {
 }
 
 function endpoint(path: string) {
-  return `${requestBase}${path}`
+  if (!serverConfiguration.requestBase) {
+    throw new TransportError(
+      'server_not_configured',
+      serverConfiguration.error ??
+        'VITE_MG_SERVER must provide the absolute production API URL.',
+    )
+  }
+  return `${serverConfiguration.requestBase}${path}`
 }
 
-function websocketEndpoint(client: ClientIdentity, cursor: string) {
+function realtimeEndpoint(
+  protocol: 'websocket' | 'sse',
+  client: ClientIdentity,
+  cursor: string,
+) {
   const query = new URLSearchParams({
     project: client.project,
     from_seq: cursor,
     token: client.token,
   })
   if (import.meta.env.DEV) {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    return `${protocol}//${window.location.host}/mg/ws?${query}`
+    if (protocol === 'sse') return `/mg/sse?${query}`
+    const websocketProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    return `${websocketProtocol}//${window.location.host}/mg/ws?${query}`
   }
-  const url = new URL(logicalServer)
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-  url.pathname = '/ws'
+  if (!serverConfiguration.logicalServer) endpoint('')
+  const url = new URL(serverConfiguration.logicalServer!)
+  if (protocol === 'websocket') {
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  }
+  url.pathname = protocol === 'websocket' ? '/ws' : '/sse'
   url.search = query.toString()
   return url.toString()
 }
@@ -120,6 +156,16 @@ async function cloneDemo() {
   )
 }
 
+function storedIdentity() {
+  const stored = parseStoredIdentity(localStorage.getItem(IDENTITY_KEY))
+  if (!stored) localStorage.removeItem(IDENTITY_KEY)
+  return stored
+}
+
+function persistIdentity(client: ClientIdentity) {
+  localStorage.setItem(IDENTITY_KEY, JSON.stringify(client))
+}
+
 async function getSnapshot(client = identity) {
   if (!client) throw new TransportError('not_connected', 'No live project is connected.')
   return jsonResponse<SnapshotResponse>(
@@ -142,28 +188,67 @@ async function refreshSnapshot() {
   }
 }
 
-function openSocket() {
+function handleRealtimeMessage(raw: string) {
+  const data = JSON.parse(raw) as
+    | { kind: 'event'; event: MissionEvent }
+    | { kind: 'snapshot'; state: GraphSnapshotState; cursor: string }
+  if (data.kind === 'event') {
+    useMissionStore.getState().applyEvent(data.event)
+  } else if (identity) {
+    useMissionStore
+      .getState()
+      .applySnapshot(data.state, data.cursor, identity.project)
+  }
+}
+
+function openEventSource() {
   if (!identity) return
   if (reconnectTimer !== null) {
     window.clearTimeout(reconnectTimer)
     reconnectTimer = null
   }
   socket?.close()
+  socket = null
+  eventSource?.close()
   const cursor = useMissionStore.getState().cursor
-  socket = new WebSocket(websocketEndpoint(identity, cursor))
-  socket.addEventListener('message', (message) => {
-    const data = JSON.parse(String(message.data)) as
-      | { kind: 'event'; event: MissionEvent }
-      | { kind: 'snapshot'; state: GraphSnapshotState; cursor: string }
-    if (data.kind === 'event') {
-      useMissionStore.getState().applyEvent(data.event)
-    } else if (identity) {
+  eventSource = new EventSource(realtimeEndpoint('sse', identity, cursor))
+  eventSource.addEventListener('message', (message) => {
+    handleRealtimeMessage(String(message.data))
+  })
+  eventSource.addEventListener('open', () => {
+    useMissionStore.getState().setConnectionMode('live', 'Live server · SSE fallback')
+  })
+  eventSource.addEventListener('error', () => {
+    if (identity) {
       useMissionStore
         .getState()
-        .applySnapshot(data.state, data.cursor, identity.project)
+        .setConnectionMode('live', 'Live server · SSE reconnecting')
     }
   })
-  socket.addEventListener('open', () => {
+}
+
+function openSocket() {
+  if (!identity) return
+  if (realtimeTransport(failedWebSockets) === 'sse') {
+    openEventSource()
+    return
+  }
+  if (reconnectTimer !== null) {
+    window.clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  eventSource?.close()
+  eventSource = null
+  const cursor = useMissionStore.getState().cursor
+  const activeSocket = new WebSocket(
+    realtimeEndpoint('websocket', identity, cursor),
+  )
+  socket = activeSocket
+  activeSocket.addEventListener('message', (message) => {
+    failedWebSockets = 0
+    handleRealtimeMessage(String(message.data))
+  })
+  activeSocket.addEventListener('open', () => {
     useMissionStore
       .getState()
       .setConnectionMode(
@@ -171,8 +256,14 @@ function openSocket() {
         seededDevProject ? 'Live dev seed · fixture projection' : 'Live server',
       )
   })
-  socket.addEventListener('close', () => {
-    if (!identity) return
+  activeSocket.addEventListener('close', () => {
+    if (!identity || socket !== activeSocket) return
+    socket = null
+    failedWebSockets++
+    if (realtimeTransport(failedWebSockets) === 'sse') {
+      openEventSource()
+      return
+    }
     useMissionStore
       .getState()
       .setConnectionMode('live', 'Live server · reconnecting')
@@ -221,7 +312,6 @@ async function postMutation<T extends EvType>(
   type: T,
   payload: EventPayloadMap[T],
   actor: 'human' | 'browser_agent',
-  retry = true,
 ): Promise<number> {
   const state = useMissionStore.getState()
   if (state.connectionMode === 'fixture') {
@@ -256,15 +346,63 @@ async function postMutation<T extends EvType>(
         stale.fresh_digest.cursor,
       )
     await refreshSnapshot()
-    if (retry) return postMutation(type, payload, actor, false)
-    throw new TransportError(
-      'stale_sequence',
+    const error = new TransportError(
+      'stale_mutation',
       'The graph changed concurrently; the live snapshot was refreshed.',
     )
+    useMissionStore.getState().showToast(error.message, 'error')
+    throw error
   }
   const result = await jsonResponse<MutationResponse>(response)
   await waitForSequence(result.seq)
   return result.seq
+}
+
+async function postMutationBatch(
+  batch: MutationBatchItem[],
+  actor: 'human' | 'browser_agent',
+): Promise<number[]> {
+  const state = useMissionStore.getState()
+  if (state.connectionMode === 'fixture') {
+    return batch.map((item) => fixtureMutation(item.type, item.payload, actor))
+  }
+  if (!identity) throw new TransportError('not_connected', 'No live project is connected.')
+  const response = await fetch(
+    endpoint(`/api/p/${encodeURIComponent(identity.project)}/mutations`),
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-mg-token': identity.token,
+        'x-mg-session': state.sessionId,
+        'x-mg-actor': actor,
+      },
+      body: JSON.stringify({
+        batch,
+        idem_key: crypto.randomUUID(),
+        base_seq: Number(state.cursor),
+      }),
+    },
+  )
+  if (response.status === 409) {
+    const stale = (await response.json()) as StaleBody
+    useMissionStore
+      .getState()
+      .applyDigestChanges(
+        stale.fresh_digest.changes_since as DigestChange[],
+        stale.fresh_digest.cursor,
+      )
+    await refreshSnapshot()
+    const error = new TransportError(
+      'stale_mutation',
+      'The graph changed concurrently; the live snapshot was refreshed.',
+    )
+    useMissionStore.getState().showToast(error.message, 'error')
+    throw error
+  }
+  const result = await jsonResponse<BatchMutationResponse>(response)
+  if (result.seqs.length > 0) await waitForSequence(result.seqs.at(-1)!)
+  return result.seqs
 }
 
 export function mutate<T extends EvType>(
@@ -296,6 +434,19 @@ export function mutate<T extends EvType>(
   return queued
 }
 
+export function mutateBatch(
+  batch: MutationBatchItem[],
+  options: Pick<MutationOptions, 'actor'> = {},
+): Promise<number[]> {
+  const actor = options.actor ?? 'human'
+  const queued = mutationQueue.then(() => postMutationBatch(batch, actor))
+  mutationQueue = queued.then(
+    () => undefined,
+    () => undefined,
+  )
+  return queued
+}
+
 function seededIdentityFromUrl(): ClientIdentity | null {
   if (!import.meta.env.DEV) return null
   const params = new URLSearchParams(window.location.search)
@@ -311,13 +462,26 @@ async function bootstrap() {
   try {
     const seededIdentity = seededIdentityFromUrl()
     seededDevProject = seededIdentity !== null
-    identity = seededIdentity ?? (await cloneDemo())
-    const snapshot = await getSnapshot(identity)
-    store.applySnapshot(snapshot.state, snapshot.cursor, identity.project)
     if (seededIdentity) {
-      store.setConnectionMode('live', 'Live dev seed · fixture projection')
+      await connectProject(seededIdentity)
+      return
     }
-    openSocket()
+    const persisted = storedIdentity()
+    if (persisted) {
+      try {
+        await connectProject(persisted)
+        return
+      } catch (error) {
+        if (!(error instanceof TransportError) || !shouldReplaceStoredIdentity(error.code)) {
+          throw error
+        }
+        localStorage.removeItem(IDENTITY_KEY)
+      }
+    }
+    const cloned = await cloneDemo()
+    const client = { project: cloned.project, token: cloned.token }
+    persistIdentity(client)
+    await connectProject(client)
   } catch (error) {
     identity = null
     const message =
@@ -326,24 +490,54 @@ async function bootstrap() {
   }
 }
 
+async function connectProject(client: ClientIdentity) {
+  identity = client
+  const snapshot = await getSnapshot(client)
+  const store = useMissionStore.getState()
+  store.applySnapshot(snapshot.state, snapshot.cursor, client.project)
+  await loadChangesSince('0')
+  if (seededDevProject) {
+    store.setConnectionMode('live', 'Live dev seed · fixture projection')
+  }
+  openSocket()
+}
+
 export function initializeMissionClient() {
   initialization ??= bootstrap()
   return initialization
 }
 
-export async function loadChangesSince(since: string) {
-  const state = useMissionStore.getState()
-  if (state.connectionMode === 'fixture') {
-    for (const event of state.events.filter((event) => event.seq > Number(since))) {
-      state.recordHistoricalEvent(event)
-    }
-    return
+export async function resetMissionDemo() {
+  localStorage.removeItem(IDENTITY_KEY)
+  identity = null
+  seededDevProject = false
+  failedWebSockets = 0
+  socket?.close()
+  socket = null
+  eventSource?.close()
+  eventSource = null
+  if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+  reconnectTimer = null
+  useMissionStore
+    .getState()
+    .setConnectionMode('loading', 'Resetting to a fresh visitor project…')
+  try {
+    const cloned = await cloneDemo()
+    const client = { project: cloned.project, token: cloned.token }
+    persistIdentity(client)
+    await connectProject(client)
+  } catch (error) {
+    identity = null
+    const message = error instanceof Error ? error.message : String(error)
+    useMissionStore.getState().useFixture(`Offline fixture · ${message}`)
   }
-  if (!identity || Number(since) >= Number(state.cursor)) return
+}
 
-  const target = Number(state.cursor)
-  await new Promise<void>((resolve, reject) => {
-    const historySocket = new WebSocket(websocketEndpoint(identity!, since))
+function loadHistoryWithWebSocket(client: ClientIdentity, since: string, target: number) {
+  return new Promise<void>((resolve, reject) => {
+    const historySocket = new WebSocket(
+      realtimeEndpoint('websocket', client, since),
+    )
     const timeout = window.setTimeout(() => {
       historySocket.close()
       reject(new TransportError('history_timeout', 'Timed out loading graph history.'))
@@ -362,7 +556,54 @@ export async function loadChangesSince(since: string) {
     })
     historySocket.addEventListener('error', () => {
       window.clearTimeout(timeout)
+      historySocket.close()
       reject(new TransportError('history_unavailable', 'Graph history is unavailable.'))
     })
   })
+}
+
+function loadHistoryWithSse(client: ClientIdentity, since: string, target: number) {
+  return new Promise<void>((resolve, reject) => {
+    const historySource = new EventSource(realtimeEndpoint('sse', client, since))
+    const timeout = window.setTimeout(() => {
+      historySource.close()
+      reject(new TransportError('history_timeout', 'Timed out loading graph history.'))
+    }, 3_000)
+    historySource.addEventListener('message', (message) => {
+      const data = JSON.parse(String(message.data)) as
+        | { kind: 'event'; event: MissionEvent }
+        | { kind: 'snapshot' }
+      if (data.kind !== 'event') return
+      useMissionStore.getState().recordHistoricalEvent(data.event)
+      if (data.event.seq >= target) {
+        window.clearTimeout(timeout)
+        historySource.close()
+        resolve()
+      }
+    })
+    historySource.addEventListener('error', () => {
+      window.clearTimeout(timeout)
+      historySource.close()
+      reject(new TransportError('history_unavailable', 'Graph history is unavailable.'))
+    })
+  })
+}
+
+export async function loadChangesSince(since: string) {
+  const state = useMissionStore.getState()
+  if (state.connectionMode === 'fixture') {
+    for (const event of state.events.filter((event) => event.seq > Number(since))) {
+      state.recordHistoricalEvent(event)
+    }
+    return
+  }
+  if (!identity || Number(since) >= Number(state.cursor)) return
+
+  const target = Number(state.cursor)
+  try {
+    await loadHistoryWithWebSocket(identity, since, target)
+  } catch {
+    failedWebSockets++
+    await loadHistoryWithSse(identity, since, target)
+  }
 }

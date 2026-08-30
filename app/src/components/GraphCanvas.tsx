@@ -20,6 +20,7 @@ import {
   type DisplayState,
 } from '../model/graph'
 import { useMissionStore } from '../store/mission-store'
+import { resetMissionDemo } from '../transport/client'
 import { Inspector } from './Inspector'
 import { PulseBar } from './PulseBar'
 import { TaskNodeCard, type TaskFlowNode } from './TaskNodeCard'
@@ -326,6 +327,7 @@ function MissionBoard() {
         eta={criticalPath.eta}
         counts={counts}
         onCatchUp={() => void replayCatchUp()}
+        onReset={() => void resetMissionDemo()}
         replaying={replaying}
         connectionMode={connectionMode}
         connectionMessage={connectionMessage}
