@@ -13,7 +13,6 @@ import {
 import ELK from 'elkjs/lib/elk.bundled.js'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import '@xyflow/react/dist/style.css'
-import { shortyApprovals } from '../fixtures/shorty-dag'
 import {
   getCriticalPath,
   getDisplayState,
@@ -21,6 +20,7 @@ import {
   type DisplayState,
 } from '../model/graph'
 import { useMissionStore } from '../store/mission-store'
+import { resetMissionDemo } from '../transport/client'
 import { Inspector } from './Inspector'
 import { PulseBar } from './PulseBar'
 import { TaskNodeCard, type TaskFlowNode } from './TaskNodeCard'
@@ -65,7 +65,13 @@ function MissionBoard() {
   const selectedId = useMissionStore((state) => state.selectedId)
   const highlightedIds = useMissionStore((state) => state.highlightedIds)
   const readySince = useMissionStore((state) => state.readySince)
+  const approvals = useMissionStore((state) => state.approvals)
+  const cameraRequest = useMissionStore((state) => state.cameraRequest)
+  const connectionMode = useMissionStore((state) => state.connectionMode)
+  const connectionMessage = useMissionStore((state) => state.connectionMessage)
+  const projectId = useMissionStore((state) => state.projectId)
   const toast = useMissionStore((state) => state.toast)
+  const structuralPreview = useMissionStore((state) => state.structuralPreview)
   const hydratePositions = useMissionStore((state) => state.hydratePositions)
   const moveNode = useMissionStore((state) => state.moveNode)
   const connectNodes = useMissionStore((state) => state.connectNodes)
@@ -73,6 +79,8 @@ function MissionBoard() {
   const select = useMissionStore((state) => state.select)
   const setHighlights = useMissionStore((state) => state.setHighlights)
   const clearToast = useMissionStore((state) => state.clearToast)
+  const confirmStructural = useMissionStore((state) => state.confirmStructural)
+  const cancelStructural = useMissionStore((state) => state.cancelStructural)
   const [dragPositions, setDragPositions] = useState<
     Record<string, { x: number; y: number }>
   >({})
@@ -146,7 +154,10 @@ function MissionBoard() {
             displayState,
             approval:
               node.state === 'review' &&
-              shortyApprovals.some((approval) => approval.node_id === node.id),
+              Object.values(approvals).some(
+                (approval) =>
+                  approval.node_id === node.id && approval.status === 'pending',
+              ),
             idleFor: displayState === 'ready' ? readySince[node.id] : undefined,
             critical: criticalPath.nodeIds.includes(node.id),
             highlighted: highlightedIds.includes(node.id),
@@ -155,6 +166,7 @@ function MissionBoard() {
       }),
     [
       criticalPath.nodeIds,
+      approvals,
       dragPositions,
       edges,
       highlightedIds,
@@ -167,7 +179,15 @@ function MissionBoard() {
   )
 
   useEffect(() => {
-    if (hasLaidOut.current || nodes.length === 0) {
+    hasLaidOut.current = false
+  }, [projectId])
+
+  useEffect(() => {
+    if (
+      connectionMode === 'loading' ||
+      hasLaidOut.current ||
+      nodes.length === 0
+    ) {
       return
     }
     hasLaidOut.current = true
@@ -178,7 +198,17 @@ function MissionBoard() {
       hydratePositions(layout)
       window.setTimeout(() => void fitView({ padding: 0.16, duration: 280 }), 0)
     })
-  }, [fitView, flowEdges, hydratePositions, nodes])
+  }, [connectionMode, fitView, flowEdges, hydratePositions, nodes])
+
+  useEffect(() => {
+    if (!cameraRequest) return
+    const focused = flowNodes.filter((node) =>
+      cameraRequest.nodeIds.includes(node.id),
+    )
+    if (focused.length > 0) {
+      void fitView({ nodes: focused, padding: 0.28, duration: 420 })
+    }
+  }, [cameraRequest, fitView, flowNodes])
 
   useEffect(() => {
     function handleDelete(event: KeyboardEvent) {
@@ -300,7 +330,10 @@ function MissionBoard() {
         eta={criticalPath.eta}
         counts={counts}
         onCatchUp={() => void replayCatchUp()}
+        onReset={() => void resetMissionDemo()}
         replaying={replaying}
+        connectionMode={connectionMode}
+        connectionMessage={connectionMessage}
       />
       <div className="canvas-stage">
         <ReactFlow<TaskFlowNode, Edge>
@@ -340,6 +373,39 @@ function MissionBoard() {
           <span><i className="legend-line legend-line--conflict" />File conflict</span>
           <span className="hidden xl:inline">Drag to arrange · connect ports to depend · delete to tombstone</span>
         </div>
+        {structuralPreview && (
+          <section className="structural-confirm" role="dialog" aria-modal="true">
+            <p className="structural-confirm-kicker">Blast-radius preview</p>
+            <h2>{structuralPreview.title}</h2>
+            <p>
+              Context may become stale for{' '}
+              {structuralPreview.blastRadius.stale
+                .map(
+                  (id) =>
+                    nodes.find((node) => node.id === id)?.title ?? 'removed work',
+                )
+                .join(', ')}.
+            </p>
+            {structuralPreview.blastRadius.pausing.length > 0 && (
+              <p>
+                Running workers that may pause:{' '}
+                {structuralPreview.blastRadius.pausing
+                  .map(
+                    (id) => nodes.find((node) => node.id === id)?.title ?? id,
+                  )
+                  .join(', ')}.
+              </p>
+            )}
+            <div>
+              <button type="button" className="action-secondary" onClick={cancelStructural}>
+                Cancel
+              </button>
+              <button type="button" className="action-primary" onClick={confirmStructural}>
+                Confirm change
+              </button>
+            </div>
+          </section>
+        )}
       </div>
       <Inspector nodes={nodes} edges={edges} events={events} />
       <Timeline

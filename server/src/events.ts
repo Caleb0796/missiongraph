@@ -584,6 +584,12 @@ export class EventStore {
         PRIMARY KEY (project_id, seq),
         UNIQUE (project_id, idem_key)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS mutation_batches (
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        idem_key TEXT NOT NULL,
+        seqs_json TEXT NOT NULL CHECK(json_valid(seqs_json)),
+        PRIMARY KEY (project_id, idem_key)
+      ) STRICT;
       CREATE TABLE IF NOT EXISTS reporter_credentials (
         token_hash TEXT PRIMARY KEY,
         project_id TEXT NOT NULL REFERENCES projects(id),
@@ -767,6 +773,84 @@ export class EventStore {
       throw error;
     }
     if (!result.duplicate) this.events.emit("event", result.event);
+    return result;
+  }
+
+  appendBatch(
+    projectId: string,
+    inputs: readonly EventInput[],
+    idemKey: string,
+    options: { baseSeq?: number; ts?: string; sessionId?: string } = {},
+  ): { events: Event[]; duplicate: boolean } {
+    if (!this.hasProject(projectId)) throw new UnknownProjectError(projectId);
+    if (inputs.length === 0) throw new EventValidationError("batch must not be empty");
+    this.database.exec("BEGIN IMMEDIATE");
+    let result: { events: Event[]; duplicate: boolean };
+    try {
+      const duplicate = this.database
+        .prepare("SELECT seqs_json FROM mutation_batches WHERE project_id = ? AND idem_key = ?")
+        .get(projectId, idemKey) as { seqs_json: string } | undefined;
+      if (duplicate) {
+        const seqs = new Set(JSON.parse(duplicate.seqs_json) as number[]);
+        result = {
+          events: this.listEvents(projectId).filter((event) => seqs.has(event.seq)),
+          duplicate: true,
+        };
+      } else {
+        const currentSeq = this.latestSeq(projectId);
+        if (options.baseSeq !== undefined && options.baseSeq !== currentSeq) {
+          throw new StaleSequenceError(currentSeq);
+        }
+        const timestamp = options.ts ?? new Date().toISOString();
+        const batchHash = createHash("sha256").update(idemKey).digest("hex");
+        let state = fold(this.listEvents(projectId));
+        const events: Event[] = [];
+        for (const [index, input] of inputs.entries()) {
+          const event = {
+            seq: currentSeq + index + 1,
+            project_id: projectId,
+            ts: timestamp,
+            ...input,
+            idem_key: `batch:${batchHash}:${index}`,
+          } as Event;
+          state = reduceEvent(state, event, {
+            ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+          });
+          events.push(event);
+        }
+        for (const event of events) {
+          const { nodeRef, edgeRef } = refs(event as EventInput);
+          this.database
+            .prepare(
+              `INSERT INTO events
+                (project_id, seq, ts, actor, type, payload_json, node_ref, edge_ref, idem_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              projectId,
+              event.seq,
+              event.ts,
+              event.actor,
+              event.type,
+              JSON.stringify({ v: 1, data: event.payload }),
+              nodeRef,
+              edgeRef,
+              event.idem_key,
+            );
+        }
+        this.database
+          .prepare("INSERT INTO mutation_batches (project_id, idem_key, seqs_json) VALUES (?, ?, ?)")
+          .run(projectId, idemKey, JSON.stringify(events.map((event) => event.seq)));
+        result = { events, duplicate: false };
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    if (!result.duplicate) {
+      for (const event of result.events) this.events.emit("event", event);
+    }
     return result;
   }
 }

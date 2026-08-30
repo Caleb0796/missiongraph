@@ -24,6 +24,7 @@ export interface ServerOptions {
   seedProjectId?: string;
   now?: () => Date;
   id?: () => string;
+  allowedOrigins?: string[];
   logger?: boolean;
 }
 
@@ -66,6 +67,65 @@ function baseSequence(body: Record<string, unknown>): number | undefined {
     throw new EventValidationError("base_seq must be a non-negative integer");
   }
   return body.base_seq as number;
+}
+
+function record(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new EventValidationError(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function batchInputs(
+  body: Record<string, unknown>,
+  actor: Actor,
+  assignId: () => string,
+): { idemKey: string; inputs: EventInput[] } {
+  if (!Array.isArray(body.batch) || body.batch.length === 0) {
+    throw new EventValidationError("batch must be a non-empty array");
+  }
+  if (body.batch.length > 500) throw new EventValidationError("batch must contain at most 500 events");
+  if (typeof body.idem_key !== "string" || body.idem_key.length === 0) {
+    throw new EventValidationError("idem_key must not be empty");
+  }
+  const tempIds = new Set<string>();
+  const declare = (value: unknown, label: string): void => {
+    if (typeof value !== "string" || value.length === 0) {
+      throw new EventValidationError(`${label} must not be empty`);
+    }
+    if (tempIds.has(value)) throw new EventValidationError(`batch-local id ${value} is declared twice`);
+    tempIds.add(value);
+  };
+  for (const [index, value] of body.batch.entries()) {
+    const item = record(value, `batch[${index}]`);
+    const payload = record(item.payload, `batch[${index}].payload`);
+    if (item.type === "TASK_ADDED") {
+      declare(record(payload.node, `batch[${index}].payload.node`).id, `batch[${index}].payload.node.id`);
+    } else if (item.type === "EDGE_ADDED") {
+      declare(payload.edge_id, `batch[${index}].payload.edge_id`);
+    } else if (item.type === "TASK_SPLIT") {
+      if (!Array.isArray(payload.children)) {
+        throw new EventValidationError(`batch[${index}].payload.children must be an array`);
+      }
+      for (const [childIndex, child] of payload.children.entries()) {
+        declare(
+          record(child, `batch[${index}].payload.children[${childIndex}]`).id,
+          `batch[${index}].payload.children[${childIndex}].id`,
+        );
+      }
+    }
+  }
+  const ids = new Map([...tempIds].map((tempId) => [tempId, assignId()]));
+  const inputs = body.batch.map((value, index) => {
+    const item = record(value, `batch[${index}]`);
+    return parseEventInput({
+      ...item,
+      actor,
+      payload: remapPayload(item.payload, ids),
+      idem_key: `${body.idem_key}:${index}`,
+    });
+  });
+  return { idemKey: body.idem_key, inputs };
 }
 
 function errorReply(error: unknown, reply: FastifyReply): FastifyReply {
@@ -168,8 +228,30 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
   const now = options.now ?? (() => new Date());
   const id = options.id ?? randomUUID;
   const seedProjectId = options.seedProjectId ?? process.env.SEED_PROJECT_ID ?? "demo-seed";
+  const allowedOrigins = new Set(
+    options.allowedOrigins ??
+      (process.env.ALLOWED_ORIGINS ?? "")
+        .split(",")
+        .map((origin) => origin.trim())
+        .filter(Boolean),
+  );
   const store = new EventStore(options.databasePath ?? process.env.DB_PATH ?? "missiongraph.sqlite");
   const app = Fastify({ logger: options.logger ?? false });
+
+  app.addHook("onRequest", async (request, reply) => {
+    const origin = textHeader(request.headers.origin);
+    if (!origin || !allowedOrigins.has(origin)) return;
+    reply
+      .header("access-control-allow-origin", origin)
+      .header("vary", "Origin")
+      .header("access-control-allow-methods", "GET, POST, OPTIONS")
+      .header(
+        "access-control-allow-headers",
+        "content-type, x-mg-token, x-mg-session, x-mg-actor",
+      )
+      .header("access-control-max-age", "86400");
+    if (request.method === "OPTIONS") return reply.code(204).send();
+  });
 
   app.post("/api/p/:project/mutations", async (request, reply) => {
     const project = (request.params as { project: string }).project;
@@ -179,11 +261,25 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       const body = request.body as Record<string, unknown>;
       const actor = mutationActor(request);
       const sessionId = mutationSession(request);
+      baseSeq = baseSequence(body);
+      if (body.batch !== undefined) {
+        const batch = batchInputs(body, actor, id);
+        for (const input of batch.inputs) {
+          if (reporterEventTypes.has(input.type)) {
+            throw new EventValidationError(`${input.type} must use the reporter endpoint`);
+          }
+        }
+        const result = store.appendBatch(project, batch.inputs, batch.idemKey, {
+          ...(baseSeq === undefined ? {} : { baseSeq }),
+          ...(sessionId === undefined ? {} : { sessionId }),
+          ts: now().toISOString(),
+        });
+        return reply.send({ seqs: result.events.map((event) => event.seq) });
+      }
       const input = parseEventInput({ ...body, actor });
       if (reporterEventTypes.has(input.type)) {
         throw new EventValidationError(`${input.type} must use the reporter endpoint`);
       }
-      baseSeq = baseSequence(body);
       const result = store.append(project, input, {
         ...(baseSeq === undefined ? {} : { baseSeq }),
         ...(sessionId === undefined ? {} : { sessionId }),

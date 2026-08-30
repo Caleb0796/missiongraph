@@ -1,4 +1,4 @@
-import type { GraphEdge, MissionEvent, TaskNode } from './types'
+import type { Approval, GraphEdge, MissionEvent, TaskNode } from './types'
 
 export type DisplayState =
   | 'queued'
@@ -151,6 +151,130 @@ export function wouldCreateCycle(
   return false
 }
 
+export function isNonIdle(node: TaskNode) {
+  return (
+    (node as TaskNode & { ever_started?: boolean }).ever_started ??
+    node.state !== 'queued'
+  )
+}
+
+export function isPreviewStale(previewCursor: string, currentCursor: string) {
+  return previewCursor !== currentCursor
+}
+
+export function getBlastRadius(
+  ids: string[],
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+) {
+  const reached = new Set(ids)
+  const pending = [...ids]
+  while (pending.length > 0) {
+    const current = pending.shift()!
+    for (const edge of edges) {
+      if (
+        edge.kind === 'depends' &&
+        edge.upstream === current &&
+        !reached.has(edge.downstream)
+      ) {
+        reached.add(edge.downstream)
+        pending.push(edge.downstream)
+      }
+    }
+  }
+  const stale = [...reached]
+  return {
+    stale,
+    pausing: stale.filter(
+      (id) => nodes.find((node) => node.id === id)?.state === 'running',
+    ),
+  }
+}
+
+function isReadyUnassigned(
+  node: TaskNode,
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+) {
+  return (
+    getDisplayState(node, nodes, edges) === 'ready' &&
+    !(node as TaskNode & { assigned?: boolean }).assigned
+  )
+}
+
+export function refreshReadySince(
+  previousNodes: TaskNode[],
+  previousEdges: GraphEdge[],
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+  current: Record<string, string>,
+  transitionTime: string,
+) {
+  const previousById = new Map(previousNodes.map((node) => [node.id, node]))
+  const next = { ...current }
+  for (const node of nodes) {
+    const ready = isReadyUnassigned(node, nodes, edges)
+    const previous = previousById.get(node.id)
+    const wasReady = previous
+      ? isReadyUnassigned(previous, previousNodes, previousEdges)
+      : false
+    if (ready && !wasReady) next[node.id] = transitionTime
+    if (!ready) delete next[node.id]
+  }
+  for (const id of Object.keys(next)) {
+    if (!nodes.some((node) => node.id === id)) delete next[id]
+  }
+  return next
+}
+
+export function approvalsForNode(
+  approvals: Record<string, Approval>,
+  nodeId: string,
+) {
+  return Object.values(approvals)
+    .filter((approval) => approval.node_id === nodeId)
+    .sort(
+      (left, right) =>
+        left.created_seq - right.created_seq ||
+        left.created_at.localeCompare(right.created_at) ||
+        left.id.localeCompare(right.id),
+    )
+}
+
+export function eventTargetsNode(event: MissionEvent, nodeId: string) {
+  switch (event.type) {
+    case 'TASK_ADDED':
+      return event.payload.node.id === nodeId
+    case 'TASK_REMOVED':
+    case 'DISPATCHED':
+    case 'RETRY_REQUESTED':
+    case 'PAUSE_REQUESTED':
+    case 'RESUME_REQUESTED':
+    case 'APPROVED':
+    case 'REJECTED':
+    case 'NODE_STATE_CHANGED':
+    case 'PAUSE_ACKED':
+    case 'WORKER_LOG':
+    case 'HANDOFF_FILED':
+    case 'DEVIATION_NOTED':
+    case 'APPROVAL_CREATED':
+    case 'NODE_MOVED':
+      return event.payload.node_id === nodeId
+    case 'TASK_SPLIT':
+      return event.payload.parent_id === nodeId
+    case 'ANNOTATED':
+      return event.payload.target_id === nodeId
+    default:
+      return false
+  }
+}
+
+export function boundedHistory<T extends { seq: number }>(items: T[], limit = 200) {
+  return [...items]
+    .sort((left, right) => left.seq - right.seq)
+    .slice(-limit)
+}
+
 export function getEventNodeId(event: MissionEvent, edges: GraphEdge[]) {
   switch (event.type) {
     case 'TASK_ADDED':
@@ -226,7 +350,9 @@ export function describeEvent(
     case 'POLICY_STATED':
       return `A new session approval policy was recorded: ${event.payload.text}`
     case 'ANNOTATED':
-      return `${edgeTitle(event.payload.target_id)} gained context: ${event.payload.note}`
+      return nodes.some((node) => node.id === event.payload.target_id)
+        ? `${title(event.payload.target_id)} gained context: ${event.payload.note}`
+        : `${edgeTitle(event.payload.target_id)} gained context: ${event.payload.note}`
     case 'JOURNAL_NOTE':
       return event.payload.text
     case 'NODE_STATE_CHANGED':
