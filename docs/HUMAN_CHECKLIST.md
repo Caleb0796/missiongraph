@@ -5,7 +5,7 @@
 ## ⏰ 开工前
 
 1. **Devpost 注册 + 创建项目页**（webmcp.devpost.com）——注册和提交同一个截止时间 9/3 13:00 PDT，别拖到最后一天。
-2. **升级 Chrome 到 ≥153**（当前 152.0.7977.64）——动态工具注销（AbortController）需要 153+；升级后开 `chrome://flags/#enable-webmcp-testing` 并重启。
+2. **保持 stable Chrome 152 作为主测试环境**（评委用的就是 stable），开 `chrome://flags/#enable-webmcp-testing` 并重启即可。可选：并排安装 Chrome Beta（153），只用于验证动态注销的增强路径——不要指望它，152 上必须一切正常。
 3. **确认 ChatGPT.app 内置浏览器可用**——这是评委的主要测试环境，也是 M0 的硬门槛环境。
 4. GitHub：gh 已登录（Caleb0796）✅——决定仓库名（建议 `missiongraph`，public + MIT），M0 后让 Codex push。
 

@@ -19,7 +19,7 @@ document.modelContext.registerTool({
 
 - Namespace: `document.modelContext` (current); `navigator.modelContext` was the older location (deprecated Chrome 150) — feature-detect both, prefer document.
 - **Return contract: a string.** No MCP `{content:[...]}` wrapper. We return JSON strings carrying `{...data, cursor, changes_since}`.
-- Unregister: `registerTool(tool, { signal: abortController.signal })` then `controller.abort()` — **Chrome 153+**. This is what dynamic contextual tools ride on.
+- Unregister: `registerTool(tool, { signal: abortController.signal })` then `controller.abort()` — **Chrome 153+ (Beta as of 2026-08-30; 152 is stable)**. Dynamic contextual tools must NOT depend on this: feature-detect, and on ≤152 fall back to `provideContext({tools:[...]})` full-set replacement (verify replace semantics + toolchange on 152 during M0); last resort: keep contextual tools registered and return "not applicable". Behavior must be identical across versions.
 - Discovery/self-test (no agent needed): `document.modelContext.getTools()` and `executeTool(name, jsonInputString)` — use these for the M0 in-page smoke test.
 - `document.modelContext.addEventListener("toolchange", cb)` fires when the tool list changes.
 - Cross-origin iframes need `allow="tools"`; Permissions Policy `tools` defaults to `self`; page must keep origin isolation (no `Origin-Agent-Cluster: ?0`).
@@ -27,7 +27,7 @@ document.modelContext.registerTool({
 ## Enabling for testing
 
 1. **ChatGPT built-in browser** — supports WebMCP natively; primary judge environment. Open the deployed URL inside ChatGPT and converse.
-2. **Chrome 149+** — `chrome://flags/#enable-webmcp-testing` → Enabled → relaunch. (Origin trial Chrome 149–156 exists for production traffic; the local flag suffices for testing. Machine currently has Chrome 152 — update to ≥153 for AbortController unregistration.)
+2. **Chrome 149+** — `chrome://flags/#enable-webmcp-testing` → Enabled → relaunch. (Origin trial Chrome 149–156 exists for production traffic; the local flag suffices for testing. Machine has Chrome 152 = current stable = the primary target; installing Chrome Beta 153 SIDE-BY-SIDE is optional, only to verify the abort-unregistration enhanced path.)
 
 ## Gotchas
 
