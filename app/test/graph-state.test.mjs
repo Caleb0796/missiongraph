@@ -6,7 +6,10 @@ import {
   boundedHistory,
   eventTargetsNode,
   getBlastRadius,
+  humanizeIdleAge,
+  idleRadar,
   isPreviewStale,
+  rankedPendingApprovals,
   refreshReadySince,
 } from '../src/model/graph.ts'
 
@@ -99,4 +102,45 @@ test('history is bounded and node dossiers include annotations and all approvals
     ).map((approval) => approval.id),
     ['earlier', 'later'],
   )
+})
+
+test('flight queues rank delay before age and radar humanizes oldest idle work', () => {
+  const nodes = [
+    task('old-ready', 'queued', { assigned: false, ever_started: false }),
+    task('new-ready', 'queued', { assigned: false, ever_started: false }),
+    task('long-review', 'review', { estimate_min: 20 }),
+    task('short-review', 'review', { estimate_min: 5 }),
+  ]
+  const approvals = {
+    short: {
+      id: 'short',
+      node_id: 'short-review',
+      summary: 'Short review',
+      created_at: '2026-08-30T10:00:00.000Z',
+      created_seq: 1,
+      status: 'pending',
+    },
+    long: {
+      id: 'long',
+      node_id: 'long-review',
+      summary: 'Long review',
+      created_at: '2026-08-30T10:05:00.000Z',
+      created_seq: 2,
+      status: 'pending',
+    },
+  }
+  assert.deepEqual(
+    rankedPendingApprovals(approvals, nodes, []).map((item) => item.id),
+    ['long', 'short'],
+  )
+  const now = Date.parse('2026-08-30T11:00:00.000Z')
+  const readySince = {
+    'old-ready': '2026-08-30T10:20:00.000Z',
+    'new-ready': '2026-08-30T10:55:00.000Z',
+  }
+  assert.deepEqual(
+    idleRadar(nodes, [], readySince, now).map((item) => item.id),
+    ['old-ready'],
+  )
+  assert.equal(humanizeIdleAge(readySince['old-ready'], now), 'idle 40m')
 })
