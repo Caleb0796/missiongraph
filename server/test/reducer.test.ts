@@ -194,4 +194,44 @@ describe("deterministic reducer", () => {
       }),
     ).toThrow("non-schedulable group");
   });
+
+  it("clears removed nodes and edges from every client selection", () => {
+    let state = add(initialState(), "a", 5);
+    state = add(state, "b", 10);
+    state = add(state, "c", 15);
+    state = link(state, "a", "b");
+    state = link(state, "b", "c");
+    state = append(state, {
+      actor: "human",
+      type: "SELECTION_CHANGED",
+      payload: { client_id: "client-one", selected: ["a", "depends-a-b", "c"] },
+      idem_key: "select-client-one",
+    });
+    state = append(state, {
+      actor: "human",
+      type: "SELECTION_CHANGED",
+      payload: { client_id: "client-two", selected: ["depends-a-b", "depends-b-c", "b"] },
+      idem_key: "select-client-two",
+    });
+    state = append(state, {
+      actor: "human",
+      type: "TASK_REMOVED",
+      payload: { node_id: "a", tombstone: true },
+      idem_key: "remove-a",
+    });
+
+    expect(state.selections).toEqual({
+      "client-one": ["c"],
+      "client-two": ["depends-b-c", "b"],
+    });
+
+    state = append(state, {
+      actor: "human",
+      type: "EDGE_REMOVED",
+      payload: { edge_id: "depends-b-c" },
+      idem_key: "remove-b-c",
+    });
+
+    expect(state.selections).toEqual({ "client-one": ["c"], "client-two": ["b"] });
+  });
 });

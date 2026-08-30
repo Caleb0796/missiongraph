@@ -114,6 +114,12 @@ function addNode(state: GraphState, task: TaskNode): void {
   };
 }
 
+function clearSelections(state: GraphState, removed: ReadonlySet<string>): void {
+  for (const [clientId, selected] of Object.entries(state.selections)) {
+    state.selections[clientId] = selected.filter((id) => !removed.has(id));
+  }
+}
+
 function removeNode(state: GraphState, id: string, event: Event): void {
   const existing = node(state, id);
   const {
@@ -129,9 +135,14 @@ function removeNode(state: GraphState, id: string, event: Event): void {
   state.tombstones[id] = { node: task, removed_at: event.ts, removed_seq: event.seq };
   delete state.nodes[id];
   delete state.positions[id];
+  const removed = new Set([id]);
   for (const [edgeId, value] of Object.entries(state.edges)) {
-    if (value.upstream === id || value.downstream === id) delete state.edges[edgeId];
+    if (value.upstream === id || value.downstream === id) {
+      delete state.edges[edgeId];
+      removed.add(edgeId);
+    }
   }
+  clearSelections(state, removed);
 }
 
 function comparePaths(a: { weight: number; path: string[] }, b: { weight: number; path: string[] }): number {
@@ -306,6 +317,7 @@ function apply(state: GraphState, event: Event): void {
         seen.add(remap.edge_id);
       }
       for (const edgeId of incident.keys()) delete state.edges[edgeId];
+      clearSelections(state, new Set([...incident.keys()].filter((edgeId) => !seen.has(edgeId))));
       parent.record_type = "group";
       parent.child_ids = [...childIds];
       parent.availability = null;
@@ -343,6 +355,7 @@ function apply(state: GraphState, event: Event): void {
     case "EDGE_REMOVED":
       edge(state, event.payload.edge_id);
       delete state.edges[event.payload.edge_id];
+      clearSelections(state, new Set([event.payload.edge_id]));
       assertAcyclic(state);
       break;
     case "DISPATCHED": {
