@@ -403,6 +403,96 @@ describe("HTTP and streaming contract", () => {
     expect(authorized.json()).toEqual({ seq: 2 });
   });
 
+  it("issues renewable reporter credentials only to the supervisor scope", async () => {
+    let reportTime = new Date("2026-08-30T10:00:00.000Z");
+    const { app, store } = server({ now: () => reportTime });
+    for (const [project, visitor] of [["project-a", "visitor-a"], ["project-b", "visitor-b"]] as const) {
+      store.createProject(project, visitor, "2026-08-30T10:00:00.000Z");
+      store.append(project, {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+        },
+        idem_key: "add-a",
+      });
+    }
+    const issue = (authorization?: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/p/project-a/reporter-credentials",
+        headers: authorization ? { authorization } : {},
+        payload: { actor: "worker:a" },
+      });
+
+    const missingAuth = await issue();
+    const wrongAuth = await issue("Bearer wrong");
+    const first = await issue("Bearer reporter-secret");
+    const firstCredential = first.json<{ token: string; actor: string; expires: string }>();
+    const report = (project: string, token: string, actor: string, idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: `/api/p/${project}/report`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          actor,
+          type: "WORKER_LOG",
+          payload: { node_id: "a", lines: ["Worker is active."] },
+          idem_key: idemKey,
+        },
+      });
+
+    const crossProject = await report("project-b", firstCredential.token, "worker:a", "cross-project");
+    const wrongActor = await report("project-a", firstCredential.token, "worker:b", "wrong-actor");
+    const firstWorking = await report("project-a", firstCredential.token, "worker:a", "first-working");
+    reportTime = new Date("2026-08-30T10:14:00.000Z");
+    const renewal = await issue("Bearer reporter-secret");
+    const replacement = renewal.json<{ token: string; actor: string; expires: string }>();
+    reportTime = new Date("2026-08-30T10:15:00.000Z");
+    const expired = await report("project-a", firstCredential.token, "worker:a", "expired");
+    const replacementWorking = await report("project-a", replacement.token, "worker:a", "replacement-working");
+
+    expect(missingAuth.statusCode).toBe(401);
+    expect(wrongAuth.statusCode).toBe(401);
+    expect(first.statusCode).toBe(200);
+    expect(firstCredential).toMatchObject({ actor: "worker:a", expires: "2026-08-30T10:15:00.000Z" });
+    expect(firstCredential.token).toEqual(expect.any(String));
+    expect(crossProject.statusCode).toBe(401);
+    expect(wrongActor.statusCode).toBe(401);
+    expect(firstWorking.statusCode).toBe(200);
+    expect(replacement).toMatchObject({ actor: "worker:a", expires: "2026-08-30T10:29:00.000Z" });
+    expect(replacement.token).not.toBe(firstCredential.token);
+    expect(expired.statusCode).toBe(401);
+    expect(replacementWorking.statusCode).toBe(200);
+  });
+
+  it("accepts supervisor journal reports and rejects worker journal reports", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.issueReporterCredential("project", "worker:a", "2026-08-30T10:00:00.000Z", "worker-a-token");
+    const journal = (token: string, actor: "supervisor" | "worker:a", idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/p/project/report",
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          actor,
+          type: "JOURNAL_NOTE",
+          payload: { text: "Supervisor recorded a project decision." },
+          idem_key: idemKey,
+        },
+      });
+
+    const supervisor = await journal("reporter-secret", "supervisor", "supervisor-note");
+    const worker = await journal("worker-a-token", "worker:a", "worker-note");
+
+    expect(supervisor.json()).toEqual({ seq: 1 });
+    expect(worker.statusCode).toBe(400);
+    expect(store.listEvents("project")).toMatchObject([
+      { actor: "supervisor", type: "JOURNAL_NOTE", payload: { text: "Supervisor recorded a project decision." } },
+    ]);
+  });
+
   it("binds short-lived reporter credentials to one project and actor", async () => {
     let reportTime = new Date("2026-08-30T10:05:00.000Z");
     const { app, store } = server({ now: () => reportTime });

@@ -9,11 +9,13 @@ import {
   EventValidationError,
   StaleSequenceError,
   UnknownProjectError,
+  parseActor,
   parseEventInput,
   reporterEventTypes,
   type Actor,
   type Event,
   type EventInput,
+  type ReporterActor,
 } from "./events.js";
 import { fold, GraphValidationError } from "./reducer.js";
 import { installRealtime } from "./ws.js";
@@ -313,11 +315,39 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       if (projectIdentity ? projectIdentity.actor !== input.actor : input.actor !== "supervisor") {
         return reply.code(401).send({ error: "unauthorized" });
       }
-      if (!reporterEventTypes.has(input.type)) {
+      if (!reporterEventTypes.has(input.type) && !(input.actor === "supervisor" && input.type === "JOURNAL_NOTE")) {
         throw new EventValidationError(`${input.type} is not a fleet reporter event`);
       }
       const result = store.append(project, input, { ts: reportTime.toISOString() });
       return reply.send({ seq: result.event.seq });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/p/:project/reporter-credentials", async (request, reply) => {
+    const project = (request.params as { project: string }).project;
+    const authorization = textHeader(request.headers.authorization);
+    const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
+    if (!sameSecret(bearer, supervisorReporterToken)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    try {
+      const body = record(request.body, "body");
+      const actor = parseActor(body.actor);
+      if (actor !== "supervisor" && !actor.startsWith("worker:")) {
+        throw new EventValidationError("actor must be supervisor or worker:<node_id>");
+      }
+      const credential = store.issueReporterCredential(
+        project,
+        actor as ReporterActor,
+        now().toISOString(),
+      );
+      return reply.send({
+        token: credential.token,
+        actor: credential.actor,
+        expires: credential.expires_at,
+      });
     } catch (error) {
       return errorReply(error, reply);
     }
