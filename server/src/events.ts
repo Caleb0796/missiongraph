@@ -597,7 +597,7 @@ export class EventStore {
   append(
     projectId: string,
     input: EventInput,
-    options: { baseSeq?: number; ts?: string } = {},
+    options: { baseSeq?: number; ts?: string; sessionId?: string; trustedImport?: boolean } = {},
   ): { event: Event; duplicate: boolean } {
     if (!this.hasProject(projectId)) throw new UnknownProjectError(projectId);
     this.database.exec("BEGIN IMMEDIATE");
@@ -619,7 +619,10 @@ export class EventStore {
           ts: options.ts ?? new Date().toISOString(),
           ...input,
         } as Event;
-        reduceEvent(fold(this.listEvents(projectId)), event);
+        reduceEvent(fold(this.listEvents(projectId)), event, {
+          ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+          ...(options.trustedImport === true ? { replay: true } : {}),
+        });
         const { nodeRef, edgeRef } = refs(input);
         this.database
           .prepare(

@@ -54,6 +54,12 @@ function mutationActor(request: FastifyRequest): Actor {
   throw new EventValidationError("x-mg-actor must be human or browser_agent");
 }
 
+function mutationSession(request: FastifyRequest): string | undefined {
+  const sessionId = textHeader(request.headers["x-mg-session"]);
+  if (sessionId === "") throw new EventValidationError("x-mg-session must not be empty");
+  return sessionId;
+}
+
 function baseSequence(body: Record<string, unknown>): number | undefined {
   if (body.base_seq === undefined) return undefined;
   if (!Number.isSafeInteger(body.base_seq) || (body.base_seq as number) < 0) {
@@ -145,7 +151,7 @@ function remapPayload(value: unknown, ids: ReadonlyMap<string, string>, key?: st
 function cloneInputs(events: readonly Event[], now: Date): { input: EventInput; ts: string }[] {
   const ids = collectIds(events);
   const latestTime = events.at(-1) ? Date.parse(events.at(-1)!.ts) : now.getTime();
-  return events.map((event) => ({
+  return events.filter((event) => event.type !== "POLICY_STATED").map((event) => ({
     input: parseEventInput({
       actor: event.actor,
       type: event.type,
@@ -172,6 +178,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     try {
       const body = request.body as Record<string, unknown>;
       const actor = mutationActor(request);
+      const sessionId = mutationSession(request);
       const input = parseEventInput({ ...body, actor });
       if (reporterEventTypes.has(input.type)) {
         throw new EventValidationError(`${input.type} must use the reporter endpoint`);
@@ -179,6 +186,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       baseSeq = baseSequence(body);
       const result = store.append(project, input, {
         ...(baseSeq === undefined ? {} : { baseSeq }),
+        ...(sessionId === undefined ? {} : { sessionId }),
         ts: now().toISOString(),
       });
       return reply.send({ seq: result.event.seq });
@@ -229,7 +237,9 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     try {
       const source = store.hasProject(seedProjectId) ? store.listEvents(seedProjectId) : [];
       store.createProject(project, token, created.toISOString(), seedProjectId);
-      for (const clone of cloneInputs(source, created)) store.append(project, clone.input, { ts: clone.ts });
+      for (const clone of cloneInputs(source, created)) {
+        store.append(project, clone.input, { ts: clone.ts, trustedImport: true });
+      }
       const state = fold(store.listEvents(project));
       for (const current of Object.values(state.nodes).filter(
         (node) => node.record_type === "task" && node.state === "running",

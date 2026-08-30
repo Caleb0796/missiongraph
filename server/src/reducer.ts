@@ -60,6 +60,11 @@ export interface GraphState {
   critical_path: string[];
 }
 
+export interface ReducerContext {
+  sessionId?: string;
+  replay?: boolean;
+}
+
 export function initialState(): GraphState {
   return {
     v: 1,
@@ -264,15 +269,26 @@ function requirePolicy(event: Ev<"APPROVED"> | Ev<"REJECTED">): void {
   }
 }
 
-function resolveApproval(state: GraphState, event: Ev<"APPROVED"> | Ev<"REJECTED">): void {
+function resolveApproval(
+  state: GraphState,
+  event: Ev<"APPROVED"> | Ev<"REJECTED">,
+  context: ReducerContext,
+): void {
   requirePolicy(event);
   const approval = state.approvals[event.payload.approval_id];
   if (!approval || approval.status !== "pending") fail(`approval ${event.payload.approval_id} is not pending`);
   if (approval.node_id !== event.payload.node_id) fail("approval node_id does not match");
   const target = node(state, event.payload.node_id);
   if (target.state !== "review") fail(`node ${target.id} is not in review`);
-  if (event.payload.policy_ref && !state.policies[event.payload.policy_ref]) {
-    fail(`policy ${event.payload.policy_ref} does not exist`);
+  if (event.payload.policy_ref) {
+    const policy = state.policies[event.payload.policy_ref];
+    if (!policy && !context.replay) fail(`policy ${event.payload.policy_ref} does not exist`);
+    if (!context.replay) {
+      if (!context.sessionId) fail(`${event.type} with policy_ref requires a caller session`);
+      if (policy?.session_id !== context.sessionId) {
+        fail(`policy ${event.payload.policy_ref} belongs to another browser session`);
+      }
+    }
   }
   approval.status = event.type === "APPROVED" ? "approved" : "rejected";
   approval.resolved_at = event.ts;
@@ -287,7 +303,7 @@ function resolveApproval(state: GraphState, event: Ev<"APPROVED"> | Ev<"REJECTED
   }
 }
 
-function apply(state: GraphState, event: Event): void {
+function apply(state: GraphState, event: Event, context: ReducerContext): void {
   switch (event.type) {
     case "TASK_ADDED":
       addNode(state, event.payload.node);
@@ -387,9 +403,15 @@ function apply(state: GraphState, event: Event): void {
     }
     case "APPROVED":
     case "REJECTED":
-      resolveApproval(state, event);
+      resolveApproval(state, event, context);
       break;
     case "POLICY_STATED":
+      if (!context.replay) {
+        if (!context.sessionId) fail("POLICY_STATED requires a caller session");
+        if (event.payload.session_id !== context.sessionId) {
+          fail("POLICY_STATED session_id does not match the caller session");
+        }
+      }
       if (state.policies[event.payload.policy_ref]) fail(`policy ${event.payload.policy_ref} already exists`);
       state.policies[event.payload.policy_ref] = {
         text: event.payload.text,
@@ -483,10 +505,10 @@ function apply(state: GraphState, event: Event): void {
   }
 }
 
-export function reduceEvent(state: GraphState, event: Event): GraphState {
+export function reduceEvent(state: GraphState, event: Event, context: ReducerContext = {}): GraphState {
   if (event.seq !== state.seq + 1) fail(`expected seq ${state.seq + 1}, received ${event.seq}`);
   const next = cloneState(state);
-  apply(next, event);
+  apply(next, event, context);
   next.seq = event.seq;
   refreshDerived(next, event.ts);
   return next;
@@ -494,6 +516,6 @@ export function reduceEvent(state: GraphState, event: Event): GraphState {
 
 export function fold(events: readonly Event[]): GraphState {
   let state = initialState();
-  for (const event of events) state = reduceEvent(state, event);
+  for (const event of events) state = reduceEvent(state, event, { replay: true });
   return state;
 }
