@@ -43,7 +43,7 @@ The actions array may contain only these exact object shapes:
 {"act":"kill_worker","node_id":"..."}
 {"act":"rebrief_worker","node_id":"...","message":"..."}
 {"act":"note","text":"..."}
-Return at most 10 actions. Brief and message strings must not exceed 16 KB. Return at most one spawn_worker per node in a turn.
+Return at most 10 actions. Brief, message, and note text strings must not exceed 16 KB. Return at most one spawn_worker per node in a turn.
 Return {"actions":[]} when no mechanical action is warranted. Never invent actions or fields outside this contract.
 
 COMPACT PROJECT STATE
