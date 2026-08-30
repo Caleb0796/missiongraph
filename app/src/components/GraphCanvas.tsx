@@ -22,7 +22,14 @@ import {
   type DisplayState,
 } from '../model/graph'
 import { useMissionStore } from '../store/mission-store'
-import { copyCurrentMissionLink, resetMissionDemo } from '../transport/client'
+import {
+  copyCurrentMissionLink,
+  openStoredMission,
+  reconnectMission,
+  resetMissionDemo,
+  startFreshMissionCopy,
+} from '../transport/client'
+import { skewCorrectedNow } from '../transport/client-logic'
 import { FlightPanel } from './FlightPanel'
 import { Inspector } from './Inspector'
 import { PulseBar } from './PulseBar'
@@ -72,6 +79,10 @@ function MissionBoard() {
   const cameraRequest = useMissionStore((state) => state.cameraRequest)
   const connectionMode = useMissionStore((state) => state.connectionMode)
   const connectionMessage = useMissionStore((state) => state.connectionMessage)
+  const clockSkewMs = useMissionStore((state) => state.clockSkewMs)
+  const linkErrorHasStoredIdentity = useMissionStore(
+    (state) => state.linkErrorHasStoredIdentity,
+  )
   const projectId = useMissionStore((state) => state.projectId)
   const toast = useMissionStore((state) => state.toast)
   const structuralPreview = useMissionStore((state) => state.structuralPreview)
@@ -98,9 +109,13 @@ function MissionBoard() {
     () => getCriticalPath(nodes, edges),
     [edges, nodes],
   )
+  const correctedNow = skewCorrectedNow(now, clockSkewMs)
   const idleNodeIds = useMemo(
-    () => new Set(idleRadar(nodes, edges, readySince, now).map((node) => node.id)),
-    [edges, nodes, now, readySince],
+    () =>
+      new Set(
+        idleRadar(nodes, edges, readySince, correctedNow).map((node) => node.id),
+      ),
+    [correctedNow, edges, nodes, readySince],
   )
 
   const flowEdges: Edge[] = useMemo(
@@ -168,7 +183,7 @@ function MissionBoard() {
               ),
             idleFor:
               idleNodeIds.has(node.id) && readySince[node.id]
-                ? humanizeIdleAge(readySince[node.id], now)
+                ? humanizeIdleAge(readySince[node.id], correctedNow)
                 : undefined,
             critical: criticalPath.nodeIds.includes(node.id),
             highlighted: highlightedIds.includes(node.id),
@@ -187,7 +202,7 @@ function MissionBoard() {
       positions,
       readySince,
       selectedId,
-      now,
+      correctedNow,
     ],
   )
 
@@ -327,12 +342,16 @@ function MissionBoard() {
 
   async function copyMissionLink() {
     try {
-      await copyCurrentMissionLink()
-      useMissionStore.getState().showToast(
-        'Mission link copied',
-        'info',
-        'anyone with this link can act on this mission',
-      )
+      const result = await copyCurrentMissionLink()
+      useMissionStore
+        .getState()
+        .showToast(
+          result.copied ? 'Mission link copied' : 'Copy this mission link manually',
+          'info',
+          result.copied
+            ? 'anyone with this link can act on this mission'
+            : result.url,
+        )
     } catch (error) {
       useMissionStore
         .getState()
@@ -365,9 +384,13 @@ function MissionBoard() {
         onCatchUp={() => void replayCatchUp()}
         onReset={() => void resetMissionDemo()}
         onCopyMissionLink={() => void copyMissionLink()}
+        onReconnect={() => void reconnectMission()}
+        onStartFreshMission={() => void startFreshMissionCopy()}
+        onOpenStoredMission={() => void openStoredMission()}
         replaying={replaying}
         connectionMode={connectionMode}
         connectionMessage={connectionMessage}
+        linkErrorHasStoredIdentity={linkErrorHasStoredIdentity}
       />
       <div className="canvas-stage">
         <ReactFlow<TaskFlowNode, Edge>
@@ -407,7 +430,7 @@ function MissionBoard() {
           <span><i className="legend-line legend-line--conflict" />File conflict</span>
           <span className="hidden xl:inline">Drag to arrange · connect ports to depend · delete to tombstone</span>
         </div>
-        <FlightPanel now={now} />
+        <FlightPanel now={correctedNow} />
         {structuralPreview && (
           <section className="structural-confirm" role="dialog" aria-modal="true">
             <p className="structural-confirm-kicker">Blast-radius preview</p>

@@ -7,9 +7,13 @@ interface PulseBarProps {
   onCatchUp: () => void
   onReset: () => void
   onCopyMissionLink: () => void
+  onReconnect: () => void
+  onStartFreshMission: () => void
+  onOpenStoredMission: () => void
   replaying: boolean
   connectionMode: ConnectionMode
   connectionMessage: string
+  linkErrorHasStoredIdentity: boolean
 }
 
 function Stat({ label, value, tone }: { label: string; value: number; tone: string }) {
@@ -28,9 +32,13 @@ export function PulseBar({
   onCatchUp,
   onReset,
   onCopyMissionLink,
+  onReconnect,
+  onStartFreshMission,
+  onOpenStoredMission,
   replaying,
   connectionMode,
   connectionMessage,
+  linkErrorHasStoredIdentity,
 }: PulseBarProps) {
   return (
     <header className="pulse-bar">
@@ -45,7 +53,14 @@ export function PulseBar({
             MissionGraph
           </p>
           <p className="truncate font-mono text-[9px] tracking-[0.16em] text-slate-600 uppercase">
-            Shorty · {connectionMode === 'fixture' ? 'fixture simulation' : 'live project'}
+            Shorty ·{' '}
+            {connectionMode === 'live'
+              ? 'live project'
+              : connectionMode === 'fixture'
+                ? 'fixture simulation'
+                : connectionMode === 'link-error'
+                  ? 'mission link unavailable'
+                  : 'connecting'}
           </p>
         </div>
       </div>
@@ -88,9 +103,34 @@ export function PulseBar({
             ? 'Live'
             : connectionMode === 'loading'
               ? 'Connecting'
-              : 'Fixture'}
+              : connectionMode === 'fixture'
+                ? 'Fixture'
+                : 'Link expired'}
         </div>
-        <button type="button" className="compat-link" onClick={onCopyMissionLink}>
+        {connectionMode === 'link-error' && (
+          <div className="connection-recovery" role="alert">
+            <span>Expired or invalid mission link</span>
+            <button type="button" onClick={onStartFreshMission}>
+              Start a fresh mission copy
+            </button>
+            {linkErrorHasStoredIdentity && (
+              <button type="button" onClick={onOpenStoredMission}>
+                Open my stored mission
+              </button>
+            )}
+          </div>
+        )}
+        {connectionMode === 'fixture' && (
+          <button type="button" className="compat-link" onClick={onReconnect}>
+            Reconnect
+          </button>
+        )}
+        <button
+          type="button"
+          className="compat-link"
+          onClick={onCopyMissionLink}
+          disabled={connectionMode !== 'live'}
+        >
           Copy mission link
         </button>
         <a href="/compat" className="compat-link">

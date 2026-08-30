@@ -104,7 +104,7 @@ const helloMissionGraph: ToolDefinition = {
 
 let initialization: Promise<RegistryStatus> | undefined
 let definitions: ToolDefinition[] = [helloMissionGraph]
-let clientCursor: string | null = null
+let clientCursor: { projectId: string | null; cursor: string } | null = null
 
 export function getWebMcpRuntime(): WebMcpRuntime | null {
   if (document.modelContext) {
@@ -136,7 +136,11 @@ async function executeDefinition(
     definition.name === 'graph_digest' && typeof inputs.since === 'string'
       ? inputs.since
       : null
-  const since = explicitSince ?? clientCursor ?? storeBefore.cursor
+  const scopedCursor =
+    clientCursor?.projectId === storeBefore.projectId
+      ? clientCursor.cursor
+      : null
+  const since = explicitSince ?? scopedCursor ?? storeBefore.cursor
   let outcome: ToolOutcome
   try {
     outcome = await definition.execute(inputs, options)
@@ -147,7 +151,10 @@ async function executeDefinition(
   const changes = storeAfter.changes
     .filter((change) => change.seq > Number(since))
     .slice(-50)
-  clientCursor = storeAfter.cursor
+  clientCursor = {
+    projectId: storeAfter.projectId,
+    cursor: storeAfter.cursor,
+  }
   return JSON.stringify({
     ok: !outcome.error,
     ...outcome,

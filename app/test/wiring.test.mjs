@@ -11,8 +11,11 @@ test('live hydration replays seed history before tailing', async () => {
     client.indexOf('async function connectProject'),
     client.indexOf('export function initializeMissionClient'),
   )
-  assert.ok(connectProject.indexOf("await loadChangesSince('0')") >= 0)
-  assert.ok(connectProject.indexOf("await loadChangesSince('0')") < connectProject.indexOf('openRealtime()'))
+  assert.ok(connectProject.indexOf("await loadChangesSince('0', candidate)") >= 0)
+  assert.ok(
+    connectProject.indexOf("await loadChangesSince('0', candidate)") <
+      connectProject.indexOf('openRealtime(candidate)'),
+  )
 })
 
 test('stale mutations surface without reposting', async () => {
@@ -65,18 +68,76 @@ test('all M4 tools emit their contract events and require policy attribution', a
   assert.match(tools, /statePolicy,[\s\S]*dispatch,[\s\S]*retryWithGuidance/)
 })
 
-test('expired identities re-clone visibly and realtime resumes from the folded cursor', async () => {
+test('identity recovery is source-aware and realtime resumes with fenced backoff', async () => {
   const client = await source('../src/transport/client.ts')
-  assert.match(client, /shouldReplaceStoredIdentity\(error\.code\)/)
+  const linkedBranch = client.slice(
+    client.indexOf('const linked = sharedIdentityFromUrl()'),
+    client.indexOf('const persisted = storedIdentity()'),
+  )
+  const storedBranch = client.slice(
+    client.indexOf('const persisted = storedIdentity()'),
+    client.indexOf(
+      'const cloned = await cloneDemo()',
+      client.indexOf('const persisted = storedIdentity()'),
+    ),
+  )
+  assert.match(client, /identityFailureDisposition\('url', error\.status\)/)
+  assert.match(client, /showInvalidMissionLink\(storedIdentity\(\) !== null\)/)
+  assert.match(client, /identityFailureDisposition\('stored', error\.status\)/)
+  assert.doesNotMatch(linkedBranch, /localStorage\.removeItem\(IDENTITY_KEY\)/)
+  assert.match(storedBranch, /localStorage\.removeItem\(IDENTITY_KEY\)/)
   assert.match(
     client,
     /previous session expired — started a fresh mission copy/,
   )
   assert.match(client, /setConnectionMode\('loading', 'Starting a fresh mission copy…'\)/)
-  assert.match(client, /realtimeEndpoint\('websocket', client, cursor\)/)
-  assert.match(client, /realtimeEndpoint\('sse', client, cursor\)/)
+  assert.match(client, /realtimeEndpoint\('websocket', candidate\.client, cursor\)/)
+  assert.match(client, /realtimeEndpoint\('sse', candidate\.client, cursor\)/)
   assert.match(client, /sequenceDisposition\(store\.cursor, data\.event\.seq\)/)
-  assert.match(client, /scheduleReconnect\(true\)/)
+  assert.doesNotMatch(client, /scheduleReconnect\(true\)/)
+  assert.match(client, /failedWebSockets\+\+/)
+  assert.match(client, /connectionProvedStable/)
+  const reconnect = client.slice(
+    client.indexOf('function scheduleReconnect()'),
+    client.indexOf('function proveConnectionStable'),
+  )
+  assert.match(reconnect, /setConnectionMode\(\s*'loading'/)
+})
+
+test('all stream readers and store folds are fenced to project identity', async () => {
+  const client = await source('../src/transport/client.ts')
+  const store = await source('../src/store/mission-store.ts')
+  assert.match(client, /identityEpoch/)
+  assert.match(client, /historyClosers/)
+  assert.match(client, /for \(const close of \[\.\.\.historyClosers\]\) close\(\)/)
+  assert.match(client, /data\.event\.project_id !== candidate\.client\.project/)
+  assert.match(store, /eventBelongsToProject\(state\.projectId, event\.project_id\)/)
+  assert.match(store, /shouldApplySnapshot\(/)
+})
+
+test('server digest is the shared approval-order source', async () => {
+  const client = await source('../src/transport/client.ts')
+  const store = await source('../src/store/mission-store.ts')
+  const panel = await source('../src/components/FlightPanel.tsx')
+  const tools = await source('../src/webmcp/tools.ts')
+  assert.match(client, /base_seq: cursor - 1/)
+  assert.match(client, /applyServerDigest\(candidate\.client\.project, stale\.fresh_digest\)/)
+  assert.match(store, /approvalRankingSource: 'server'/)
+  assert.match(panel, /approvalQueueFromRanking\(approvals, approvalRanking\)/)
+  assert.match(tools, /approvalQueueFromRanking\(/)
+  assert.doesNotMatch(panel, /fixtureRankedPendingApprovals/)
+})
+
+test('WebMCP cursor and bootstrap retries are project-scoped', async () => {
+  const registry = await source('../src/webmcp/registry.ts')
+  const client = await source('../src/transport/client.ts')
+  const pulse = await source('../src/components/PulseBar.tsx')
+  assert.match(registry, /clientCursor\?\.projectId === storeBefore\.projectId/)
+  assert.match(registry, /projectId: storeAfter\.projectId/)
+  assert.match(client, /bootstrapRetryDelay\(bootstrapAttempt\+\+\)/)
+  assert.match(client, /initialization = null/)
+  assert.match(client, /export function reconnectMission\(\)/)
+  assert.match(pulse, />\s*Reconnect\s*</)
 })
 
 test('tool console keeps unknown tools and malformed JSON as inline errors', async () => {
@@ -90,8 +151,12 @@ test('tool console keeps unknown tools and malformed JSON as inline errors', asy
 test('capability links and fixture labeling stay explicit', async () => {
   const client = await source('../src/transport/client.ts')
   const pulse = await source('../src/components/PulseBar.tsx')
-  assert.match(client, /searchParams\.set\('mg_project', identity\.project\)/)
-  assert.match(client, /searchParams\.set\('mg_token', identity\.token\)/)
+  assert.match(client, /searchParams\.set\('mg_project', candidate\.client\.project\)/)
+  assert.match(client, /searchParams\.set\('mg_token', candidate\.client\.token\)/)
+  assert.match(client, /document\.execCommand\('copy'\)/)
+  assert.match(pulse, /disabled=\{connectionMode !== 'live'\}/)
+  assert.match(pulse, /Start a fresh mission copy/)
+  assert.match(pulse, /Open my stored mission/)
   assert.match(pulse, /connectionMode === 'fixture'/)
   assert.match(pulse, /Dev fixture projection/)
   assert.doesNotMatch(pulse, /connectionMessage\.includes\('fixture projection'\)/)
