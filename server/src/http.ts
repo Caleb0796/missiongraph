@@ -144,7 +144,7 @@ function remapPayload(value: unknown, ids: ReadonlyMap<string, string>, key?: st
 
 function cloneInputs(events: readonly Event[], now: Date): { input: EventInput; ts: string }[] {
   const ids = collectIds(events);
-  const firstTime = events[0] ? Date.parse(events[0].ts) : now.getTime();
+  const latestTime = events.at(-1) ? Date.parse(events.at(-1)!.ts) : now.getTime();
   return events.map((event) => ({
     input: parseEventInput({
       actor: event.actor,
@@ -152,7 +152,7 @@ function cloneInputs(events: readonly Event[], now: Date): { input: EventInput; 
       payload: remapPayload(event.payload, ids),
       idem_key: randomUUID(),
     }),
-    ts: new Date(now.getTime() + Math.max(0, Date.parse(event.ts) - firstTime)).toISOString(),
+    ts: new Date(now.getTime() + Date.parse(event.ts) - latestTime).toISOString(),
   }));
 }
 

@@ -3,12 +3,12 @@ import { once } from "node:events";
 import WebSocket from "ws";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createServer, type MissionGraphServer } from "../src/http.js";
+import { createServer, type MissionGraphServer, type ServerOptions } from "../src/http.js";
 
 const openServers: MissionGraphServer[] = [];
 
-function server(): MissionGraphServer {
-  const result = createServer({ databasePath: ":memory:", reporterToken: "reporter-secret" });
+function server(options: ServerOptions = {}): MissionGraphServer {
+  const result = createServer({ databasePath: ":memory:", reporterToken: "reporter-secret", ...options });
   openServers.push(result);
   return result;
 }
@@ -80,6 +80,56 @@ describe("HTTP and streaming contract", () => {
     expect(body.cursor).toBe("1");
     expect(nodeIds).toHaveLength(1);
     expect(nodeIds).not.toContain("seed-node");
+  });
+
+  it("anchors the latest cloned seed event at clone time", async () => {
+    const cloneTime = new Date("2026-08-30T12:00:00.000Z");
+    const { app, store } = server({ now: () => cloneTime });
+    store.createProject("demo-seed", "seed-token", "2026-08-30T10:00:00.000Z");
+    store.append(
+      "demo-seed",
+      {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: {
+            id: "running-seed-node",
+            title: "Running seed task",
+            brief: "A real running seed task.",
+            estimate_min: 5,
+            tags: [],
+            state: "running",
+          },
+        },
+        idem_key: "seed-add",
+      },
+      { ts: "2026-08-30T10:00:00.000Z" },
+    );
+    store.append(
+      "demo-seed",
+      {
+        actor: "human",
+        type: "JOURNAL_NOTE",
+        payload: { text: "Seed history is still real." },
+        idem_key: "seed-note",
+      },
+      { ts: "2026-08-30T10:05:00.000Z" },
+    );
+
+    const clone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const body = clone.json<{ project: string }>();
+    const clonedEvents = store.listEvents(body.project);
+
+    expect(clonedEvents.map((event) => event.ts)).toEqual([
+      "2026-08-30T11:55:00.000Z",
+      "2026-08-30T12:00:00.000Z",
+      "2026-08-30T12:00:00.000Z",
+    ]);
+    expect(clonedEvents.at(-1)).toMatchObject({
+      type: "NODE_STATE_CHANGED",
+      payload: { from: "running", to: "paused", detail: "worker detached during visitor clone" },
+    });
+    expect(clonedEvents.every((event) => Date.parse(event.ts) <= cloneTime.getTime())).toBe(true);
   });
 
   it("authenticates fleet reports separately from visitor mutations", async () => {
