@@ -1,5 +1,4 @@
 import { useMemo, useState } from 'react'
-import { shortyApprovals } from '../fixtures/shorty-dag'
 import { describeEvent, getDisplayState } from '../model/graph'
 import type { GraphEdge, MissionEvent, TaskNode } from '../model/types'
 import { useMissionStore } from '../store/mission-store'
@@ -26,6 +25,11 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
   const approve = useMissionStore((state) => state.approve)
   const reject = useMissionStore((state) => state.reject)
   const dispatch = useMissionStore((state) => state.dispatch)
+  const approvals = useMissionStore((state) => state.approvals)
+  const annotations = useMissionStore((state) => state.annotations)
+  const handoffs = useMissionStore((state) => state.handoffs)
+  const storedDeviations = useMissionStore((state) => state.deviations)
+  const workerLogs = useMissionStore((state) => state.workerLogs)
   const [activeTab, setActiveTab] = useState<Tab>('Brief')
   const node = nodes.find((candidate) => candidate.id === selectedId)
   const edge = edges.find((candidate) => candidate.edge_id === selectedId)
@@ -97,18 +101,13 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
   const downstream = edge
     ? nodes.find((candidate) => candidate.id === edge.downstream)
     : undefined
-  const handoff = relevantEvents.findLast(
-    (event) => event.type === 'HANDOFF_FILED',
-  )
-  const deviations = relevantEvents.filter(
-    (event) => event.type === 'DEVIATION_NOTED',
-  )
   const decisions = relevantEvents.filter((event) =>
     ['APPROVAL_CREATED', 'APPROVED', 'REJECTED', 'ANNOTATED'].includes(event.type),
   )
-  const logs = relevantEvents.filter((event) => event.type === 'WORKER_LOG')
   const approval = node
-    ? shortyApprovals.find((item) => item.node_id === node.id)
+    ? Object.values(approvals).find(
+        (item) => item.node_id === node.id && item.status === 'pending',
+      )
     : undefined
   const displayState = node ? getDisplayState(node, nodes, edges) : undefined
 
@@ -131,12 +130,14 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
           {approval && (
             <span
               className={
-                approval.risk === 'schema'
+                approval.diff_stats?.files.some((file) => file.includes('schema'))
                   ? 'inspector-risk inspector-risk--schema'
                   : 'inspector-risk'
               }
             >
-              {approval.risk === 'schema' ? 'Schema exception' : 'Routine review'}
+              {approval.diff_stats?.files.some((file) => file.includes('schema'))
+                ? 'Schema exception'
+                : 'Pending review'}
             </span>
           )}
           {edge && (
@@ -185,23 +186,23 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
                 ? `${downstream?.title} cannot finish its intended work until ${upstream?.title} has delivered the prerequisite.`
                 : `${upstream?.title} and ${downstream?.title} touch overlapping implementation areas. They may proceed in parallel, but their workers should coordinate before handoff.`}
             </p>
-            {relevantEvents
-              .filter((event) => event.type === 'ANNOTATED')
-              .map((event) => (
-                <ProseRecord key={event.idem_key}>{event.payload.note}</ProseRecord>
-              ))}
+            {(annotations[edge.edge_id] ?? []).map((annotation) => (
+              <ProseRecord key={`${annotation.ts}-${annotation.note}`}>
+                {annotation.note}
+              </ProseRecord>
+            ))}
           </>
         )}
 
         {activeTab === 'Handoff' &&
-          (handoff?.type === 'HANDOFF_FILED' ? (
+          (node && handoffs[node.id] ? (
             <>
-              <p className="inspector-prose">{handoff.payload.handoff.summary}</p>
+              <p className="inspector-prose">{handoffs[node.id].summary}</p>
               <ProseRecord>
-                <p>{handoff.payload.handoff.downstream_notes}</p>
+                <p>{handoffs[node.id].downstream_notes}</p>
                 <p className="mt-3 text-xs text-slate-500">
-                  Tests: {handoff.payload.handoff.tests} · Files:{' '}
-                  {handoff.payload.handoff.files.join(', ')}
+                  Tests: {handoffs[node.id].tests} · Files:{' '}
+                  {handoffs[node.id].files.join(', ')}
                 </p>
               </ProseRecord>
             </>
@@ -213,19 +214,15 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
           ))}
 
         {activeTab === 'Deviations' &&
-          (deviations.length > 0 ? (
-            deviations.map((event) => (
-              <ProseRecord key={event.idem_key}>
-                {event.type === 'DEVIATION_NOTED' && (
-                  <>
-                    <p>{event.payload.text}</p>
-                    {event.payload.actual_min && (
-                      <p className="mt-3 text-xs text-slate-500">
-                        Planned {event.payload.est_min} minutes; observed{' '}
-                        {event.payload.actual_min} minutes.
-                      </p>
-                    )}
-                  </>
+          (node && (storedDeviations[node.id]?.length ?? 0) > 0 ? (
+            storedDeviations[node.id].map((deviation) => (
+              <ProseRecord key={`${deviation.ts}-${deviation.text}`}>
+                <p>{deviation.text}</p>
+                {deviation.actual_min && (
+                  <p className="mt-3 text-xs text-slate-500">
+                    Planned {deviation.est_min} minutes; observed{' '}
+                    {deviation.actual_min} minutes.
+                  </p>
                 )}
               </ProseRecord>
             ))
@@ -249,14 +246,10 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
           ))}
 
         {activeTab === 'Log' &&
-          (logs.length > 0 ? (
-            logs.flatMap((event) =>
-              event.type === 'WORKER_LOG'
-                ? event.payload.lines.map((line) => (
-                    <ProseRecord key={`${event.idem_key}-${line}`}>{line}</ProseRecord>
-                  ))
-                : [],
-            )
+          (node && (workerLogs[node.id]?.length ?? 0) > 0 ? (
+            workerLogs[node.id].map((line, index) => (
+              <ProseRecord key={`${index}-${line}`}>{line}</ProseRecord>
+            ))
           ) : (
             <EmptyRecord>
               No worker log has arrived for this selection. Logs are rendered as

@@ -13,7 +13,6 @@ import {
 import ELK from 'elkjs/lib/elk.bundled.js'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import '@xyflow/react/dist/style.css'
-import { shortyApprovals } from '../fixtures/shorty-dag'
 import {
   getCriticalPath,
   getDisplayState,
@@ -65,6 +64,11 @@ function MissionBoard() {
   const selectedId = useMissionStore((state) => state.selectedId)
   const highlightedIds = useMissionStore((state) => state.highlightedIds)
   const readySince = useMissionStore((state) => state.readySince)
+  const approvals = useMissionStore((state) => state.approvals)
+  const cameraRequest = useMissionStore((state) => state.cameraRequest)
+  const connectionMode = useMissionStore((state) => state.connectionMode)
+  const connectionMessage = useMissionStore((state) => state.connectionMessage)
+  const projectId = useMissionStore((state) => state.projectId)
   const toast = useMissionStore((state) => state.toast)
   const hydratePositions = useMissionStore((state) => state.hydratePositions)
   const moveNode = useMissionStore((state) => state.moveNode)
@@ -146,7 +150,10 @@ function MissionBoard() {
             displayState,
             approval:
               node.state === 'review' &&
-              shortyApprovals.some((approval) => approval.node_id === node.id),
+              Object.values(approvals).some(
+                (approval) =>
+                  approval.node_id === node.id && approval.status === 'pending',
+              ),
             idleFor: displayState === 'ready' ? readySince[node.id] : undefined,
             critical: criticalPath.nodeIds.includes(node.id),
             highlighted: highlightedIds.includes(node.id),
@@ -155,6 +162,7 @@ function MissionBoard() {
       }),
     [
       criticalPath.nodeIds,
+      approvals,
       dragPositions,
       edges,
       highlightedIds,
@@ -167,7 +175,15 @@ function MissionBoard() {
   )
 
   useEffect(() => {
-    if (hasLaidOut.current || nodes.length === 0) {
+    hasLaidOut.current = false
+  }, [projectId])
+
+  useEffect(() => {
+    if (
+      connectionMode === 'loading' ||
+      hasLaidOut.current ||
+      nodes.length === 0
+    ) {
       return
     }
     hasLaidOut.current = true
@@ -178,7 +194,17 @@ function MissionBoard() {
       hydratePositions(layout)
       window.setTimeout(() => void fitView({ padding: 0.16, duration: 280 }), 0)
     })
-  }, [fitView, flowEdges, hydratePositions, nodes])
+  }, [connectionMode, fitView, flowEdges, hydratePositions, nodes])
+
+  useEffect(() => {
+    if (!cameraRequest) return
+    const focused = flowNodes.filter((node) =>
+      cameraRequest.nodeIds.includes(node.id),
+    )
+    if (focused.length > 0) {
+      void fitView({ nodes: focused, padding: 0.28, duration: 420 })
+    }
+  }, [cameraRequest, fitView, flowNodes])
 
   useEffect(() => {
     function handleDelete(event: KeyboardEvent) {
@@ -301,6 +327,8 @@ function MissionBoard() {
         counts={counts}
         onCatchUp={() => void replayCatchUp()}
         replaying={replaying}
+        connectionMode={connectionMode}
+        connectionMessage={connectionMessage}
       />
       <div className="canvas-stage">
         <ReactFlow<TaskFlowNode, Edge>

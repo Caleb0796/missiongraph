@@ -1,10 +1,13 @@
 import type { DisplayState } from '../model/graph'
+import type { ConnectionMode } from '../store/mission-store'
 
 interface PulseBarProps {
   eta: number
   counts: Record<DisplayState, number>
   onCatchUp: () => void
   replaying: boolean
+  connectionMode: ConnectionMode
+  connectionMessage: string
 }
 
 function Stat({ label, value, tone }: { label: string; value: number; tone: string }) {
@@ -17,7 +20,14 @@ function Stat({ label, value, tone }: { label: string; value: number; tone: stri
   )
 }
 
-export function PulseBar({ eta, counts, onCatchUp, replaying }: PulseBarProps) {
+export function PulseBar({
+  eta,
+  counts,
+  onCatchUp,
+  replaying,
+  connectionMode,
+  connectionMessage,
+}: PulseBarProps) {
   return (
     <header className="pulse-bar">
       <div className="flex min-w-0 items-center gap-3">
@@ -31,7 +41,7 @@ export function PulseBar({ eta, counts, onCatchUp, replaying }: PulseBarProps) {
             MissionGraph
           </p>
           <p className="truncate font-mono text-[9px] tracking-[0.16em] text-slate-600 uppercase">
-            Shorty · fixture simulation
+            Shorty · {connectionMode === 'fixture' ? 'fixture simulation' : 'live project'}
           </p>
         </div>
       </div>
@@ -54,6 +64,11 @@ export function PulseBar({ eta, counts, onCatchUp, replaying }: PulseBarProps) {
       </div>
 
       <div className="flex items-center gap-3">
+        {connectionMode === 'fixture' && (
+          <span className="offline-badge" title={connectionMessage}>
+            Offline fixture
+          </span>
+        )}
         <button
           type="button"
           className="catch-up-chip"
@@ -69,6 +84,9 @@ export function PulseBar({ eta, counts, onCatchUp, replaying }: PulseBarProps) {
         </div>
         <a href="/compat" className="compat-link">
           Compat
+        </a>
+        <a href="/tools" className="compat-link">
+          Tools
         </a>
       </div>
     </header>
