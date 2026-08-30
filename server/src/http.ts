@@ -169,6 +169,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
   app.post("/api/p/:project/mutations", async (request, reply) => {
     const project = (request.params as { project: string }).project;
     if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
+    let baseSeq: number | undefined;
     try {
       const body = request.body as Record<string, unknown>;
       const actor = mutationActor(request);
@@ -176,7 +177,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       if (reporterEventTypes.has(input.type)) {
         throw new EventValidationError(`${input.type} must use the reporter endpoint`);
       }
-      const baseSeq = baseSequence(body);
+      baseSeq = baseSequence(body);
       const result = store.append(project, input, {
         ...(baseSeq === undefined ? {} : { baseSeq }),
         ts: now().toISOString(),
@@ -185,7 +186,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     } catch (error) {
       if (error instanceof StaleSequenceError) {
         const events = store.listEvents(project);
-        return reply.code(409).send({ fresh_digest: buildDigest(fold(events), events, error.currentSeq) });
+        return reply.code(409).send({ fresh_digest: buildDigest(fold(events), events, baseSeq ?? 0) });
       }
       return errorReply(error, reply);
     }

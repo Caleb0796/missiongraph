@@ -158,10 +158,16 @@ function object(value: unknown, label: string): Record<string, unknown> {
 }
 
 function string(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new EventValidationError(`${label} must be a non-empty string`);
+  if (typeof value !== "string") {
+    throw new EventValidationError(`${label} must be a string`);
   }
   return value;
+}
+
+function identifier(value: unknown, label: string): string {
+  const parsed = string(value, label);
+  if (parsed.length === 0) throw new EventValidationError(`${label} must not be empty`);
+  return parsed;
 }
 
 function number(value: unknown, label: string, minimum = 0): number {
@@ -189,6 +195,10 @@ function optionalString(value: unknown, label: string): string | undefined {
   return value === undefined ? undefined : string(value, label);
 }
 
+function optionalIdentifier(value: unknown, label: string): string | undefined {
+  return value === undefined ? undefined : identifier(value, label);
+}
+
 function oneOf<T extends string>(value: unknown, values: readonly T[], label: string): T {
   if (typeof value !== "string" || !values.includes(value as T)) {
     throw new EventValidationError(`${label} must be one of ${values.join(", ")}`);
@@ -199,7 +209,7 @@ function oneOf<T extends string>(value: unknown, values: readonly T[], label: st
 function taskNode(value: unknown, label: string): TaskNode {
   const item = object(value, label);
   return {
-    id: string(item.id, `${label}.id`),
+    id: identifier(item.id, `${label}.id`),
     title: string(item.title, `${label}.title`),
     brief: string(item.brief, `${label}.brief`),
     estimate_min: number(item.estimate_min, `${label}.estimate_min`),
@@ -235,7 +245,7 @@ function handoff(value: unknown): Handoff {
 }
 
 function nodeIdPayload(payload: Record<string, unknown>): { node_id: string } {
-  return { node_id: string(payload.node_id, "payload.node_id") };
+  return { node_id: identifier(payload.node_id, "payload.node_id") };
 }
 
 export function parseActor(value: unknown): Actor {
@@ -261,34 +271,34 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
       break;
     case "TASK_REMOVED":
       if (payload.tombstone !== true) throw new EventValidationError("payload.tombstone must be true");
-      parsed = { node_id: string(payload.node_id, "payload.node_id"), tombstone: true };
+      parsed = { node_id: identifier(payload.node_id, "payload.node_id"), tombstone: true };
       break;
     case "TASK_SPLIT":
       if (!Array.isArray(payload.children) || !Array.isArray(payload.edge_remap)) {
         throw new EventValidationError("payload.children and payload.edge_remap must be arrays");
       }
       parsed = {
-        parent_id: string(payload.parent_id, "payload.parent_id"),
+        parent_id: identifier(payload.parent_id, "payload.parent_id"),
         children: payload.children.map((child, index) => taskNode(child, `payload.children[${index}]`)),
         edge_remap: payload.edge_remap.map((remap, index) => {
           const entry = object(remap, `payload.edge_remap[${index}]`);
           return {
-            edge_id: string(entry.edge_id, `payload.edge_remap[${index}].edge_id`),
-            new_target: string(entry.new_target, `payload.edge_remap[${index}].new_target`),
+            edge_id: identifier(entry.edge_id, `payload.edge_remap[${index}].edge_id`),
+            new_target: identifier(entry.new_target, `payload.edge_remap[${index}].new_target`),
           };
         }),
       };
       break;
     case "EDGE_ADDED":
       parsed = {
-        edge_id: string(payload.edge_id, "payload.edge_id"),
-        upstream: string(payload.upstream, "payload.upstream"),
-        downstream: string(payload.downstream, "payload.downstream"),
+        edge_id: identifier(payload.edge_id, "payload.edge_id"),
+        upstream: identifier(payload.upstream, "payload.upstream"),
+        downstream: identifier(payload.downstream, "payload.downstream"),
         kind: oneOf(payload.kind, ["depends", "conflicts"] as const, "payload.kind"),
       };
       break;
     case "EDGE_REMOVED":
-      parsed = { edge_id: string(payload.edge_id, "payload.edge_id") };
+      parsed = { edge_id: identifier(payload.edge_id, "payload.edge_id") };
       break;
     case "DISPATCHED": {
       const brief_override = optionalString(payload.brief_override, "payload.brief_override");
@@ -308,22 +318,22 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
       parsed = nodeIdPayload(payload);
       break;
     case "APPROVED": {
-      const policy_ref = optionalString(payload.policy_ref, "payload.policy_ref");
+      const policy_ref = optionalIdentifier(payload.policy_ref, "payload.policy_ref");
       const rationale = optionalString(payload.rationale, "payload.rationale");
       parsed = {
-        approval_id: string(payload.approval_id, "payload.approval_id"),
-        node_id: string(payload.node_id, "payload.node_id"),
+        approval_id: identifier(payload.approval_id, "payload.approval_id"),
+        node_id: identifier(payload.node_id, "payload.node_id"),
         ...(policy_ref === undefined ? {} : { policy_ref }),
         ...(rationale === undefined ? {} : { rationale }),
       };
       break;
     }
     case "REJECTED": {
-      const policy_ref = optionalString(payload.policy_ref, "payload.policy_ref");
+      const policy_ref = optionalIdentifier(payload.policy_ref, "payload.policy_ref");
       const reason = optionalString(payload.reason, "payload.reason");
       parsed = {
-        approval_id: string(payload.approval_id, "payload.approval_id"),
-        node_id: string(payload.node_id, "payload.node_id"),
+        approval_id: identifier(payload.approval_id, "payload.approval_id"),
+        node_id: identifier(payload.node_id, "payload.node_id"),
         ...(policy_ref === undefined ? {} : { policy_ref }),
         ...(reason === undefined ? {} : { reason }),
       };
@@ -332,15 +342,15 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
     case "POLICY_STATED":
       if (payload.scope !== "session") throw new EventValidationError("payload.scope must be session");
       parsed = {
-        policy_ref: string(payload.policy_ref, "payload.policy_ref"),
+        policy_ref: identifier(payload.policy_ref, "payload.policy_ref"),
         text: string(payload.text, "payload.text"),
         scope: "session",
-        session_id: string(payload.session_id, "payload.session_id"),
+        session_id: identifier(payload.session_id, "payload.session_id"),
       };
       break;
     case "ANNOTATED":
       parsed = {
-        target_id: string(payload.target_id, "payload.target_id"),
+        target_id: identifier(payload.target_id, "payload.target_id"),
         note: string(payload.note, "payload.note"),
       };
       break;
@@ -350,7 +360,7 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
     case "NODE_STATE_CHANGED": {
       const detail = optionalString(payload.detail, "payload.detail");
       parsed = {
-        node_id: string(payload.node_id, "payload.node_id"),
+        node_id: identifier(payload.node_id, "payload.node_id"),
         from: oneOf(payload.from, nodeStates, "payload.from"),
         to: oneOf(payload.to, nodeStates, "payload.to"),
         ...(detail === undefined ? {} : { detail }),
@@ -383,8 +393,8 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
           ? undefined
           : oneOf(payload.tests, ["green", "red", "none"] as const, "payload.tests");
       parsed = {
-        approval_id: string(payload.approval_id, "payload.approval_id"),
-        node_id: string(payload.node_id, "payload.node_id"),
+        approval_id: identifier(payload.approval_id, "payload.approval_id"),
+        node_id: identifier(payload.node_id, "payload.node_id"),
         summary: string(payload.summary, "payload.summary"),
         ...(diff === undefined
           ? {}
@@ -408,8 +418,11 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
       break;
     case "SELECTION_CHANGED":
       parsed = {
-        client_id: string(payload.client_id, "payload.client_id"),
-        selected: strings(payload.selected, "payload.selected"),
+        client_id: identifier(payload.client_id, "payload.client_id"),
+        selected: (() => {
+          if (!Array.isArray(payload.selected)) throw new EventValidationError("payload.selected must be an array");
+          return payload.selected.map((item, index) => identifier(item, `payload.selected[${index}]`));
+        })(),
       };
       break;
   }
@@ -421,7 +434,7 @@ export function parseEventInput(value: unknown, defaultActor?: Actor): EventInpu
   const type = parseEventType(input.type);
   const actor = input.actor === undefined && defaultActor ? defaultActor : parseActor(input.actor);
   const payload = parsePayload(type, input.payload);
-  const idem_key = string(input.idem_key, "idem_key");
+  const idem_key = identifier(input.idem_key, "idem_key");
   return { actor, type, payload, idem_key } as EventInput;
 }
 

@@ -123,6 +123,8 @@ function removeNode(state: GraphState, id: string, event: Event): void {
 
 function comparePaths(a: { weight: number; path: string[] }, b: { weight: number; path: string[] }): number {
   if (a.weight !== b.weight) return a.weight - b.weight;
+  if (a.path.length > 0 && b.path.length === 0) return 1;
+  if (a.path.length === 0 && b.path.length > 0) return -1;
   return b.path.join("\u0000").localeCompare(a.path.join("\u0000"));
 }
 
