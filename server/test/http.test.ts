@@ -252,8 +252,9 @@ describe("HTTP and streaming contract", () => {
   });
 
   it("authenticates fleet reports separately from visitor mutations", async () => {
-    const { app, store } = server();
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
     store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.issueReporterCredential("project", "worker:a", "2026-08-30T10:00:00.000Z", "worker-a-token");
     store.append("project", {
       actor: "human",
       type: "TASK_ADDED",
@@ -273,7 +274,7 @@ describe("HTTP and streaming contract", () => {
         idem_key: "running-a",
       },
     });
-    const authorized = await app.inject({
+    const supervisorTokenAsWorker = await app.inject({
       method: "POST",
       url: "/api/p/project/report",
       headers: { authorization: "Bearer reporter-secret" },
@@ -284,9 +285,81 @@ describe("HTTP and streaming contract", () => {
         idem_key: "running-a",
       },
     });
+    const authorized = await app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: "Bearer worker-a-token" },
+      payload: {
+        actor: "worker:a",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "a", from: "queued", to: "running" },
+        idem_key: "running-a",
+      },
+    });
 
     expect(unauthorized.statusCode).toBe(401);
+    expect(supervisorTokenAsWorker.statusCode).toBe(401);
     expect(authorized.json()).toEqual({ seq: 2 });
+  });
+
+  it("binds short-lived reporter credentials to one project and actor", async () => {
+    let reportTime = new Date("2026-08-30T10:05:00.000Z");
+    const { app, store } = server({ now: () => reportTime });
+    const created = store.createProject("project-a", "visitor-a", "2026-08-30T10:00:00.000Z", {
+      reporterToken: "project-a-supervisor",
+    });
+    store.createProject("project-b", "visitor-b", "2026-08-30T10:00:00.000Z");
+    const worker = store.issueReporterCredential(
+      "project-a",
+      "worker:a",
+      "2026-08-30T10:00:00.000Z",
+      "project-a-worker",
+    );
+    for (const project of ["project-a", "project-b"]) {
+      store.append(project, {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+        },
+        idem_key: "add-a",
+      });
+    }
+    const report = (project: string, token: string, actor: string, idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: `/api/p/${project}/report`,
+        headers: { authorization: `Bearer ${token}` },
+        payload: {
+          actor,
+          type: "WORKER_LOG",
+          payload: { node_id: "a", lines: ["Worker is active."] },
+          idem_key: idemKey,
+        },
+      });
+
+    const crossProject = await report("project-b", worker.token, "worker:a", "cross-project");
+    const wrongActor = await report("project-a", worker.token, "worker:b", "wrong-actor");
+    const authorized = await report("project-a", worker.token, "worker:a", "authorized");
+    const projectSupervisor = await report(
+      "project-a",
+      created.reporter_credential.token,
+      "supervisor",
+      "project-supervisor",
+    );
+    reportTime = new Date("2026-08-30T10:15:00.001Z");
+    const expired = await report("project-a", worker.token, "worker:a", "expired");
+
+    expect(crossProject.statusCode).toBe(401);
+    expect(wrongActor.statusCode).toBe(401);
+    expect(authorized.statusCode).toBe(200);
+    expect(projectSupervisor.statusCode).toBe(200);
+    expect(expired.statusCode).toBe(401);
+    expect(store.listEvents("project-a").map((event) => event.idem_key)).toEqual([
+      "add-a",
+      "authorized",
+      "project-supervisor",
+    ]);
   });
 
   it("replays from a websocket cursor and then streams live events", async () => {

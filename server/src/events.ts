@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { DatabaseSync } from "node:sqlite";
 
@@ -7,6 +8,7 @@ export const nodeStates = ["queued", "running", "review", "done", "failed", "pau
 
 export type NodeState = (typeof nodeStates)[number];
 export type Actor = "human" | "browser_agent" | "supervisor" | `worker:${string}`;
+export type ReporterActor = Exclude<Actor, "human" | "browser_agent">;
 
 export interface TaskNode {
   id: string;
@@ -462,6 +464,50 @@ export interface Project {
   seed_project_id: string | null;
 }
 
+export interface ReporterCredential {
+  project_id: string;
+  actor: ReporterActor;
+  token: string;
+  expires_at: string;
+}
+
+export interface ReporterIdentity {
+  project_id: string;
+  actor: ReporterActor;
+  expires_at: string;
+}
+
+export interface CreateProjectOptions {
+  seedProjectId?: string;
+  reporterToken?: string;
+}
+
+export interface CreatedProject extends Project {
+  reporter_credential: ReporterCredential;
+}
+
+const reporterCredentialLifetimeMs = 15 * 60 * 1_000;
+
+function reporterActor(actor: Actor): ReporterActor {
+  if (actor === "supervisor") return actor;
+  if (actor.startsWith("worker:")) return actor as `worker:${string}`;
+  throw new EventValidationError("reporter credential actor must be supervisor or worker:<id>");
+}
+
+function reporterTokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function reporterCredential(
+  projectId: string,
+  actor: Actor,
+  token: string,
+  expiresAt: string,
+): ReporterCredential {
+  if (token.length === 0) throw new EventValidationError("reporter credential token must not be empty");
+  return { project_id: projectId, actor: reporterActor(actor), token, expires_at: expiresAt };
+}
+
 export class StaleSequenceError extends Error {
   constructor(readonly currentSeq: number) {
     super(`base_seq is stale; current sequence is ${currentSeq}`);
@@ -538,8 +584,15 @@ export class EventStore {
         PRIMARY KEY (project_id, seq),
         UNIQUE (project_id, idem_key)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS reporter_credentials (
+        token_hash TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        actor TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      ) STRICT;
       CREATE INDEX IF NOT EXISTS events_project_node ON events(project_id, node_ref, seq);
       CREATE INDEX IF NOT EXISTS events_project_edge ON events(project_id, edge_ref, seq);
+      CREATE INDEX IF NOT EXISTS reporter_credentials_project ON reporter_credentials(project_id, expires_at);
     `);
   }
 
@@ -547,13 +600,42 @@ export class EventStore {
     this.database.close();
   }
 
-  createProject(id: string, visitorToken: string, createdAt: string, seedProjectId?: string): Project {
-    this.database
-      .prepare(
-        "INSERT INTO projects (id, visitor_token, created_at, seed_project_id) VALUES (?, ?, ?, ?)",
-      )
-      .run(id, visitorToken, createdAt, seedProjectId ?? null);
-    return { id, visitor_token: visitorToken, created_at: createdAt, seed_project_id: seedProjectId ?? null };
+  createProject(
+    id: string,
+    visitorToken: string,
+    createdAt: string,
+    options: CreateProjectOptions = {},
+  ): CreatedProject {
+    const project = {
+      id,
+      visitor_token: visitorToken,
+      created_at: createdAt,
+      seed_project_id: options.seedProjectId ?? null,
+    };
+    const credential = reporterCredential(
+      id,
+      "supervisor",
+      options.reporterToken ?? randomUUID(),
+      new Date(Date.parse(createdAt) + reporterCredentialLifetimeMs).toISOString(),
+    );
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          "INSERT INTO projects (id, visitor_token, created_at, seed_project_id) VALUES (?, ?, ?, ?)",
+        )
+        .run(project.id, project.visitor_token, project.created_at, project.seed_project_id);
+      this.database
+        .prepare(
+          "INSERT INTO reporter_credentials (token_hash, project_id, actor, expires_at) VALUES (?, ?, ?, ?)",
+        )
+        .run(reporterTokenHash(credential.token), credential.project_id, credential.actor, credential.expires_at);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return { ...project, reporter_credential: credential };
   }
 
   getProject(id: string): Project | undefined {
@@ -570,6 +652,42 @@ export class EventStore {
       .prepare("SELECT 1 AS found FROM projects WHERE id = ? AND visitor_token = ?")
       .get(id, token) as { found: number } | undefined;
     return row?.found === 1;
+  }
+
+  issueReporterCredential(
+    projectId: string,
+    actor: ReporterActor,
+    issuedAt: string,
+    token: string = randomUUID(),
+  ): ReporterCredential {
+    if (!this.hasProject(projectId)) throw new UnknownProjectError(projectId);
+    const credential = reporterCredential(
+      projectId,
+      actor,
+      token,
+      new Date(Date.parse(issuedAt) + reporterCredentialLifetimeMs).toISOString(),
+    );
+    this.database
+      .prepare(
+        "INSERT INTO reporter_credentials (token_hash, project_id, actor, expires_at) VALUES (?, ?, ?, ?)",
+      )
+      .run(reporterTokenHash(credential.token), credential.project_id, credential.actor, credential.expires_at);
+    return credential;
+  }
+
+  authenticateReporter(projectId: string, token: string, at: string): ReporterIdentity | undefined {
+    if (token.length === 0) return undefined;
+    const row = this.database
+      .prepare(
+        `SELECT project_id, actor, expires_at
+         FROM reporter_credentials
+         WHERE token_hash = ? AND project_id = ? AND expires_at > ?`,
+      )
+      .get(reporterTokenHash(token), projectId, at) as
+      | { project_id: string; actor: string; expires_at: string }
+      | undefined;
+    if (!row) return undefined;
+    return { project_id: row.project_id, actor: reporterActor(parseActor(row.actor)), expires_at: row.expires_at };
   }
 
   latestSeq(projectId: string): number {

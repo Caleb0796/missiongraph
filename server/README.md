@@ -16,19 +16,19 @@ The server listens on `0.0.0.0:3000` by default and stores data in `missiongraph
 
 | Variable | Required | Default | Purpose |
 |---|---:|---|---|
-| `REPORTER_TOKEN` | yes | — | Bearer secret used only by supervisor and worker reporters. |
+| `REPORTER_TOKEN` | yes | — | Process-wide bearer secret used only by the trusted supervisor reporter. |
 | `DB_PATH` | no | `missiongraph.sqlite` | Path to the single SQLite database file. |
 | `PORT` | no | `3000` | HTTP, WebSocket, and SSE port. |
 | `SEED_PROJECT_ID` | no | `demo-seed` | Source event stream cloned by `/api/clone-demo`. |
 
-Visitor tokens are generated per cloned project and sent as `x-mg-token`. A browser-agent mutation may additionally set `x-mg-actor: browser_agent`; mutations default to the `human` actor.
+Visitor tokens are generated per cloned project and sent as `x-mg-token`. A browser-agent mutation may additionally set `x-mg-actor: browser_agent`; mutations default to the `human` actor. Worker reporters use 15-minute credentials bound to their project and `worker:<id>` actor; reporter tokens are stored as SHA-256 hashes.
 
 ## API
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | `POST` | `/api/p/:project/mutations` | `x-mg-token` | Append a human or browser-agent mutation. Body: `{type, payload, idem_key, base_seq?}`. |
-| `POST` | `/api/p/:project/report` | `Authorization: Bearer $REPORTER_TOKEN` | Append a supervisor or `worker:<id>` fleet event. |
+| `POST` | `/api/p/:project/report` | `Authorization: Bearer <reporter credential>` | Append a supervisor or `worker:<id>` fleet event. The process token is supervisor-only; workers use project- and actor-bound credentials. |
 | `GET` | `/api/p/:project/snapshot` | `x-mg-token` | Return the deterministic graph state and current cursor. |
 | `POST` | `/api/clone-demo` | none | Clone the configured seed stream into an isolated project, remap entity IDs, and issue its visitor token. |
 | `GET` | `/ws?project&from_seq&token` | query token | Replay events strictly after `from_seq`, then stream live events server-to-client. Without `from_seq`, sends a snapshot first. |

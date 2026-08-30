@@ -163,8 +163,8 @@ function cloneInputs(events: readonly Event[], now: Date): { input: EventInput; 
 }
 
 export function createServer(options: ServerOptions = {}): MissionGraphServer {
-  const reporterToken = options.reporterToken ?? process.env.REPORTER_TOKEN;
-  if (!reporterToken) throw new Error("REPORTER_TOKEN is required");
+  const supervisorReporterToken = options.reporterToken ?? process.env.REPORTER_TOKEN;
+  if (!supervisorReporterToken) throw new Error("REPORTER_TOKEN is required");
   const now = options.now ?? (() => new Date());
   const id = options.id ?? randomUUID;
   const seedProjectId = options.seedProjectId ?? process.env.SEED_PROJECT_ID ?? "demo-seed";
@@ -203,16 +203,24 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     const project = (request.params as { project: string }).project;
     const authorization = textHeader(request.headers.authorization);
     const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
-    if (!sameSecret(bearer, reporterToken)) return reply.code(401).send({ error: "unauthorized" });
+    const reportTime = now();
+    const projectIdentity = bearer
+      ? store.authenticateReporter(project, bearer, reportTime.toISOString())
+      : undefined;
+    const supervisorAuthorized = sameSecret(bearer, supervisorReporterToken);
+    if (!projectIdentity && !supervisorAuthorized) return reply.code(401).send({ error: "unauthorized" });
     try {
       const input = parseEventInput(request.body);
       if (input.actor !== "supervisor" && !input.actor.startsWith("worker:")) {
         throw new EventValidationError("reporter actor must be supervisor or worker:<id>");
       }
+      if (projectIdentity ? projectIdentity.actor !== input.actor : input.actor !== "supervisor") {
+        return reply.code(401).send({ error: "unauthorized" });
+      }
       if (!reporterEventTypes.has(input.type)) {
         throw new EventValidationError(`${input.type} is not a fleet reporter event`);
       }
-      const result = store.append(project, input, { ts: now().toISOString() });
+      const result = store.append(project, input, { ts: reportTime.toISOString() });
       return reply.send({ seq: result.event.seq });
     } catch (error) {
       return errorReply(error, reply);
@@ -236,7 +244,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     const created = now();
     try {
       const source = store.hasProject(seedProjectId) ? store.listEvents(seedProjectId) : [];
-      store.createProject(project, token, created.toISOString(), seedProjectId);
+      store.createProject(project, token, created.toISOString(), {
+        seedProjectId,
+        reporterToken: id(),
+      });
       for (const clone of cloneInputs(source, created)) {
         store.append(project, clone.input, { ts: clone.ts, trustedImport: true });
       }
