@@ -1,4 +1,4 @@
-# CONTRACTS.md — frozen interfaces v1.1 (2026-08-30)
+# CONTRACTS.md — frozen interfaces v1.2 (2026-08-30)
 
 **FROZEN.** Every track builds against these. No session edits this file; propose changes in PROGRESS.md notes → the orchestrator (Claude) amends and bumps the version. TypeScript-ish notation; code generates types from here.
 
@@ -88,7 +88,11 @@ Cursor state is maintained per browser client by the wrapper; `graph_digest(sinc
 - Reporter: `POST /api/p/:project/report` — body = fleet event sans seq/ts; idempotent by `idem_key`. Auth: bearer reporter token (distinct secret).
 - Snapshot: `GET /api/p/:project/snapshot` → `{state, cursor}`.
 - WS `GET /ws?project&from_seq&token`: server→client only: `{kind:"event", event}` | `{kind:"snapshot", ...}`. Client mutations always go over HTTP. SSE fallback mirrors WS.
-- Clone: `POST /api/clone-demo` → fresh project from seed (per-visitor isolation, §13).
+- Clone: `POST /api/clone-demo` → fresh project from seed (per-visitor isolation, §13). The CLIENT persists project id + visitor token (localStorage) and reuses them across reloads until an explicit reset (v1.2).
+- Batch mutations (v1.2): the mutations endpoint ALSO accepts `{batch: [{type, payload}, …], idem_key, base_seq?}` — applied atomically in order, all-or-nothing, single 409 on stale `base_seq`; response `{seqs: number[]}`. `plan_seed` MUST use this; ids in a batch are server-assigned (batch-local temp ids in payloads are remapped).
+- CORS (v1.2): the server answers CORS for origins listed in env `ALLOWED_ORIGINS` (comma-separated; production includes the Vercel origin), allowing `content-type`, `x-mg-token`, `x-mg-session` headers on the API routes; preflight cached. Without a matching origin, no CORS headers (fail closed).
+- Client 409 rule (v1.2): on 409, refresh state from `fresh_digest` and SURFACE the conflict (tool envelope `error.code="stale_mutation"`, UI toast); NEVER auto-repost the original mutation.
+- Preview binding (v1.2): `op_token` records the cursor at preview time; a confirm call after the cursor advanced is rejected with `error.code="preview_stale"` + a fresh preview. Native-UI structural edits on non-idle targets go through the SAME preview/confirm dialog (parity with tools).
 
 ## 5. Supervisor envelope delivery (server → codex supervisor) — v1.1, probe-verified
 
@@ -120,6 +124,7 @@ interface SupervisorDecision {
 Worker sessions get their own thread ids; the server tracks `node_id → {thread_id, worktree}`. Workers report via the reporter API (§4), never through the supervisor.
 
 ## Changelog
+- v1.2 (2026-08-30): from the M2 adversarial review — atomic batch mutations, ALLOWED_ORIGINS CORS, client clone persistence, 409 surface-don't-retry, cursor-bound op_token + native-UI confirm parity.
 - v1.1 (2026-08-30): §5 delivery switched from `codex queue` (nonexistent in 0.144.6) to server-FIFO + `exec resume`, per docs/PROBE.md; added §5b supervisor decision contract.
 - v1 (2026-08-30): initial freeze.
 
