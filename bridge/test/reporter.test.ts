@@ -1,0 +1,57 @@
+import { describe, expect, it } from "vitest";
+
+import { reporterPayload } from "../src/reporter.js";
+import { workerBrief } from "../src/prompts.js";
+
+describe("reporter contract", () => {
+  it("builds exact fleet event envelopes", () => {
+    expect(
+      reporterPayload(
+        "worker:node-a",
+        "NODE_STATE_CHANGED",
+        { node_id: "node-a", from: "queued", to: "running", detail: "Worker started" },
+        "idem-1",
+      ),
+    ).toEqual({
+      actor: "worker:node-a",
+      type: "NODE_STATE_CHANGED",
+      payload: { node_id: "node-a", from: "queued", to: "running", detail: "Worker started" },
+      idem_key: "idem-1",
+    });
+    expect(
+      reporterPayload(
+        "worker:node-a",
+        "HANDOFF_FILED",
+        {
+          node_id: "node-a",
+          handoff: {
+            v: 1,
+            summary: "Implemented the requested task.",
+            files: ["src/a.ts"],
+            commits: ["abc123"],
+            tests: "green",
+            downstream_notes: "Import the new function.",
+            deviations: [],
+            artifacts: [],
+          },
+        },
+        "idem-2",
+      ),
+    ).toMatchObject({
+      actor: "worker:node-a",
+      type: "HANDOFF_FILED",
+      payload: { handoff: { v: 1, summary: "Implemented the requested task.", tests: "green" } },
+      idem_key: "idem-2",
+    });
+  });
+
+  it("makes lifecycle, log, handoff, and approval reporting non-optional in the worker brief", () => {
+    const brief = workerBrief("node-a", "Build A.", "/tmp/repo");
+    expect(brief).toContain("REPORTING IS REQUIRED AND NON-OPTIONAL");
+    expect(brief).toContain("Authorization: Bearer $MG_REPORTER_CREDENTIAL");
+    expect(brief).toContain("NODE_STATE_CHANGED");
+    expect(brief).toContain("WORKER_LOG");
+    expect(brief).toContain("HANDOFF_FILED");
+    expect(brief).toContain("APPROVAL_CREATED exactly once");
+  });
+});

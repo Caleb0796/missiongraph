@@ -8,3 +8,5 @@ dist/
 *.sqlite
 *.db
 .vercel/
+bridge/config.json
+bridge/state.json
