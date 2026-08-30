@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { describeEvent, getDisplayState } from '../model/graph'
+import { describeEvent, eventTargetsNode, getDisplayState } from '../model/graph'
 import type { GraphEdge, MissionEvent, TaskNode } from '../model/types'
 import { useMissionStore } from '../store/mission-store'
 
@@ -38,27 +38,7 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
     () =>
       events.filter((event) => {
         if (node) {
-          switch (event.type) {
-            case 'TASK_ADDED':
-              return event.payload.node.id === node.id
-            case 'TASK_REMOVED':
-            case 'DISPATCHED':
-            case 'RETRY_REQUESTED':
-            case 'PAUSE_REQUESTED':
-            case 'RESUME_REQUESTED':
-            case 'APPROVED':
-            case 'REJECTED':
-            case 'NODE_STATE_CHANGED':
-            case 'PAUSE_ACKED':
-            case 'WORKER_LOG':
-            case 'HANDOFF_FILED':
-            case 'DEVIATION_NOTED':
-            case 'APPROVAL_CREATED':
-            case 'NODE_MOVED':
-              return event.payload.node_id === node.id
-            default:
-              return false
-          }
+          return eventTargetsNode(event, node.id)
         }
         if (edge) {
           return (
@@ -176,6 +156,11 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
                 <strong>{node.tags.join(' · ')}</strong>
               </div>
             </div>
+            {(annotations[node.id] ?? []).map((annotation) => (
+              <ProseRecord key={`${annotation.ts}-${annotation.note}`}>
+                {annotation.note}
+              </ProseRecord>
+            ))}
           </>
         )}
         {activeTab === 'Brief' && edge && (

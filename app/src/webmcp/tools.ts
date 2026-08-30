@@ -1,7 +1,20 @@
-import { getCriticalPath, getDisplayState, wouldCreateCycle } from '../model/graph'
-import type { EdgeKind, GraphEdge, TaskNode } from '../model/types'
+import {
+  approvalsForNode,
+  getBlastRadius,
+  getCriticalPath,
+  getDisplayState,
+  isNonIdle,
+  isPreviewStale,
+  wouldCreateCycle,
+} from '../model/graph'
+import type { EdgeKind, GraphEdge, MissionEvent, TaskNode } from '../model/types'
 import { currentCriticalPath, useMissionStore } from '../store/mission-store'
-import { loadChangesSince, mutate } from '../transport/client'
+import {
+  loadChangesSince,
+  mutate,
+  mutateBatch,
+  type MutationBatchItem,
+} from '../transport/client'
 import type { ToolDefinition, ToolOutcome } from './registry'
 
 interface SeedTask {
@@ -15,6 +28,8 @@ interface SeedTask {
 
 interface PendingOperation {
   key: string
+  cursor: string
+  ids: string[]
   apply: () => Promise<ToolOutcome>
 }
 
@@ -85,48 +100,23 @@ function approval(id: string, allowPolicyRejection = false) {
   return found
 }
 
-function downstreamFrom(ids: string[]) {
-  const { edges } = useMissionStore.getState()
-  const reached = new Set(ids)
-  const pending = [...ids]
-  while (pending.length > 0) {
-    const current = pending.shift()!
-    for (const edge of edges) {
-      if (
-        edge.kind === 'depends' &&
-        edge.upstream === current &&
-        !reached.has(edge.downstream)
-      ) {
-        reached.add(edge.downstream)
-        pending.push(edge.downstream)
-      }
-    }
-  }
-  return [...reached]
-}
-
-function blastRadius(ids: string[]) {
-  const state = useMissionStore.getState()
-  const stale = downstreamFrom(ids)
-  const pausing = stale.filter(
-    (id) => state.nodes.find((node) => node.id === id)?.state === 'running',
-  )
-  return { stale, pausing }
-}
-
 function preview(
   key: string,
   ids: string[],
   apply: () => Promise<ToolOutcome>,
 ): ToolOutcome {
   const opToken = crypto.randomUUID()
-  pendingOperations.set(opToken, { key, apply })
+  const state = useMissionStore.getState()
+  pendingOperations.set(opToken, { key, cursor: state.cursor, ids, apply })
   return {
     data: {
       summary:
         'This structural change needs confirmation because it touches active or depended-on work.',
     },
-    preview: { op_token: opToken, blast_radius: blastRadius(ids) },
+    preview: {
+      op_token: opToken,
+      blast_radius: getBlastRadius(ids, state.nodes, state.edges),
+    },
   }
 }
 
@@ -145,6 +135,17 @@ async function confirmed(
     throw new Error('op_token is missing, expired, or does not match this operation.')
   }
   pendingOperations.delete(token)
+  if (isPreviewStale(pending.cursor, useMissionStore.getState().cursor)) {
+    const fresh = preview(key, pending.ids, pending.apply)
+    return {
+      ...fresh,
+      error: {
+        code: 'preview_stale',
+        message:
+          'The graph changed after this preview. Review the refreshed blast radius and confirm again.',
+      },
+    }
+  }
   return pending.apply()
 }
 
@@ -258,6 +259,9 @@ const planSeed: ToolDefinition = {
     const tempIds = new Set(tasks.map((task) => task.temp_id))
     if (tempIds.size !== tasks.length) throw new Error('temp_id values must be unique.')
     const state = useMissionStore.getState()
+    if (state.nodes.some((item) => tempIds.has(item.id))) {
+      throw new Error('temp_id values must not collide with persistent task ids.')
+    }
     for (const task of tasks) {
       for (const dep of task.deps) {
         if (!tempIds.has(dep) && !state.nodes.some((item) => item.id === dep)) {
@@ -265,42 +269,53 @@ const planSeed: ToolDefinition = {
         }
       }
     }
-    const ids = new Map(tasks.map((task) => [task.temp_id, crypto.randomUUID()]))
+    const batchIds = new Map(
+      tasks.map((task) => [
+        task.temp_id,
+        state.connectionMode === 'fixture' ? crypto.randomUUID() : task.temp_id,
+      ]),
+    )
     const candidateEdges = [...state.edges]
+    const addedEdges: GraphEdge[] = []
     for (const task of tasks) {
       for (const dep of task.deps) {
-        const upstream = ids.get(dep) ?? dep
-        const downstream = ids.get(task.temp_id)!
+        const upstream = batchIds.get(dep) ?? dep
+        const downstream = batchIds.get(task.temp_id)!
         if (wouldCreateCycle(candidateEdges, upstream, downstream)) {
           throw new Error(`Dependency ${dep} → ${task.temp_id} creates a cycle.`)
         }
-        candidateEdges.push({
-          edge_id: crypto.randomUUID(),
+        const edge = {
+          edge_id:
+            state.connectionMode === 'fixture'
+              ? crypto.randomUUID()
+              : `plan-edge-${crypto.randomUUID()}`,
           upstream,
           downstream,
-          kind: 'depends',
-        })
+          kind: 'depends' as const,
+        }
+        candidateEdges.push(edge)
+        addedEdges.push(edge)
       }
     }
-    for (const task of tasks) {
-      await mutate(
-        'TASK_ADDED',
-        {
-          node: {
-            id: ids.get(task.temp_id)!,
-            title: task.title,
-            brief: task.brief,
-            estimate_min: task.estimate,
-            tags: task.tags,
-            state: 'queued',
-          },
+    const batch: MutationBatchItem[] = tasks.map((task) => ({
+      type: 'TASK_ADDED',
+      payload: {
+        node: {
+          id: batchIds.get(task.temp_id)!,
+          title: task.title,
+          brief: task.brief,
+          estimate_min: task.estimate,
+          tags: task.tags,
+          state: 'queued',
         },
-        { actor: 'browser_agent' },
-      )
-    }
-    for (const edge of candidateEdges.slice(state.edges.length)) {
-      await mutate('EDGE_ADDED', edge, { actor: 'browser_agent' })
-    }
+      },
+    }))
+    batch.push(
+      ...addedEdges.map((edge) => ({
+        type: 'EDGE_ADDED' as const,
+        payload: edge,
+      })),
+    )
     const depths = new Map<string, number>()
     const byTempId = new Map(tasks.map((task) => [task.temp_id, task]))
     function depthOf(tempId: string): number {
@@ -320,20 +335,37 @@ const planSeed: ToolDefinition = {
       const depth = depthOf(task.temp_id)
       const row = rows.get(depth) ?? 0
       rows.set(depth, row + 1)
-      await mutate(
-        'NODE_MOVED',
-        {
-          node_id: ids.get(task.temp_id)!,
+      batch.push({
+        type: 'NODE_MOVED',
+        payload: {
+          node_id: batchIds.get(task.temp_id)!,
           x: depth * 390,
           y: row * 210,
         },
-        { actor: 'browser_agent' },
-      )
+      })
     }
+    const seqs = await mutateBatch(batch, { actor: 'browser_agent' })
+    const seqSet = new Set(seqs)
+    const addedTasks = useMissionStore
+      .getState()
+      .events.filter(
+        (event): event is Extract<MissionEvent, { type: 'TASK_ADDED' }> =>
+          event.type === 'TASK_ADDED' && seqSet.has(event.seq),
+      )
+      .sort((left, right) => left.seq - right.seq)
+    if (addedTasks.length !== tasks.length) {
+      throw new Error('The atomic plan was applied but its assigned task ids are unavailable.')
+    }
+    const ids = Object.fromEntries(
+      tasks.map((task, index) => [
+        task.temp_id,
+        addedTasks[index]!.payload.node.id,
+      ]),
+    )
     return {
       data: {
         summary: `Created ${tasks.length} tasks for “${goal}” and laid out their validated dependency graph.`,
-        task_ids: Object.fromEntries(ids),
+        task_ids: ids,
       },
     }
   },
@@ -426,7 +458,7 @@ const link: ToolDefinition = {
       key,
       inputs,
       [upstream, downstream],
-      upstreamNode.state !== 'queued' || downstreamNode.state !== 'queued',
+      isNonIdle(upstreamNode) || isNonIdle(downstreamNode),
       async () => {
         await mutate(
           'EDGE_ADDED',
@@ -466,7 +498,7 @@ const unlink: ToolDefinition = {
       `unlink:${edgeId}`,
       inputs,
       touched.map((item) => item.id),
-      touched.some((item) => item.state !== 'queued'),
+      touched.some(isNonIdle),
       async () => {
         await mutate('EDGE_REMOVED', { edge_id: edgeId }, { actor: 'browser_agent' })
         return {
@@ -523,7 +555,7 @@ const remove: ToolDefinition = {
       `remove:${nodeId}`,
       inputs,
       [nodeId],
-      target.state !== 'queued' || hasIncidentEdge,
+      isNonIdle(target) || hasIncidentEdge,
       async () => {
         await mutate(
           'TASK_REMOVED',
@@ -773,16 +805,14 @@ const getNode: ToolDefinition = {
     const state = useMissionStore.getState()
     const task = state.nodes.find((item) => item.id === id)
     if (task) {
-      const itemApproval = Object.values(state.approvals).find(
-        (item) => item.node_id === id,
-      )
+      const itemApprovals = approvalsForNode(state.approvals, id)
       return {
         data: {
           summary: `“${task.title}” is ${getDisplayState(task, state.nodes, state.edges)}: ${task.brief}`,
           node: task,
           handoff: state.handoffs[id] ?? null,
           deviations: state.deviations[id] ?? [],
-          decision_trail: itemApproval ? [itemApproval] : [],
+          decision_trail: itemApprovals,
           annotations: state.annotations[id] ?? [],
           worker_log_tail: state.workerLogs[id] ?? [],
         },

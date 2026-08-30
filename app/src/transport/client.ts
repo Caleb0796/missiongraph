@@ -401,7 +401,10 @@ async function postMutationBatch(
     throw error
   }
   const result = await jsonResponse<BatchMutationResponse>(response)
-  if (result.seqs.length > 0) await waitForSequence(result.seqs.at(-1)!)
+  if (result.seqs.length > 0) {
+    await waitForSequence(result.seqs.at(-1)!)
+    await loadChangesSince(state.cursor)
+  }
   return result.seqs
 }
 

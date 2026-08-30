@@ -4,7 +4,16 @@ import {
   shortyEvents,
   shortyReadySince,
 } from '../fixtures/shorty-dag'
-import { describeEvent, getCriticalPath, wouldCreateCycle } from '../model/graph'
+import {
+  boundedHistory,
+  describeEvent,
+  getBlastRadius,
+  getCriticalPath,
+  isNonIdle,
+  isPreviewStale,
+  refreshReadySince,
+  wouldCreateCycle,
+} from '../model/graph'
 import type {
   Approval,
   DigestChange,
@@ -31,6 +40,12 @@ interface Toast {
 interface CameraRequest {
   id: string
   nodeIds: string[]
+}
+
+interface StructuralPreview {
+  title: string
+  baseCursor: string
+  blastRadius: { stale: string[]; pausing: string[] }
 }
 
 export type ConnectionMode = 'loading' | 'live' | 'fixture'
@@ -62,6 +77,7 @@ interface MissionState {
   highlightedIds: string[]
   cameraRequest: CameraRequest | null
   toast: Toast | null
+  structuralPreview: StructuralPreview | null
   readySince: Record<string, string>
   projectId: string | null
   cursor: string
@@ -83,6 +99,8 @@ interface MissionState {
   moveNode: (nodeId: string, point: Point) => void
   connectNodes: (upstream: string, downstream: string) => boolean
   removeSelected: () => void
+  confirmStructural: () => void
+  cancelStructural: () => void
   select: (id: string | null) => void
   approve: (nodeId: string) => void
   reject: (nodeId: string) => void
@@ -94,6 +112,12 @@ interface MissionState {
 }
 
 let mutationSender: MutationSender | null = null
+let pendingStructuralOperation: {
+  title: string
+  ids: string[]
+  baseCursor: string
+  apply: () => Promise<number>
+} | null = null
 
 export function configureMutationSender(sender: MutationSender) {
   mutationSender = sender
@@ -266,6 +290,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   highlightedIds: [],
   cameraRequest: null,
   toast: null,
+  structuralPreview: null,
   readySince: shortyReadySince,
   projectId: null,
   cursor: '0',
@@ -298,8 +323,10 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     const state = get()
     if (event.seq <= Number(state.cursor)) return
 
-    let nodes = state.nodes
-    let edges = state.edges
+    const previousNodes = state.nodes
+    const previousEdges = state.edges
+    let nodes = previousNodes
+    let edges = previousEdges
     let positions = state.positions
     let tombstones = state.tombstones
     let approvals = state.approvals
@@ -312,7 +339,14 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
     switch (event.type) {
       case 'TASK_ADDED':
-        nodes = [...nodes, event.payload.node]
+        nodes = [
+          ...nodes,
+          {
+            ...event.payload.node,
+            assigned: event.payload.node.state !== 'queued',
+            ever_started: event.payload.node.state !== 'queued',
+          } as TaskNode & { assigned: boolean; ever_started: boolean },
+        ]
         break
       case 'TASK_REMOVED':
         nodes = nodes.filter((node) => node.id !== event.payload.node_id)
@@ -381,7 +415,18 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       case 'NODE_STATE_CHANGED':
         nodes = nodes.map((node) =>
           node.id === event.payload.node_id
-            ? { ...node, state: event.payload.to }
+            ? {
+                ...node,
+                state: event.payload.to,
+                assigned:
+                  (node as TaskNode & { assigned?: boolean }).assigned ||
+                  event.payload.to !== 'queued',
+                ever_started:
+                  (node as TaskNode & { ever_started?: boolean }).ever_started ||
+                  ['running', 'review', 'done', 'failed'].includes(
+                    event.payload.to,
+                  ),
+              }
             : node,
         )
         break
@@ -442,6 +487,15 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         break
     }
 
+    readySince = refreshReadySince(
+      previousNodes,
+      previousEdges,
+      nodes,
+      edges,
+      readySince,
+      event.ts,
+    )
+
     const change = eventChange(event, nodes, edges)
     set({
       nodes,
@@ -456,12 +510,14 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       selectedId,
       readySince,
       cursor: String(event.seq),
-      events: [...state.events.filter((item) => item.seq !== event.seq), event]
-        .sort((left, right) => left.seq - right.seq)
-        .slice(-250),
-      changes: [...state.changes.filter((item) => item.seq !== event.seq), change]
-        .sort((left, right) => left.seq - right.seq)
-        .slice(-250),
+      events: boundedHistory([
+        ...state.events.filter((item) => item.seq !== event.seq),
+        event,
+      ]),
+      changes: boundedHistory([
+        ...state.changes.filter((item) => item.seq !== event.seq),
+        change,
+      ]),
     })
     if (event.actor === 'browser_agent') {
       get().showToast(`🤖 via your agent — ${describeEvent(event, nodes, edges)}`)
@@ -475,23 +531,24 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     }
     const change = eventChange(event, state.nodes, state.edges)
     set({
-      events: [...state.events.filter((item) => item.seq !== event.seq), event]
-        .sort((left, right) => left.seq - right.seq)
-        .slice(-250),
-      changes: [...state.changes.filter((item) => item.seq !== event.seq), change]
-        .sort((left, right) => left.seq - right.seq)
-        .slice(-250),
+      events: boundedHistory([
+        ...state.events.filter((item) => item.seq !== event.seq),
+        event,
+      ]),
+      changes: boundedHistory([
+        ...state.changes.filter((item) => item.seq !== event.seq),
+        change,
+      ]),
     })
   },
   applyDigestChanges(changes, cursor) {
     set((state) => ({
-      changes: [...state.changes, ...changes]
-        .filter(
+      changes: boundedHistory(
+        [...state.changes, ...changes].filter(
           (change, index, all) =>
             all.findIndex((candidate) => candidate.seq === change.seq) === index,
-        )
-        .sort((left, right) => left.seq - right.seq)
-        .slice(-250),
+        ),
+      ),
       cursor,
     }))
   },
@@ -543,12 +600,34 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       state.showToast('That dependency already exists.', 'error')
       return false
     }
-    void sendMutation('EDGE_ADDED', {
+    const payload = {
       edge_id: crypto.randomUUID(),
       upstream,
       downstream,
       kind: 'depends',
-    }).catch((error: unknown) =>
+    } as const
+    const apply = () => sendMutation('EDGE_ADDED', payload)
+    const touched = state.nodes.filter(
+      (node) => node.id === upstream || node.id === downstream,
+    )
+    if (touched.some(isNonIdle)) {
+      const ids = [upstream, downstream]
+      pendingStructuralOperation = {
+        title: 'Add dependency',
+        ids,
+        baseCursor: state.cursor,
+        apply,
+      }
+      set({
+        structuralPreview: {
+          title: 'Add dependency',
+          baseCursor: state.cursor,
+          blastRadius: getBlastRadius(ids, state.nodes, state.edges),
+        },
+      })
+      return true
+    }
+    void apply().catch((error: unknown) =>
       get().showToast(error instanceof Error ? error.message : String(error), 'error'),
     )
     return true
@@ -560,14 +639,72 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     const edge = state.edges.find(
       (candidate) => candidate.edge_id === state.selectedId,
     )
-    const mutation = node
-      ? sendMutation('TASK_REMOVED', { node_id: node.id, tombstone: true })
+    const apply = node
+      ? () => sendMutation('TASK_REMOVED', { node_id: node.id, tombstone: true })
       : edge
-        ? sendMutation('EDGE_REMOVED', { edge_id: edge.edge_id })
+        ? () => sendMutation('EDGE_REMOVED', { edge_id: edge.edge_id })
         : null
-    void mutation?.catch((error: unknown) =>
+    if (!apply) return
+    const ids = node ? [node.id] : [edge!.upstream, edge!.downstream]
+    const needsPreview = node
+      ? isNonIdle(node) ||
+        state.edges.some(
+          (candidate) =>
+            candidate.upstream === node.id || candidate.downstream === node.id,
+        )
+      : ids.some((id) => {
+          const touched = state.nodes.find((candidate) => candidate.id === id)
+          return touched ? isNonIdle(touched) : false
+        })
+    if (needsPreview) {
+      const title = node ? `Remove ${node.title}` : 'Remove relationship'
+      pendingStructuralOperation = {
+        title,
+        ids,
+        baseCursor: state.cursor,
+        apply,
+      }
+      set({
+        structuralPreview: {
+          title,
+          baseCursor: state.cursor,
+          blastRadius: getBlastRadius(ids, state.nodes, state.edges),
+        },
+      })
+      return
+    }
+    void apply().catch((error: unknown) =>
       get().showToast(error instanceof Error ? error.message : String(error), 'error'),
     )
+  },
+  confirmStructural() {
+    const pending = pendingStructuralOperation
+    if (!pending) return
+    const state = get()
+    if (isPreviewStale(pending.baseCursor, state.cursor)) {
+      pending.baseCursor = state.cursor
+      set({
+        structuralPreview: {
+          title: pending.title,
+          baseCursor: state.cursor,
+          blastRadius: getBlastRadius(pending.ids, state.nodes, state.edges),
+        },
+      })
+      state.showToast(
+        'The graph changed. Review the refreshed blast radius before confirming again.',
+        'error',
+      )
+      return
+    }
+    pendingStructuralOperation = null
+    set({ structuralPreview: null })
+    void pending.apply().catch((error: unknown) =>
+      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
+    )
+  },
+  cancelStructural() {
+    pendingStructuralOperation = null
+    set({ structuralPreview: null })
   },
   select(id) {
     set({ selectedId: id })

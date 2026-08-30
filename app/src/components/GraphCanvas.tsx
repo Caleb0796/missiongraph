@@ -71,6 +71,7 @@ function MissionBoard() {
   const connectionMessage = useMissionStore((state) => state.connectionMessage)
   const projectId = useMissionStore((state) => state.projectId)
   const toast = useMissionStore((state) => state.toast)
+  const structuralPreview = useMissionStore((state) => state.structuralPreview)
   const hydratePositions = useMissionStore((state) => state.hydratePositions)
   const moveNode = useMissionStore((state) => state.moveNode)
   const connectNodes = useMissionStore((state) => state.connectNodes)
@@ -78,6 +79,8 @@ function MissionBoard() {
   const select = useMissionStore((state) => state.select)
   const setHighlights = useMissionStore((state) => state.setHighlights)
   const clearToast = useMissionStore((state) => state.clearToast)
+  const confirmStructural = useMissionStore((state) => state.confirmStructural)
+  const cancelStructural = useMissionStore((state) => state.cancelStructural)
   const [dragPositions, setDragPositions] = useState<
     Record<string, { x: number; y: number }>
   >({})
@@ -370,6 +373,39 @@ function MissionBoard() {
           <span><i className="legend-line legend-line--conflict" />File conflict</span>
           <span className="hidden xl:inline">Drag to arrange · connect ports to depend · delete to tombstone</span>
         </div>
+        {structuralPreview && (
+          <section className="structural-confirm" role="dialog" aria-modal="true">
+            <p className="structural-confirm-kicker">Blast-radius preview</p>
+            <h2>{structuralPreview.title}</h2>
+            <p>
+              Context may become stale for{' '}
+              {structuralPreview.blastRadius.stale
+                .map(
+                  (id) =>
+                    nodes.find((node) => node.id === id)?.title ?? 'removed work',
+                )
+                .join(', ')}.
+            </p>
+            {structuralPreview.blastRadius.pausing.length > 0 && (
+              <p>
+                Running workers that may pause:{' '}
+                {structuralPreview.blastRadius.pausing
+                  .map(
+                    (id) => nodes.find((node) => node.id === id)?.title ?? id,
+                  )
+                  .join(', ')}.
+              </p>
+            )}
+            <div>
+              <button type="button" className="action-secondary" onClick={cancelStructural}>
+                Cancel
+              </button>
+              <button type="button" className="action-primary" onClick={confirmStructural}>
+                Confirm change
+              </button>
+            </div>
+          </section>
+        )}
       </div>
       <Inspector nodes={nodes} edges={edges} events={events} />
       <Timeline
