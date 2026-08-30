@@ -36,9 +36,6 @@ export class EnvelopePump {
           this.queuedSequences.delete(dropped.seq);
           this.recordDrop(dropped);
         }
-      } else {
-        this.recordDrop(event);
-        return;
       }
     }
     this.queuedSequences.add(event.seq);
@@ -97,7 +94,7 @@ export class EnvelopePump {
               if (droppedCount > 0) await this.onDrop(droppedCount);
             }
           } catch (error) {
-            this.logger.error(`post-commit action failed and will not be redelivered: ${error instanceof Error ? error.message : String(error)}`);
+            this.logger.error(`post-commit action drain failed; pending actions remain durable: ${error instanceof Error ? error.message : String(error)}`);
           }
         } catch (error) {
           if (!committed && !this.stopped) {

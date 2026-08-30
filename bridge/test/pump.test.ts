@@ -143,4 +143,38 @@ describe("EnvelopePump", () => {
     expect(cursors).toEqual(["1", "6"]);
     expect(drops).toEqual([2]);
   });
+
+  it("preserves structural envelopes when a full queue contains no worker logs", async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const blocked = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+    const firstStarted = new Promise<void>((resolvePromise) => { started = resolvePromise; });
+    const delivered: number[][] = [];
+    const cursors: string[] = [];
+    const pump = new EnvelopePump(
+      async (events) => {
+        delivered.push(events.map((item) => item.seq));
+        if (events[0]?.seq === 1) {
+          started();
+          await blocked;
+        }
+        return { afterCommit: async () => undefined };
+      },
+      async (cursor) => { cursors.push(cursor); },
+      new TestLogger(),
+      async () => undefined,
+      2,
+    );
+
+    pump.enqueue(event(1));
+    await firstStarted;
+    pump.enqueue(event(2));
+    pump.enqueue(event(3));
+    pump.enqueue(event(4));
+    release();
+    await pump.whenIdle();
+
+    expect(delivered).toEqual([[1], [2, 3, 4]]);
+    expect(cursors).toEqual(["1", "4"]);
+  });
 });
