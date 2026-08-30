@@ -42,31 +42,49 @@ Configure the bridge with environment variables or copy `bridge/config.example.j
 
 `config.json` and `state.json` are gitignored. Prefer environment-secret injection on a VM and restrict any file containing credentials to mode `0600`.
 
-### Reporter credentials (CONTRACTS v1.3)
+### Reporter credentials (CONTRACTS v1.4)
 
-The process-wide `REPORTER_TOKEN` authorizes actor `supervisor` only. Worker events use short-lived credentials minted via `POST /api/p/:project/reporter-credentials` (supervisor bearer auth; body `{actor: "worker:<node_id>"}`; response `{token, actor, expires}`; project- and actor-bound, 15-minute TTL, renewable by re-calling — renewal mints an additional credential and earlier ones lapse at their original expiry). The bridge mints one before every worker spawn, renews long-running workers before expiry, and refreshes expired credentials on later worker turns. `/report` accepts `JOURNAL_NOTE` from actor `supervisor` (the §5b `note` transport); workers may not journal. Set `MG_REPORTER_CREDENTIAL` to the supervisor-scope `REPORTER_TOKEN`.
+The process-wide `REPORTER_TOKEN` authorizes actor `supervisor` only. Worker events use short-lived credentials minted via `POST /api/p/:project/reporter-credentials` (supervisor bearer auth; body `{actor: "worker:<node_id>"}`; response `{token, actor, expires}`; project-, actor-, and node-bound, 15-minute TTL). A worker credential receives 403 if a node-scoped payload names any other node. The bridge mints one before every worker spawn, recreates renewal timers after restart, renews live workers five minutes before expiry, and renews again before any resume whose credential has less than five minutes remaining. `/report` accepts `JOURNAL_NOTE` from actor `supervisor`; workers may not journal. Set `MG_REPORTER_CREDENTIAL` to the supervisor-scope `REPORTER_TOKEN`.
 
 ## One-command local bring-up
 
-After exporting or replacing the values below, this single command installs, builds, starts the real server, waits for the configured project, and runs the full bridge pump in dry-run mode:
+Create a mode-0600 environment file and enter the values with an editor, so credentials never appear in shell history or command arguments:
 
 ```sh
-REPORTER_TOKEN='replace-process-secret' \
-MG_SERVER_URL='http://127.0.0.1:3000' \
-MG_PROJECT_ID='replace-project-id' \
-MG_VISITOR_TOKEN='replace-visitor-token' \
-MG_REPORTER_CREDENTIAL='replace-process-secret' \
-MG_TARGET_REPO='/absolute/path/to/demo-repo' \
-DB_PATH='/tmp/missiongraph.sqlite' \
-PORT='3000' \
+test -e bridge/.env.bridge || install -m 600 /dev/null bridge/.env.bridge
+chmod 600 bridge/.env.bridge
+${EDITOR:-vi} bridge/.env.bridge
+```
+
+The file contains these assignments with real values entered only in the editor:
+
+```sh
+REPORTER_TOKEN='replace-process-secret'
+MG_REPORTER_CREDENTIAL=$REPORTER_TOKEN
+MG_SERVER_URL='http://127.0.0.1:3000'
+MG_PROJECT_ID='replace-project-id'
+MG_VISITOR_TOKEN='replace-visitor-token'
+MG_TARGET_REPO='/absolute/path/to/demo-repo'
+DB_PATH='/tmp/missiongraph.sqlite'
+PORT='3000'
+```
+
+This single command loads the protected file, installs, builds, starts the real server, waits for the configured project using a protected curl header file, and runs the full bridge pump in dry-run mode:
+
+```sh
 sh -c 'set -eu
+  set -a
+  . bridge/.env.bridge
+  set +a
+  visitor_header=bridge/.env.visitor-header
+  (umask 077; printf "x-mg-token: %s\n" "$MG_VISITOR_TOKEN" > "$visitor_header")
   (cd server && pnpm install --frozen-lockfile && pnpm build)
   (cd bridge && pnpm install --frozen-lockfile && pnpm build)
   (cd server && pnpm start) &
   server_pid=$!
-  trap '\''kill "$server_pid" 2>/dev/null || true'\'' EXIT INT TERM
+  trap '\''kill "$server_pid" 2>/dev/null || true; rm -f "$visitor_header"'\'' EXIT INT TERM
   attempts=0
-  until curl --fail --silent --show-error -H "x-mg-token: $MG_VISITOR_TOKEN" "$MG_SERVER_URL/api/p/$MG_PROJECT_ID/snapshot" >/dev/null 2>&1; do
+  until curl --fail --silent --show-error --header @"$visitor_header" "$MG_SERVER_URL/api/p/$MG_PROJECT_ID/snapshot" >/dev/null 2>&1; do
     attempts=$((attempts + 1))
     [ "$attempts" -lt 100 ] || exit 1
     sleep 0.1
@@ -74,7 +92,7 @@ sh -c 'set -eu
   (cd bridge && pnpm start -- --dry-run)'
 ```
 
-`--dry-run` replaces Codex with `bridge/mock-codex.mjs`; server, SSE, FIFO, decision parsing, worktree creation, and state persistence remain real. Remove `--dry-run` to run real Codex sessions (verified end-to-end 2026-08-30, PROGRESS.md M3). The bridge launches Codex with the probe-verified flags, disables configured MCP servers with `-c mcp_servers={}`, and gives every child ignored stdin—the programmatic equivalent of `< /dev/null`.
+`--dry-run` replaces Codex with `bridge/mock-codex.mjs`; server, SSE, FIFO, decision parsing, worktree creation, reporter writes, and state persistence remain real. Every dry-run reporter journal write is visibly prefixed `DRY-RUN SIMULATION:`. Use `--dry-run` only with a throwaway project and throwaway database; it still appends simulation records and creates worktrees. Remove `--dry-run` to run real Codex sessions (verified end-to-end 2026-08-30, PROGRESS.md M3). The bridge disables configured MCP servers with `-c mcp_servers={}` and gives every child ignored stdin. Supervisor starts and resumes are read-only with no network override; worker starts and resumes use workspace-write plus the probed network override. Codex child environments are allowlisted and never inherit the reporter master credential or visitor token.
 
 ## VM spend controls
 
@@ -88,4 +106,4 @@ Before deploying the server and bridge to a VM:
 
 ## Codex lifecycle
 
-The bridge persists the supervisor `thread_id` and resumes it across bridge restarts. Fresh supervisors and workers use `codex exec ... --json` with workspace-write/network access and `mcp_servers={}`. Envelope delivery and cooperative worker commands use one-at-a-time `codex exec resume <thread_id> '<one-line JSON>' ... --json` turns. Worker briefs require queued→running→review/failed transitions, log tails, a version-1 `HANDOFF_FILED`, and one `APPROVAL_CREATED`; workers commit in isolated worktrees and never auto-merge.
+The bridge persists the supervisor `thread_id` and resumes it across bridge restarts. An exclusive state lock enforces one bridge daemon per project/state file. Envelope delivery and cooperative worker commands use one-at-a-time `codex exec resume` turns. Worker briefs require queued→running→review/failed transitions, log tails, a version-1 `HANDOFF_FILED`, and one `APPROVAL_CREATED`; workers commit in isolated worktrees and never auto-merge. On shutdown the bridge terminates tracked children with SIGTERM, waits up to 10 seconds, then uses SIGKILL if necessary.
