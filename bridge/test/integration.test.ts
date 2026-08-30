@@ -94,7 +94,8 @@ describe("bridge dry-run integration", () => {
           visitorToken: clone.token,
           reporterCredential: reporterToken,
         };
-        bridge = new MissionGraphBridge(bridgeConfig, new TestLogger(), true);
+        const logger = new TestLogger();
+        bridge = new MissionGraphBridge(bridgeConfig, logger, true);
         await bridge.start();
 
         await mutation(
@@ -130,8 +131,30 @@ describe("bridge dry-run integration", () => {
         expect(bridge.getState()).toMatchObject({
           cursor: "2",
           supervisor_thread_id: "mock-supervisor",
-          workers: { "smoke-node": { thread_id: "mock-worker-smoke-node" } },
+          workers: {
+            "smoke-node": {
+              thread_id: "mock-worker-smoke-node",
+              reporter_credential: expect.any(String),
+              reporter_expires: expect.stringMatching(/^2026-/),
+              reporter_config_path: expect.stringMatching(/\.reporter\.conf$/),
+            },
+          },
         });
+
+        await mutation(
+          serverUrl,
+          clone.project,
+          clone.token,
+          "ANNOTATED",
+          { target_id: "smoke-node", note: "Record this supervisor observation." },
+          "smoke-annotation",
+        );
+        for (let attempt = 0; attempt < 100 && bridge.getState()?.cursor !== "4"; attempt += 1) {
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+        }
+        await bridge.whenIdle();
+        expect(bridge.getState()?.cursor).toBe("4");
+        expect(logger.errorMessages).toEqual([]);
       } finally {
         await bridge?.stop();
         await stopProcess(server);

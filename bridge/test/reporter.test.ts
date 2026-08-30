@@ -48,7 +48,8 @@ describe("reporter contract", () => {
   it("makes lifecycle, log, handoff, and approval reporting non-optional in the worker brief", () => {
     const brief = workerBrief("node-a", "Build A.", "/tmp/repo");
     expect(brief).toContain("REPORTING IS REQUIRED AND NON-OPTIONAL");
-    expect(brief).toContain("Authorization: Bearer $MG_REPORTER_CREDENTIAL");
+    expect(brief).toContain('curl --config "$MG_REPORTER_CONFIG"');
+    expect(brief).toContain("without exposing the credential in process arguments");
     expect(brief).toContain("NODE_STATE_CHANGED");
     expect(brief).toContain("WORKER_LOG");
     expect(brief).toContain("HANDOFF_FILED");

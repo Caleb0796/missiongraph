@@ -9,6 +9,12 @@ export interface ReporterEvent {
   idem_key: string;
 }
 
+export interface ReporterCredential {
+  token: string;
+  actor: ReporterEvent["actor"];
+  expires: string;
+}
+
 export function reporterPayload(
   actor: ReporterEvent["actor"],
   type: string,
@@ -23,6 +29,35 @@ export class ReporterClient {
 
   get url(): string {
     return `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/report`;
+  }
+
+  async issue(actor: ReporterEvent["actor"]): Promise<ReporterCredential> {
+    const response = await fetch(
+      `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/reporter-credentials`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${this.config.reporterCredential}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ actor }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`reporter credential POST failed (${response.status}): ${await response.text()}`);
+    }
+    const body = (await response.json()) as Partial<ReporterCredential>;
+    if (
+      typeof body.token !== "string" ||
+      body.token.length === 0 ||
+      !/^[A-Za-z0-9._~+/-]+=*$/.test(body.token) ||
+      body.actor !== actor ||
+      typeof body.expires !== "string" ||
+      !Number.isFinite(Date.parse(body.expires))
+    ) {
+      throw new Error("reporter credential response did not match the MissionGraph contract");
+    }
+    return body as ReporterCredential;
   }
 
   async post(event: ReporterEvent): Promise<number> {

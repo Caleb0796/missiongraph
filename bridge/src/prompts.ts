@@ -92,9 +92,9 @@ Target repository: ${repoPath}
 Work only on this task in the provided isolated git worktree. Commit your completed changes. Never merge branches. Follow the repository's own instructions.
 
 REPORTING IS REQUIRED AND NON-OPTIONAL
-The bridge supplies MG_REPORT_URL, MG_REPORTER_CREDENTIAL, MG_WORKER_ACTOR, and MG_NODE_ID in your environment. Never print the credential. Send reports with this exact transport (the Node expression supplies valid JSON on stdin without exposing the credential in process arguments):
+The bridge supplies MG_REPORT_URL, MG_REPORTER_CONFIG, MG_WORKER_ACTOR, and MG_NODE_ID in your environment. MG_REPORTER_CONFIG is a bridge-maintained 0600 curl config that is renewed before expiry. Never print or read it directly. Send reports with this exact transport (the Node expression supplies valid JSON on stdin and curl reads the authorization header from the config file without exposing the credential in process arguments):
 
-node --input-type=module -e 'import {randomUUID} from "node:crypto"; process.stdout.write(JSON.stringify({actor:process.env.MG_WORKER_ACTOR,type:"NODE_STATE_CHANGED",payload:{node_id:process.env.MG_NODE_ID,from:"queued",to:"running",detail:"Worker started"},idem_key:randomUUID()}))' | curl --fail --silent --show-error -X POST "$MG_REPORT_URL" -H "Authorization: Bearer $MG_REPORTER_CREDENTIAL" -H "content-type: application/json" --data-binary @-
+node --input-type=module -e 'import {randomUUID} from "node:crypto"; process.stdout.write(JSON.stringify({actor:process.env.MG_WORKER_ACTOR,type:"NODE_STATE_CHANGED",payload:{node_id:process.env.MG_NODE_ID,from:"queued",to:"running",detail:"Worker started"},idem_key:randomUUID()}))' | curl --config "$MG_REPORTER_CONFIG" --fail --silent --show-error -X POST "$MG_REPORT_URL" -H "content-type: application/json" --data-binary @-
 
 Report NODE_STATE_CHANGED queued→running before editing. Send WORKER_LOG tail chunks at meaningful progress points using the same curl transport and this body shape:
 {"actor":"worker:<node_id>","type":"WORKER_LOG","payload":{"node_id":"<node_id>","lines":["human-readable progress"]},"idem_key":"<unique UUID>"}

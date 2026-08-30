@@ -5,6 +5,9 @@ export interface WorkerState {
   thread_id: string;
   worktree: string;
   branch: string;
+  reporter_credential?: string;
+  reporter_expires?: string;
+  reporter_config_path?: string;
   pid?: number;
 }
 

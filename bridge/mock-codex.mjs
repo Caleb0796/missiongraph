@@ -20,13 +20,19 @@ if (args[1] === "resume") {
     } catch {
       envelopes = [];
     }
-    const actions = envelopes
-      .filter((envelope) => envelope?.type === "DISPATCHED" && typeof envelope.node_id === "string")
-      .map((envelope) => ({
-        act: "spawn_worker",
-        node_id: envelope.node_id,
-        brief: typeof envelope.brief_override === "string" ? envelope.brief_override : `Execute node ${envelope.node_id}.`,
-      }));
+    const actions = envelopes.flatMap((envelope) => {
+      if (envelope?.type === "DISPATCHED" && typeof envelope.node_id === "string") {
+        return [{
+          act: "spawn_worker",
+          node_id: envelope.node_id,
+          brief: typeof envelope.brief_override === "string" ? envelope.brief_override : `Execute node ${envelope.node_id}.`,
+        }];
+      }
+      if (envelope?.type === "ANNOTATED") {
+        return [{ act: "note", text: `Supervisor observed annotation for ${String(envelope.target_id)}.` }];
+      }
+      return [];
+    });
     agent({ actions });
   } else {
     agent({ worker_ack: true });

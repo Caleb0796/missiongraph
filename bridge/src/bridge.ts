@@ -24,6 +24,7 @@ async function snapshot(config: BridgeConfig): Promise<Snapshot> {
 export class MissionGraphBridge {
   private stateStore?: StateStore;
   private pump?: EnvelopePump;
+  private actions: ActionExecutor | undefined;
   private abort: AbortController | undefined;
   private stream: Promise<void> | undefined;
 
@@ -43,6 +44,7 @@ export class MissionGraphBridge {
     this.stateStore = stateStore;
     const codex = new CodexClient(this.config, this.logger, this.dryRun);
     const actions = new ActionExecutor(this.config, stateStore, codex, this.logger);
+    this.actions = actions;
     if (!stateStore.state.supervisor_thread_id) {
       const result = await codex.startSupervisor(supervisorBrief(currentSnapshot));
       if (!result.threadId) throw new Error("supervisor JSONL did not contain thread.started");
@@ -81,8 +83,10 @@ export class MissionGraphBridge {
     this.abort?.abort();
     await this.stream;
     await this.pump?.whenIdle();
+    this.actions?.stop();
     this.abort = undefined;
     this.stream = undefined;
+    this.actions = undefined;
   }
 
   async whenIdle(): Promise<void> {

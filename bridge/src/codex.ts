@@ -64,7 +64,7 @@ export class CodexClient {
     return this.collect(this.resumeArgs(threadId, envelope), this.config.targetRepoPath);
   }
 
-  startWorker(nodeId: string, brief: string, worktree: string): RunningCodex {
+  startWorker(nodeId: string, brief: string, worktree: string, reporterConfigPath: string): RunningCodex {
     const running = this.start(
       [
         "exec",
@@ -86,7 +86,7 @@ export class CodexClient {
       this.config.targetRepoPath,
       {
         MG_REPORT_URL: `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/report`,
-        MG_REPORTER_CREDENTIAL: this.config.reporterCredential,
+        MG_REPORTER_CONFIG: reporterConfigPath,
         MG_WORKER_ACTOR: `worker:${nodeId}`,
         MG_NODE_ID: nodeId,
       },
@@ -95,10 +95,16 @@ export class CodexClient {
     return running;
   }
 
-  async resumeWorker(nodeId: string, threadId: string, message: string, worktree: string): Promise<CodexResult> {
+  async resumeWorker(
+    nodeId: string,
+    threadId: string,
+    message: string,
+    worktree: string,
+    reporterConfigPath: string,
+  ): Promise<CodexResult> {
     return this.collect(this.resumeArgs(threadId, message), worktree, {
       MG_REPORT_URL: `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/report`,
-      MG_REPORTER_CREDENTIAL: this.config.reporterCredential,
+      MG_REPORTER_CONFIG: reporterConfigPath,
       MG_WORKER_ACTOR: `worker:${nodeId}`,
       MG_NODE_ID: nodeId,
     });
