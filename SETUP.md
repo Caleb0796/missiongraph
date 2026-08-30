@@ -24,6 +24,8 @@ curl --fail --silent --show-error -X POST http://127.0.0.1:3000/api/clone-demo
 
 The response supplies `project`, `token`, and `cursor`. Use `project` as `MG_PROJECT_ID` and `token` as `MG_VISITOR_TOKEN`.
 
+For a fresh local database, start the server once with the same `REPORTER_TOKEN` and `DB_PATH` you will use below, clone the project, then stop that bootstrap server. The one-command launcher reopens that database; changing `DB_PATH` would point it at a server that does not contain the cloned project.
+
 Configure the bridge with environment variables or copy `bridge/config.example.json` to the ignored `bridge/config.json`. Environment variables take precedence:
 
 | Environment variable | `config.json` key | Purpose |
