@@ -32,6 +32,10 @@ WebMCP Challenge entry (Devpost, deadline **Sep 3 2026 13:00 PDT**). The full co
 - Chrome demos: https://github.com/GoogleChromeLabs/webmcp-tools · React hook: `usewebmcp` (npm)
 - Challenge rules: https://webmcp.devpost.com/rules
 
+## Multi-session mode
+
+Execution runs as a FLEET (see docs/EXECUTION_PLAN.md): your kickoff prompt names your session id (S1/S2/S3…), track, and worktree branch. Stay in your lane — commit only to your track branch, never touch other tracks' files, never merge to `main` (the orchestrator does, after review). **docs/CONTRACTS.md is frozen**: build exactly to it; if it blocks you, write the issue in PROGRESS.md and continue on what's unblocked — the orchestrator amends contracts, you don't. Milestone discipline applies per track.
+
 ## Kickoff prompt (for the human to paste)
 
 > Read AGENTS.md and GOAL_PLAN.md fully. Execute milestone M0 ONLY. Self-test tool registration in-page via getTools()/executeTool() first, then verify in the ChatGPT built-in browser and flagged Chrome. Stop when M0's DoD passes or the compat gate fails; either way write PROGRESS.md with evidence and commit.
