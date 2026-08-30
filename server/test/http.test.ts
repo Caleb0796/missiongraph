@@ -19,6 +19,107 @@ afterEach(async () => {
 });
 
 describe("HTTP and streaming contract", () => {
+  it("answers CORS preflights only for configured origins", async () => {
+    const { app } = server({ allowedOrigins: ["https://missiongraph.vercel.app"] });
+    const allowed = await app.inject({
+      method: "OPTIONS",
+      url: "/api/clone-demo",
+      headers: {
+        origin: "https://missiongraph.vercel.app",
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "content-type,x-mg-token,x-mg-session",
+      },
+    });
+    const denied = await app.inject({
+      method: "OPTIONS",
+      url: "/api/clone-demo",
+      headers: { origin: "https://attacker.example" },
+    });
+
+    expect(allowed.statusCode).toBe(204);
+    expect(allowed.headers["access-control-allow-origin"]).toBe("https://missiongraph.vercel.app");
+    expect(allowed.headers["access-control-allow-headers"]).toContain("x-mg-token");
+    expect(allowed.headers["access-control-allow-headers"]).toContain("x-mg-session");
+    expect(denied.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("applies mutation batches atomically with server-assigned ids", async () => {
+    const assignedIds = ["node-a", "node-b", "edge-a-b"];
+    const { app, store } = server({ id: () => assignedIds.shift() ?? "unexpected-id" });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    const invalid = await app.inject({
+      method: "POST",
+      url: "/api/p/project/mutations",
+      headers: { "x-mg-token": "visitor-token", "x-mg-actor": "browser_agent" },
+      payload: {
+        batch: [
+          {
+            type: "TASK_ADDED",
+            payload: {
+              node: { id: "temp-a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+            },
+          },
+          {
+            type: "EDGE_ADDED",
+            payload: { edge_id: "temp-edge", upstream: "temp-a", downstream: "missing", kind: "depends" },
+          },
+        ],
+        idem_key: "invalid-plan",
+        base_seq: 0,
+      },
+    });
+
+    expect(invalid.statusCode).toBe(400);
+    expect(store.listEvents("project")).toEqual([]);
+
+    assignedIds.splice(0, assignedIds.length, "node-a", "node-b", "edge-a-b");
+    const validPayload = {
+      batch: [
+        {
+          type: "TASK_ADDED",
+          payload: {
+            node: { id: "temp-a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+          },
+        },
+        {
+          type: "TASK_ADDED",
+          payload: {
+            node: { id: "temp-b", title: "Task B", brief: "Build B.", estimate_min: 10, tags: [], state: "queued" },
+          },
+        },
+        {
+          type: "EDGE_ADDED",
+          payload: { edge_id: "temp-edge", upstream: "temp-a", downstream: "temp-b", kind: "depends" },
+        },
+      ],
+      idem_key: "valid-plan",
+      base_seq: 0,
+    };
+    const valid = await app.inject({
+      method: "POST",
+      url: "/api/p/project/mutations",
+      headers: { "x-mg-token": "visitor-token", "x-mg-actor": "browser_agent" },
+      payload: validPayload,
+    });
+    const duplicate = await app.inject({
+      method: "POST",
+      url: "/api/p/project/mutations",
+      headers: { "x-mg-token": "visitor-token", "x-mg-actor": "browser_agent" },
+      payload: validPayload,
+    });
+
+    expect(valid.json()).toEqual({ seqs: [1, 2, 3] });
+    expect(duplicate.json()).toEqual({ seqs: [1, 2, 3] });
+    expect(store.listEvents("project")).toMatchObject([
+      { type: "TASK_ADDED", payload: { node: { id: "node-a" } } },
+      { type: "TASK_ADDED", payload: { node: { id: "node-b" } } },
+      {
+        type: "EDGE_ADDED",
+        payload: { edge_id: "edge-a-b", upstream: "node-a", downstream: "node-b" },
+      },
+    ]);
+  });
+
   it("returns a fresh digest for stale mutations", async () => {
     const { app, store } = server();
     store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
