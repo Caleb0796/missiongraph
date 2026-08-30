@@ -1,8 +1,8 @@
+import { TransportError } from '../transport/client'
+import { useMissionStore } from '../store/mission-store'
+
 export type ModelContextNamespace = 'document' | 'navigator'
-export type DynamicToolsTier =
-  | 'abort-controller'
-  | 'provide-context'
-  | 'none'
+export type DynamicToolsTier = 'abort-controller' | 'provide-context' | 'none'
 
 export interface RegistryStatus {
   namespace: ModelContextNamespace | null
@@ -36,7 +36,9 @@ interface ModelContext {
     tool: ModelContextTool,
     options?: { signal?: AbortSignal },
   ) => Promise<void> | void
-  provideContext?: (context: { tools: ModelContextTool[] }) => Promise<void> | void
+  provideContext?: (context: {
+    tools: ModelContextTool[]
+  }) => Promise<void> | void
   getTools: () => Promise<RegisteredTool[]>
   executeTool: (tool: RegisteredTool, input: string) => Promise<string | null>
 }
@@ -51,16 +53,25 @@ declare global {
   }
 }
 
-interface ToolResult {
-  ok: boolean
+export interface ToolOutcome {
   [key: string]: unknown
+  data?: unknown
+  error?: { code: string; message: string }
+  preview?: {
+    op_token: string
+    blast_radius: { stale: string[]; pausing: string[] }
+  }
 }
 
-interface ToolDefinition extends Omit<ModelContextTool, 'execute'> {
+export interface ToolDefinition {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+  annotations?: Record<string, boolean>
   execute: (
     inputs: Record<string, unknown>,
     options: ToolExecuteOptions,
-  ) => ToolResult | Promise<ToolResult>
+  ) => ToolOutcome | Promise<ToolOutcome>
 }
 
 export interface WebMcpRuntime {
@@ -72,13 +83,16 @@ const helloMissionGraph: ToolDefinition = {
   name: 'hello_missiongraph',
   description:
     'Report MissionGraph WebMCP compatibility details for this browser.',
-  inputSchema: { type: 'object', properties: {}, required: [] },
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    required: [],
+    additionalProperties: false,
+  },
   annotations: { readOnlyHint: true },
   execute() {
     const runtime = getWebMcpRuntime()
-
     return {
-      ok: true,
       ts: new Date().toISOString(),
       env: {
         ua: navigator.userAgent,
@@ -89,45 +103,69 @@ const helloMissionGraph: ToolDefinition = {
 }
 
 let initialization: Promise<RegistryStatus> | undefined
+let definitions: ToolDefinition[] = [helloMissionGraph]
+let clientCursor: string | null = null
 
 export function getWebMcpRuntime(): WebMcpRuntime | null {
   if (document.modelContext) {
     return { modelContext: document.modelContext, namespace: 'document' }
   }
-
   if (navigator.modelContext) {
     return { modelContext: navigator.modelContext, namespace: 'navigator' }
   }
-
   return null
+}
+
+function errorShape(error: unknown) {
+  if (error instanceof TransportError) {
+    return { code: error.code, message: error.message }
+  }
+  if (error instanceof Error) {
+    return { code: 'invalid_input', message: error.message }
+  }
+  return { code: 'tool_error', message: String(error) }
+}
+
+async function executeDefinition(
+  definition: ToolDefinition,
+  inputs: Record<string, unknown>,
+  options: ToolExecuteOptions,
+) {
+  const storeBefore = useMissionStore.getState()
+  const explicitSince =
+    definition.name === 'graph_digest' && typeof inputs.since === 'string'
+      ? inputs.since
+      : null
+  const since = explicitSince ?? clientCursor ?? storeBefore.cursor
+  let outcome: ToolOutcome
+  try {
+    outcome = await definition.execute(inputs, options)
+  } catch (error) {
+    outcome = { error: errorShape(error) }
+  }
+  const storeAfter = useMissionStore.getState()
+  const changes = storeAfter.changes
+    .filter((change) => change.seq > Number(since))
+    .slice(-50)
+  clientCursor = storeAfter.cursor
+  return JSON.stringify({
+    ok: !outcome.error,
+    ...outcome,
+    cursor: storeAfter.cursor,
+    changes_since: changes,
+  })
 }
 
 function wrapTool(definition: ToolDefinition): ModelContextTool {
   return {
-    ...definition,
-    async execute(inputs, options) {
-      const result = await definition.execute(inputs, options)
-
-      return JSON.stringify({
-        ...result,
-        cursor: '0',
-        changes_since: [],
-      })
+    name: definition.name,
+    description: definition.description,
+    inputSchema: definition.inputSchema,
+    annotations: definition.annotations,
+    execute(inputs, options) {
+      return executeDefinition(definition, inputs, options)
     },
   }
-}
-
-export async function registerTool(
-  definition: ToolDefinition,
-  options?: { signal?: AbortSignal },
-) {
-  const runtime = getWebMcpRuntime()
-  if (!runtime) {
-    return false
-  }
-
-  await runtime.modelContext.registerTool(wrapTool(definition), options)
-  return true
 }
 
 function isAbortError(error: unknown) {
@@ -137,20 +175,17 @@ function isAbortError(error: unknown) {
 async function bootstrapWebMcp(): Promise<RegistryStatus> {
   const runtime = getWebMcpRuntime()
   if (!runtime) {
-    const status: RegistryStatus = {
-      namespace: null,
-      dynamicToolsTier: 'none',
-    }
     console.info('[MissionGraph] WebMCP unavailable; dynamic-tools tier=none')
-    return status
+    return { namespace: null, dynamicToolsTier: 'none' }
   }
 
   const controller = new AbortController()
   controller.abort()
   let registrationError: unknown
-
   try {
-    await registerTool(helloMissionGraph, { signal: controller.signal })
+    await runtime.modelContext.registerTool(wrapTool(helloMissionGraph), {
+      signal: controller.signal,
+    })
   } catch (error) {
     registrationError = error
   }
@@ -160,28 +195,49 @@ async function bootstrapWebMcp(): Promise<RegistryStatus> {
     (tool) => tool.name === helloMissionGraph.name,
   )
   let dynamicToolsTier: DynamicToolsTier
-
   if (!helloWasRegistered) {
     if (registrationError && !isAbortError(registrationError)) {
       throw registrationError
     }
-
     dynamicToolsTier = 'abort-controller'
-    await registerTool(helloMissionGraph)
   } else if (typeof runtime.modelContext.provideContext === 'function') {
     dynamicToolsTier = 'provide-context'
   } else {
     dynamicToolsTier = 'none'
   }
 
+  const tools = definitions.map(wrapTool)
+  if (
+    dynamicToolsTier === 'provide-context' &&
+    runtime.modelContext.provideContext
+  ) {
+    await runtime.modelContext.provideContext({ tools })
+  } else {
+    const existing = new Set(registeredTools.map((tool) => tool.name))
+    for (const tool of tools) {
+      if (!existing.has(tool.name)) await runtime.modelContext.registerTool(tool)
+    }
+  }
+
   console.info(
     `[MissionGraph] WebMCP namespace=${runtime.namespace}; dynamic-tools tier=${dynamicToolsTier}`,
   )
-
   return { namespace: runtime.namespace, dynamicToolsTier }
 }
 
-export function initializeWebMcp() {
+export function initializeWebMcp(coreDefinitions: ToolDefinition[] = []) {
+  definitions = [helloMissionGraph, ...coreDefinitions]
   initialization ??= bootstrapWebMcp()
   return initialization
+}
+
+export async function executeToolDirect(
+  name: string,
+  inputs: Record<string, unknown>,
+) {
+  const definition = definitions.find((tool) => tool.name === name)
+  if (!definition) throw new Error(`Tool ${name} is not registered.`)
+  return executeDefinition(definition, inputs, {
+    signal: new AbortController().signal,
+  })
 }

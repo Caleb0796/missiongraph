@@ -28,7 +28,7 @@ interface Toast {
   message: string
 }
 
-export interface CameraRequest {
+interface CameraRequest {
   id: string
   nodeIds: string[]
 }
@@ -75,6 +75,7 @@ interface MissionState {
     projectId: string,
   ) => void
   applyEvent: (event: MissionEvent) => void
+  recordHistoricalEvent: (event: MissionEvent) => void
   applyDigestChanges: (changes: DigestChange[], cursor: string) => void
   useFixture: (message: string) => void
   setConnectionMode: (mode: ConnectionMode, message: string) => void
@@ -331,6 +332,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         if (selectedId === event.payload.edge_id) selectedId = null
         break
       case 'DISPATCHED':
+        nodes = nodes.map((node) =>
+          node.id === event.payload.node_id ? { ...node, assigned: true } : node,
+        )
         readySince = Object.fromEntries(
           Object.entries(readySince).filter(([id]) => id !== event.payload.node_id),
         )
@@ -462,6 +466,22 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     if (event.actor === 'browser_agent') {
       get().showToast(`🤖 via your agent — ${describeEvent(event, nodes, edges)}`)
     }
+  },
+  recordHistoricalEvent(event) {
+    const state = get()
+    if (event.seq > Number(state.cursor)) {
+      state.applyEvent(event)
+      return
+    }
+    const change = eventChange(event, state.nodes, state.edges)
+    set({
+      events: [...state.events.filter((item) => item.seq !== event.seq), event]
+        .sort((left, right) => left.seq - right.seq)
+        .slice(-250),
+      changes: [...state.changes.filter((item) => item.seq !== event.seq), change]
+        .sort((left, right) => left.seq - right.seq)
+        .slice(-250),
+    })
   },
   applyDigestChanges(changes, cursor) {
     set((state) => ({

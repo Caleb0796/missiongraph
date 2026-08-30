@@ -183,6 +183,18 @@ a:focus-visible {
 
 .compat-link:hover { color: #82dbe6; }
 
+.offline-badge {
+  border: 1px solid rgb(239 184 94 / 38%);
+  border-radius: 999px;
+  background: rgb(78 54 23 / 45%);
+  padding: 4px 8px;
+  color: #e9bd78;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 8px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
 .canvas-stage {
   position: relative;
   grid-column: 1;
@@ -560,6 +572,50 @@ a:focus-visible {
 }
 
 .mission-toast--error { border-color: #77404a; background: rgb(47 25 31 / 96%); color: #f2b6bf; }
+
+.tool-console {
+  position: fixed;
+  z-index: 80;
+  top: 14px;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  width: min(440px, calc(100vw - 28px));
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #31465a;
+  border-radius: 11px;
+  background: rgb(9 16 24 / 98%);
+  box-shadow: 0 24px 70px rgb(0 0 0 / 55%);
+  padding: 16px;
+  backdrop-filter: blur(18px);
+}
+
+.tool-console-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.tool-console-heading p,
+.tool-console-heading h1 { margin: 0; }
+.tool-console-heading p { color: #61788b; font-size: 8px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }
+.tool-console-heading h1 { margin-top: 4px; color: #d7e5ec; font-size: 19px; }
+.tool-console-heading a { color: #7d94a5; font-size: 10px; }
+.tool-console-status { margin: 14px 0; border: 1px solid #25384a; border-radius: 6px; background: #101b26; padding: 7px 9px; color: #72cbd6; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; }
+.tool-console-label { margin: 10px 0 5px; color: #6d8292; font-size: 8px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+.tool-console select,
+.tool-console textarea { width: 100%; border: 1px solid #2b4053; border-radius: 6px; background: #0b131d; color: #c6d5df; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.tool-console select { padding: 8px; }
+.tool-console textarea { min-height: 100px; resize: vertical; padding: 10px; line-height: 1.55; }
+.tool-console-description { margin: 8px 0 0; color: #8da0af; font-size: 10px; line-height: 1.55; }
+.tool-console-schema { margin-top: 9px; color: #60778a; font-size: 9px; }
+.tool-console-schema summary { cursor: pointer; }
+.tool-console-schema pre { max-height: 140px; overflow: auto; border: 1px solid #233547; border-radius: 6px; background: #080f17; padding: 8px; color: #8299aa; font-size: 8px; }
+.tool-console > button { margin-top: 10px; border: 1px solid #58bdca; border-radius: 6px; background: #65d1dc; padding: 9px; color: #07161b; font-size: 10px; font-weight: 700; }
+.tool-console > button:disabled { cursor: wait; opacity: 0.55; }
+.tool-console-output { min-height: 0; flex: 1; overflow: auto; margin: 0; border: 1px solid #223548; border-radius: 7px; background: #070e16; padding: 10px; color: #8fe0b9; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; line-height: 1.5; white-space: pre-wrap; }
 
 @keyframes running-ring { to { transform: rotate(360deg); } }
 @keyframes live-breathe { 50% { opacity: 0.45; transform: scale(0.82); } }

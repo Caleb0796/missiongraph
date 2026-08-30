@@ -69,6 +69,11 @@ export function PulseBar({
             Offline fixture
           </span>
         )}
+        {connectionMessage.includes('fixture projection') && (
+          <span className="offline-badge" title={connectionMessage}>
+            Dev fixture projection
+          </span>
+        )}
         <button
           type="button"
           className="catch-up-chip"
@@ -85,9 +90,11 @@ export function PulseBar({
         <a href="/compat" className="compat-link">
           Compat
         </a>
-        <a href="/tools" className="compat-link">
-          Tools
-        </a>
+        {import.meta.env.DEV && (
+          <a href="/tools" className="compat-link">
+            Tools
+          </a>
+        )}
       </div>
     </header>
   )

@@ -74,13 +74,37 @@ for (const event of shortyEvents.filter((candidate) =>
   cursor = response.seq
 }
 
-const url = new URL('http://127.0.0.1:5173/')
+const finalSnapshot = await json<{
+  state: {
+    nodes: Record<string, { state: string }>
+    edges: Record<string, unknown>
+  }
+  cursor: string
+}>(
+  await fetch(`${server}/api/p/${clone.project}/snapshot`, {
+    headers: { 'x-mg-token': clone.token },
+  }),
+)
+const states = Object.values(finalSnapshot.state.nodes).reduce<Record<string, number>>(
+  (counts, node) => ({ ...counts, [node.state]: (counts[node.state] ?? 0) + 1 }),
+  {},
+)
+if (
+  Object.keys(finalSnapshot.state.nodes).length !== 14 ||
+  Object.keys(finalSnapshot.state.edges).length !== 18 ||
+  finalSnapshot.cursor !== String(cursor)
+) {
+  throw new Error('The seeded live projection does not match the Shorty graph.')
+}
+
+const url = new URL(process.env.MG_APP_URL ?? 'http://127.0.0.1:5173/')
 url.searchParams.set('mg_project', clone.project)
 url.searchParams.set('mg_token', clone.token)
 
 process.stdout.write(
   [
     `Seeded ${shortyEvents.filter((event) => browserMutationTypes.has(event.type)).length} real mutation events at cursor ${cursor}.`,
+    `Verified 14 tasks, 18 edges, and lifecycle states ${JSON.stringify(states)} from the live snapshot.`,
     `Open ${url.toString()}`,
     'Reporter-only fixture records were not imported; they remain simulation data and are not represented as real worker history.',
   ].join('\n') + '\n',

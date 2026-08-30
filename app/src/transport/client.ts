@@ -57,8 +57,12 @@ const logicalServer = (import.meta.env.VITE_MG_SERVER ?? DEFAULT_SERVER).replace
   '',
 )
 const requestBase = import.meta.env.DEV ? '/mg' : logicalServer
-const debounceTimers = new Map<string, number>()
+const debounceTimers = new Map<
+  string,
+  { timer: number; resolve: (cursor: number) => void }
+>()
 let identity: ClientIdentity | null = null
+let seededDevProject = false
 let socket: WebSocket | null = null
 let reconnectTimer: number | null = null
 let mutationQueue = Promise.resolve()
@@ -131,6 +135,11 @@ async function refreshSnapshot() {
   useMissionStore
     .getState()
     .applySnapshot(snapshot.state, snapshot.cursor, identity.project)
+  if (seededDevProject) {
+    useMissionStore
+      .getState()
+      .setConnectionMode('live', 'Live dev seed · fixture projection')
+  }
 }
 
 function openSocket() {
@@ -155,7 +164,12 @@ function openSocket() {
     }
   })
   socket.addEventListener('open', () => {
-    useMissionStore.getState().setConnectionMode('live', 'Live server')
+    useMissionStore
+      .getState()
+      .setConnectionMode(
+        'live',
+        seededDevProject ? 'Live dev seed · fixture projection' : 'Live server',
+      )
   })
   socket.addEventListener('close', () => {
     if (!identity) return
@@ -261,13 +275,16 @@ export function mutate<T extends EvType>(
   const actor = options.actor ?? 'human'
   if (options.debounceKey) {
     const previous = debounceTimers.get(options.debounceKey)
-    if (previous !== undefined) window.clearTimeout(previous)
+    if (previous) {
+      window.clearTimeout(previous.timer)
+      previous.resolve(Number(useMissionStore.getState().cursor))
+    }
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
         debounceTimers.delete(options.debounceKey!)
         mutate(type, payload, { actor }).then(resolve, reject)
       }, 260)
-      debounceTimers.set(options.debounceKey!, timer)
+      debounceTimers.set(options.debounceKey!, { timer, resolve })
     })
   }
 
@@ -292,9 +309,14 @@ async function bootstrap() {
   store.setSessionId(sessionId())
   configureMutationSender(mutate)
   try {
-    identity = seededIdentityFromUrl() ?? (await cloneDemo())
+    const seededIdentity = seededIdentityFromUrl()
+    seededDevProject = seededIdentity !== null
+    identity = seededIdentity ?? (await cloneDemo())
     const snapshot = await getSnapshot(identity)
     store.applySnapshot(snapshot.state, snapshot.cursor, identity.project)
+    if (seededIdentity) {
+      store.setConnectionMode('live', 'Live dev seed · fixture projection')
+    }
     openSocket()
   } catch (error) {
     identity = null
@@ -309,10 +331,38 @@ export function initializeMissionClient() {
   return initialization
 }
 
-export function clientInfo() {
-  return {
-    server: logicalServer,
-    project: identity?.project ?? null,
-    session: useMissionStore.getState().sessionId,
+export async function loadChangesSince(since: string) {
+  const state = useMissionStore.getState()
+  if (state.connectionMode === 'fixture') {
+    for (const event of state.events.filter((event) => event.seq > Number(since))) {
+      state.recordHistoricalEvent(event)
+    }
+    return
   }
+  if (!identity || Number(since) >= Number(state.cursor)) return
+
+  const target = Number(state.cursor)
+  await new Promise<void>((resolve, reject) => {
+    const historySocket = new WebSocket(websocketEndpoint(identity!, since))
+    const timeout = window.setTimeout(() => {
+      historySocket.close()
+      reject(new TransportError('history_timeout', 'Timed out loading graph history.'))
+    }, 3_000)
+    historySocket.addEventListener('message', (message) => {
+      const data = JSON.parse(String(message.data)) as
+        | { kind: 'event'; event: MissionEvent }
+        | { kind: 'snapshot' }
+      if (data.kind !== 'event') return
+      useMissionStore.getState().recordHistoricalEvent(data.event)
+      if (data.event.seq >= target) {
+        window.clearTimeout(timeout)
+        historySocket.close()
+        resolve()
+      }
+    })
+    historySocket.addEventListener('error', () => {
+      window.clearTimeout(timeout)
+      reject(new TransportError('history_unavailable', 'Graph history is unavailable.'))
+    })
+  })
 }
