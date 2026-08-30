@@ -43,6 +43,12 @@ codex exec "<worker brief>" -C ../wt-<node> -s workspace-write \
 - Always `< /dev/null` — codex reads stdin otherwise ("Reading additional input from stdin...").
 - Model availability on this account: `gpt-5.6-sol` (+ `model_reasoning_effort="ultra"` OK); `gpt-5.6-sol-max` → HTTP 400.
 
+## Addendum — CLI updated to 0.151.0 (2026-08-30, later same day)
+
+- `codex queue` now EXISTS ("Queue a message for an existing session"). Bridge decision UNCHANGED: `exec resume` stays the primary delivery (each envelope = one auditable turn whose output is the §5b decision JSON; queue is fire-and-forget with no capturable response stream). `queue` is approved only as an optional side-channel for FYI-class events needing no decision. M3 opens with a fresh probe of `codex queue --help` syntax before any use.
+- `exec resume` now ACCEPTS `-m` (0.144.6 rejected it); also gained `--last`/`--all`. Re-verify `-C` behavior at M3.
+- Version 0.151.0 is not on the known-bad list. Sessions already running on 0.144.6 are unaffected.
+
 ## Architectural consequence (CONTRACTS v1.1)
 
 Server holds the envelope FIFO; ONE in-flight `exec resume` to the supervisor at a time; each supervisor decision is a discrete, auditable turn. The supervisor is the BRAIN (its turn output = decision JSON); the SERVER is the hands (spawns worker sessions per decision). C4 boundary intact and now trivially auditable: every scheduling decision exists as a recorded supervisor turn.

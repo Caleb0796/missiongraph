@@ -21,7 +21,8 @@ WebMCP Challenge entry (Devpost, deadline **Sep 3 2026 13:00 PDT**). The full co
 - vercel CLI: NOT installed (install via `pnpm add -g vercel`, or deploy via dashboard); render CLI: not installed (use render.yaml blueprint / dashboard)
 - Chrome installed: **152.0.7977.64 = current STABLE — this is the PRIMARY compat target (judges run stable)**. AbortController tool unregistration is 153+ (Beta): feature-detect and fall back to `provideContext` full-set replacement on ≤152; shipped behavior identical on both. Flag: `chrome://flags/#enable-webmcp-testing`. Chrome Beta side-by-side is optional for the enhanced path.
 - ChatGPT.app installed (its built-in browser supports WebMCP natively — primary test target)
-- codex CLI 0.144.6 at /opt/homebrew/bin/codex; auth present. Quirks: `codex exec resume` rejects `-C`/`-m`; stderr always shows a harmless Oracle-dbtools MCP AuthRequired error + a models-cache warning — ignore both; best available model on this account: `gpt-5.6-sol` (`gpt-5.6-sol-max` returns 400)
+- codex CLI 0.151.0 (updated 2026-08-30; probe facts in docs/PROBE.md + addendum): `codex queue` exists but the bridge uses `exec resume` as primary (auditable turns); resume now accepts `-m`; stderr always shows a harmless Oracle-dbtools MCP AuthRequired error + a models-cache warning — ignore both; best available model on this account: `gpt-5.6-sol` (`gpt-5.6-sol-max` returns 400)
+- Deployed: **https://missiongraph.vercel.app** (Vercel project `missiongraph`, prod alias live 2026-08-30)
 - WebMCP API contract pinned in **docs/webmcp-notes.md** (registerTool shape, string returns, toolchange, permissions policy)
 
 ## Key references
