@@ -1,4 +1,4 @@
-import type { Ev, Event, EvType, Handoff, NodeState, TaskNode } from "./events.js";
+import type { Ev, Event, Handoff, NodeState, TaskNode } from "./events.js";
 
 export class GraphValidationError extends Error {
   constructor(message: string) {
@@ -453,8 +453,4 @@ export function fold(events: readonly Event[]): GraphState {
   let state = initialState();
   for (const event of events) state = reduceEvent(state, event);
   return state;
-}
-
-export function isDependencyMutation(type: EvType): boolean {
-  return type === "EDGE_ADDED" || type === "EDGE_REMOVED" || type === "TASK_REMOVED" || type === "TASK_SPLIT";
 }

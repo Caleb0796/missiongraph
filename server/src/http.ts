@@ -9,7 +9,6 @@ import {
   EventValidationError,
   StaleSequenceError,
   UnknownProjectError,
-  parseActor,
   parseEventInput,
   reporterEventTypes,
   type Actor,
