@@ -13,7 +13,7 @@ function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
   return Object.keys(value).sort().join("\0") === [...keys].sort().join("\0");
 }
 
-function action(value: unknown): SupervisorAction | undefined {
+export function supervisorAction(value: unknown): SupervisorAction | undefined {
   if (!object(value) || typeof value.act !== "string") return undefined;
   if (value.act === "spawn_worker") {
     if (!exactKeys(value, ["act", "node_id", "brief"])) return undefined;
@@ -77,7 +77,7 @@ export function parseSupervisorDecision(jsonl: string, logger: Logger): Supervis
   try {
     const parsed = JSON.parse(message) as unknown;
     if (!object(parsed) || !exactKeys(parsed, ["actions"]) || !Array.isArray(parsed.actions)) throw new Error();
-    const actions = parsed.actions.map(action);
+    const actions = parsed.actions.map(supervisorAction);
     if (actions.some((candidate) => candidate === undefined)) throw new Error();
     return { actions: actions as SupervisorAction[] };
   } catch {
@@ -102,11 +102,20 @@ export function validateSupervisorDecision(
     journal.push(`Supervisor decision dropped ${decision.actions.length - maximumActions} actions beyond the per-turn cap of ${maximumActions}.`);
   }
   for (const candidate of decision.actions.slice(0, maximumActions)) {
-    if (candidate.act !== "note" && !snapshot.state.nodes[candidate.node_id]) {
+    if (candidate.act === "spawn_worker" && snapshot.state.tombstones?.[candidate.node_id]) {
+      journal.push(`Supervisor decision skipped spawn_worker for tombstoned node ${candidate.node_id}.`);
+      continue;
+    }
+    const node = candidate.act === "note" ? undefined : snapshot.state.nodes[candidate.node_id];
+    if (candidate.act !== "note" && !node) {
       journal.push(`Supervisor decision skipped ${candidate.act} for unknown node ${candidate.node_id}.`);
       continue;
     }
     if (candidate.act === "spawn_worker") {
+      if (node?.state === "done") {
+        journal.push(`Supervisor decision skipped spawn_worker for done node ${candidate.node_id}.`);
+        continue;
+      }
       if (spawned.has(candidate.node_id)) {
         journal.push(`Supervisor decision skipped duplicate spawn_worker for node ${candidate.node_id} in one turn.`);
         continue;
@@ -119,6 +128,10 @@ export function validateSupervisorDecision(
     }
     if (candidate.act === "rebrief_worker" && Buffer.byteLength(candidate.message) > maximumTextBytes) {
       journal.push(`Supervisor decision skipped rebrief_worker for node ${candidate.node_id} because its message exceeded 16 KB.`);
+      continue;
+    }
+    if (candidate.act === "note" && Buffer.byteLength(candidate.text) > maximumTextBytes) {
+      journal.push("Supervisor decision skipped note because its text exceeded 16 KB.");
       continue;
     }
     accepted.push(candidate);

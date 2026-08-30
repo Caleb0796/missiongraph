@@ -1,8 +1,15 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 
 import { bridgePackageRoot, type BridgeConfig } from "./config.js";
 import { parseThreadId } from "./decision.js";
+import {
+  identifyProcess,
+  readProcessStartTime,
+  terminateProcess,
+  type ProcessIdentity,
+  type ProcessStartTimeLookup,
+} from "./process.js";
 import type { Logger } from "./types.js";
 
 export interface CodexResult {
@@ -13,6 +20,7 @@ export interface CodexResult {
 
 export interface RunningCodex {
   pid: number;
+  identity: Promise<ProcessIdentity>;
   threadId: Promise<string>;
   completed: Promise<CodexResult>;
   terminate(): Promise<void>;
@@ -25,16 +33,31 @@ interface Command {
 
 const outputRetentionBytes = 2 * 1024 * 1024;
 const lineBufferRetentionBytes = 64 * 1024;
-const terminationGraceMs = 10_000;
+const childSourceVariables = new Set([
+  "PATH",
+  "HOME",
+  "SSL_CERT_FILE",
+  "NODE_EXTRA_CA_CERTS",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+]);
+const scopedWorkerVariables = new Set(["MG_REPORT_URL", "MG_REPORTER_CONFIG", "MG_WORKER_ACTOR"]);
 
 export function codexChildEnvironment(
   environment: NodeJS.ProcessEnv = {},
   source: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const allowed = Object.fromEntries(
-    ["PATH", "HOME", "CODEX_HOME"].flatMap((name) => source[name] === undefined ? [] : [[name, source[name]]]),
+    Object.entries(source).filter(([name, value]) =>
+      value !== undefined &&
+      name !== "REPORTER_TOKEN" &&
+      !name.startsWith("MG_") &&
+      (childSourceVariables.has(name) || name.startsWith("CODEX_") || name.startsWith("OPENAI_")),
+    ),
   );
-  return { ...allowed, ...environment };
+  const scoped = Object.fromEntries(Object.entries(environment).filter(([name]) => scopedWorkerVariables.has(name)));
+  return { ...allowed, ...scoped };
 }
 
 export function retainOutput(current: string, chunk: Buffer, maximumBytes = outputRetentionBytes): string {
@@ -51,14 +74,15 @@ export class CodexClient {
     private readonly config: BridgeConfig,
     private readonly logger: Logger,
     dryRun = false,
+    private readonly processStartTime: ProcessStartTimeLookup = readProcessStartTime,
   ) {
     this.command = dryRun
       ? { executable: process.execPath, prefix: [resolve(bridgePackageRoot, "mock-codex.mjs")] }
       : { executable: config.codexBinaryPath, prefix: [] };
   }
 
-  async startSupervisor(brief: string): Promise<CodexResult> {
-    return this.collect(
+  startSupervisor(brief: string): RunningCodex {
+    return this.start(
       [
         "exec",
         brief,
@@ -76,8 +100,8 @@ export class CodexClient {
     );
   }
 
-  async resumeSupervisor(threadId: string, envelope: string): Promise<CodexResult> {
-    return this.collect(this.supervisorResumeArgs(threadId, envelope), this.config.targetRepoPath);
+  resumeSupervisor(threadId: string, envelope: string): RunningCodex {
+    return this.start(this.supervisorResumeArgs(threadId, envelope), this.config.targetRepoPath);
   }
 
   startWorker(nodeId: string, brief: string, worktree: string, reporterConfigPath: string): RunningCodex {
@@ -104,25 +128,23 @@ export class CodexClient {
         MG_REPORT_URL: `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/report`,
         MG_REPORTER_CONFIG: reporterConfigPath,
         MG_WORKER_ACTOR: `worker:${nodeId}`,
-        MG_NODE_ID: nodeId,
       },
     );
     void running.completed.catch(() => undefined);
     return running;
   }
 
-  async resumeWorker(
+  resumeWorker(
     nodeId: string,
     threadId: string,
     message: string,
     worktree: string,
     reporterConfigPath: string,
-  ): Promise<CodexResult> {
-    return this.collect(this.workerResumeArgs(threadId, message), worktree, {
+  ): RunningCodex {
+    return this.start(this.workerResumeArgs(threadId, message), worktree, {
       MG_REPORT_URL: `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/report`,
       MG_REPORTER_CONFIG: reporterConfigPath,
       MG_WORKER_ACTOR: `worker:${nodeId}`,
-      MG_NODE_ID: nodeId,
     });
   }
 
@@ -172,12 +194,6 @@ export class CodexClient {
         this.logger.error(`codex child termination failed: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
       }
     }
-  }
-
-  private async collect(args: string[], cwd: string, environment: NodeJS.ProcessEnv = {}): Promise<CodexResult> {
-    const running = this.start(args, cwd, environment);
-    void running.threadId.catch(() => undefined);
-    return running.completed;
   }
 
   private start(args: string[], cwd: string, environment: NodeJS.ProcessEnv = {}): RunningCodex {
@@ -252,29 +268,21 @@ export class CodexClient {
       });
     });
     let termination: Promise<void> | undefined;
+    const pid = child.pid ?? -1;
+    const identity = identifyProcess(pid, this.processStartTime);
+    void identity.catch(() => undefined);
     const running: RunningCodex = {
-      pid: child.pid ?? -1,
+      pid,
+      identity,
       threadId,
       completed,
-      terminate: () => termination ??= terminateChild(child),
+      terminate: () => termination ??= identity.then(async (current) => {
+        await terminateProcess(current, { lookup: this.processStartTime });
+        await completed.catch(() => undefined);
+      }),
     };
     this.children.add(running);
     void completed.catch(() => undefined).finally(() => this.children.delete(running));
     return running;
   }
-}
-
-async function terminateChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await new Promise<void>((resolvePromise) => {
-    const timer = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    }, terminationGraceMs);
-    timer.unref();
-    child.once("close", () => {
-      clearTimeout(timer);
-      resolvePromise();
-    });
-    child.kill("SIGTERM");
-  });
 }

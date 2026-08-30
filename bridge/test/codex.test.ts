@@ -9,11 +9,16 @@ import { config, initializeRepo, TestLogger } from "./helpers.js";
 describe("CodexClient", () => {
   it("allowlists child environment variables and excludes MissionGraph master secrets", async () => {
     const environment = codexChildEnvironment(
-      { MG_NODE_ID: "node-a" },
+      { MG_REPORT_URL: "http://127.0.0.1/report", MG_NODE_ID: "node-a" },
       {
         PATH: "/usr/bin:/bin",
         HOME: "/home/test",
         CODEX_HOME: "/home/test/.codex",
+        CODEX_API_KEY: "codex-provider",
+        OPENAI_API_KEY: "openai-provider",
+        SSL_CERT_FILE: "/certs/root.pem",
+        NODE_EXTRA_CA_CERTS: "/certs/extra.pem",
+        HTTPS_PROXY: "http://proxy.test",
         REPORTER_TOKEN: "master-reporter",
         MG_REPORTER_CREDENTIAL: "master-credential",
         MG_VISITOR_TOKEN: "visitor-secret",
@@ -25,7 +30,12 @@ describe("CodexClient", () => {
       PATH: "/usr/bin:/bin",
       HOME: "/home/test",
       CODEX_HOME: "/home/test/.codex",
-      MG_NODE_ID: "node-a",
+      CODEX_API_KEY: "codex-provider",
+      OPENAI_API_KEY: "openai-provider",
+      SSL_CERT_FILE: "/certs/root.pem",
+      NODE_EXTRA_CA_CERTS: "/certs/extra.pem",
+      HTTPS_PROXY: "http://proxy.test",
+      MG_REPORT_URL: "http://127.0.0.1/report",
     });
 
     const root = await mkdtemp(join(tmpdir(), "missiongraph-codex-env-"));
@@ -41,14 +51,14 @@ describe("CodexClient", () => {
       const bridgeConfig = config(root);
       await initializeRepo(bridgeConfig.targetRepoPath);
       const client = new CodexClient(bridgeConfig, new TestLogger(), true);
-      await expect(client.startSupervisor("MISSIONGRAPH SUPERVISOR\nReturn JSON.")).resolves.toMatchObject({
+      await expect(client.startSupervisor("MISSIONGRAPH SUPERVISOR\nReturn JSON.").completed).resolves.toMatchObject({
         threadId: "mock-supervisor",
       });
       const worker = client.startWorker("node-a", "Node ID: node-a\nBuild A.", bridgeConfig.targetRepoPath, join(root, "reporter.conf"));
       await expect(worker.threadId).resolves.toBe("mock-worker-node-a");
       await worker.completed;
       await expect(
-        client.resumeWorker("node-a", "mock-worker-node-a", "Continue.", bridgeConfig.targetRepoPath, join(root, "reporter.conf")),
+        client.resumeWorker("node-a", "mock-worker-node-a", "Continue.", bridgeConfig.targetRepoPath, join(root, "reporter.conf")).completed,
       ).resolves.toMatchObject({ threadId: "mock-worker-node-a" });
     } finally {
       for (const [name, value] of Object.entries(previous)) {

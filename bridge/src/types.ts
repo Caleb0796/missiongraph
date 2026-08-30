@@ -27,6 +27,7 @@ export interface MissionEvent {
 
 export interface SnapshotNode {
   id: string;
+  record_type?: "task" | "group";
   title: string;
   brief: string;
   state: string;
@@ -38,6 +39,7 @@ export interface SnapshotNode {
 export interface SnapshotState {
   seq: number;
   nodes: Record<string, SnapshotNode>;
+  tombstones?: Record<string, { node: { id: string } }>;
   approvals: Record<string, { status: string; node_id: string }>;
   policies: Record<string, { text: string }>;
   critical_path: string[];

@@ -41,7 +41,9 @@ describe("supervisor JSONL parsing", () => {
         seq: 1,
         nodes: {
           a: { id: "a", title: "A", brief: "A", state: "queued", availability: "ready", assigned: false, pause_requested: false },
+          done: { id: "done", title: "Done", brief: "Done", state: "done", availability: null, assigned: true, pause_requested: false },
         },
+        tombstones: { removed: { node: { id: "removed" } } },
         approvals: {},
         policies: {},
         critical_path: ["a"],
@@ -57,6 +59,9 @@ describe("supervisor JSONL parsing", () => {
         { act: "spawn_worker", node_id: "a", brief: "Build A twice." },
         { act: "rebrief_worker", node_id: "a", message: "x".repeat(16 * 1024 + 1) },
         { act: "pause_worker", node_id: "ghost" },
+        { act: "spawn_worker", node_id: "done", brief: "Again." },
+        { act: "spawn_worker", node_id: "removed", brief: "Restore." },
+        { act: "note", text: "x".repeat(16 * 1024 + 1) },
       ],
     };
     const validated = validateSupervisorDecision(guarded, snapshot);
@@ -70,6 +75,9 @@ describe("supervisor JSONL parsing", () => {
       expect.stringContaining("duplicate spawn_worker"),
       expect.stringContaining("exceeded 16 KB"),
       expect.stringContaining("unknown node ghost"),
+      expect.stringContaining("done node done"),
+      expect.stringContaining("tombstoned node removed"),
+      expect.stringContaining("note because its text exceeded 16 KB"),
     ]);
   });
 });

@@ -26,8 +26,8 @@ describe("StateStore", () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-stale-lock-"));
     const path = join(root, "state.json");
     await writeFile(`${path}.lock`, JSON.stringify({
-      pid: 999_999,
-      starttime: "stale",
+      pid: process.pid,
+      starttime: "reused-old-start",
       hostname: hostname(),
       owner_id: "stale-owner",
     }));

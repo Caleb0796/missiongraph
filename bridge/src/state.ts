@@ -3,6 +3,7 @@ import { mkdir, open as openFile, readFile, readdir, rename, unlink } from "node
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
+import { supervisorAction } from "./decision.js";
 import {
   identifyProcess,
   processMatches,
@@ -170,6 +171,19 @@ function stateValue(value: unknown, projectId: string): BridgeState {
   }
   if (parsed.pending_actions === undefined) parsed.pending_actions = [];
   if (!Array.isArray(parsed.pending_actions)) throw new Error("pending action ledger is invalid");
+  for (const pending of parsed.pending_actions) {
+    if (
+      typeof pending !== "object" ||
+      pending === null ||
+      typeof pending.id !== "string" ||
+      typeof pending.source !== "string" ||
+      !Number.isSafeInteger(pending.attempts) ||
+      pending.attempts < 0 ||
+      !supervisorAction(pending.action) ||
+      (pending.next_attempt_at !== undefined && !Number.isFinite(Date.parse(pending.next_attempt_at))) ||
+      (pending.permanent_failure !== undefined && typeof pending.permanent_failure !== "string")
+    ) throw new Error("pending action ledger entry is invalid");
+  }
   return parsed as BridgeState;
 }
 

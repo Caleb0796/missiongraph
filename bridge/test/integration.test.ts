@@ -95,7 +95,7 @@ describe("bridge dry-run integration", () => {
           reporterCredential: reporterToken,
         };
         const logger = new TestLogger();
-        bridge = new MissionGraphBridge(bridgeConfig, logger, true);
+        bridge = new MissionGraphBridge(bridgeConfig, logger, true, async (pid) => `test-start-${pid}`);
         await mutation(
           serverUrl,
           clone.project,

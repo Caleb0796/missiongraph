@@ -6,6 +6,9 @@ const args = process.argv.slice(2);
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const agent = (value) => emit({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(value) } });
 const includesPair = (flag, value) => args.some((argument, index) => argument === flag && args[index + 1] === value);
+const finish = async () => {
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+};
 
 for (const name of ["REPORTER_TOKEN", "MG_REPORTER_CREDENTIAL", "MG_VISITOR_TOKEN"]) {
   if (process.env[name] !== undefined) {
@@ -27,6 +30,7 @@ if (args[1] === "resume") {
   if (supervisor) {
     if (threadId === "mock-supervisor-malformed" || message.startsWith("FORMAT CORRECTION:")) {
       emit({ type: "item.completed", item: { type: "agent_message", text: "not-json" } });
+      await finish();
       process.exit(0);
     }
     let envelopes = [];
@@ -36,10 +40,11 @@ if (args[1] === "resume") {
     } catch {
       envelopes = [];
     }
+    let malformed = false;
     const actions = envelopes.flatMap((envelope) => {
       if (envelope?.type === "ANNOTATED" && envelope.note === "MALFORMED_DECISION_TEST") {
-        emit({ type: "item.completed", item: { type: "agent_message", text: "not-json" } });
-        process.exit(0);
+        malformed = true;
+        return [];
       }
       if (envelope?.type === "DISPATCHED" && typeof envelope.node_id === "string") {
         return [{
@@ -53,10 +58,12 @@ if (args[1] === "resume") {
       }
       return [];
     });
-    agent({ actions });
+    if (malformed) emit({ type: "item.completed", item: { type: "agent_message", text: "not-json" } });
+    else agent({ actions });
   } else {
     agent({ worker_ack: true });
   }
+  await finish();
   process.exit(0);
 }
 
@@ -71,3 +78,4 @@ if (brief.startsWith("MISSIONGRAPH SUPERVISOR")) {
   emit({ type: "thread.started", thread_id: `mock-worker-${nodeId}` });
   agent({ worker_complete: true });
 }
+await finish();
