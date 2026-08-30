@@ -76,6 +76,9 @@ function MissionBoard() {
   const [dragPositions, setDragPositions] = useState<
     Record<string, { x: number; y: number }>
   >({})
+  const [nodeDims, setNodeDims] = useState<
+    Record<string, { width: number; height: number }>
+  >({})
   const [replaying, setReplaying] = useState(false)
   const hasLaidOut = useRef(false)
   const { fitView, setCenter } = useReactFlow<TaskFlowNode, Edge>()
@@ -134,6 +137,7 @@ function MissionBoard() {
             dragPositions[node.id] ??
             positions[node.id] ?? { x: (index % 3) * 320, y: Math.floor(index / 3) * 190 },
           selected: selectedId === node.id,
+          ...(nodeDims[node.id] ? { measured: nodeDims[node.id] } : {}),
           data: {
             title: node.title,
             brief: node.brief,
@@ -154,6 +158,7 @@ function MissionBoard() {
       dragPositions,
       edges,
       highlightedIds,
+      nodeDims,
       nodes,
       positions,
       readySince,
@@ -201,6 +206,16 @@ function MissionBoard() {
   }, [clearToast, toast])
 
   const onNodesChange = useCallback((changes: NodeChange<TaskFlowNode>[]) => {
+    setNodeDims((current) => {
+      let next = current
+      for (const change of changes) {
+        if (change.type === 'dimensions' && change.dimensions) {
+          if (next === current) next = { ...current }
+          next[change.id] = change.dimensions
+        }
+      }
+      return next
+    })
     setDragPositions((current) => {
       const next = { ...current }
       for (const change of changes) {
