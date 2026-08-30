@@ -1,0 +1,76 @@
+import type { DisplayState } from '../model/graph'
+
+interface PulseBarProps {
+  eta: number
+  counts: Record<DisplayState, number>
+  onCatchUp: () => void
+  replaying: boolean
+}
+
+function Stat({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return (
+    <div className="pulse-stat">
+      <span className={`pulse-stat-dot ${tone}`} />
+      <span className="text-slate-500">{label}</span>
+      <strong className="font-mono font-medium text-slate-200">{value}</strong>
+    </div>
+  )
+}
+
+export function PulseBar({ eta, counts, onCatchUp, replaying }: PulseBarProps) {
+  return (
+    <header className="pulse-bar">
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="brand-mark" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+        <div className="min-w-0">
+          <p className="truncate text-sm font-semibold tracking-[-0.01em] text-slate-100">
+            MissionGraph
+          </p>
+          <p className="truncate font-mono text-[9px] tracking-[0.16em] text-slate-600 uppercase">
+            Shorty · fixture simulation
+          </p>
+        </div>
+      </div>
+
+      <div className="hidden items-center gap-5 lg:flex">
+        <div className="pulse-eta">
+          <span className="text-[10px] tracking-[0.13em] text-slate-500 uppercase">
+            Critical ETA
+          </span>
+          <strong className="font-mono text-sm font-medium text-amber-200">
+            {eta} min
+          </strong>
+        </div>
+        <Stat label="Ready" value={counts.ready} tone="bg-blue-400" />
+        <Stat label="Running" value={counts.running} tone="bg-cyan-400" />
+        <Stat label="Review" value={counts.review} tone="bg-amber-300" />
+        <Stat label="Done" value={counts.done} tone="bg-emerald-400" />
+        <Stat label="Blocked" value={counts.blocked} tone="bg-slate-500" />
+        <Stat label="Failed" value={counts.failed} tone="bg-rose-400" />
+      </div>
+
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          className="catch-up-chip"
+          onClick={onCatchUp}
+          disabled={replaying}
+        >
+          <span className="catch-up-count">6</span>
+          {replaying ? 'Replaying changes' : 'Since you left'}
+        </button>
+        <div className="live-indicator">
+          <span className="live-dot" />
+          Live
+        </div>
+        <a href="/compat" className="compat-link">
+          Compat
+        </a>
+      </div>
+    </header>
+  )
+}
