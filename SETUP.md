@@ -42,11 +42,9 @@ Configure the bridge with environment variables or copy `bridge/config.example.j
 
 `config.json` and `state.json` are gitignored. Prefer environment-secret injection on a VM and restrict any file containing credentials to mode `0600`.
 
-### Reporter credential integration gap
+### Reporter credentials (CONTRACTS v1.3)
 
-There is currently no server HTTP endpoint or CLI that lets an operator obtain or renew a project's reporter credential. `EventStore.createProject()` returns it only to internal callers; `/api/clone-demo` discards that return value and stores only the token hash. The process-wide `REPORTER_TOKEN` authorizes only actor `supervisor`, while worker events require a short-lived project- and `worker:<node_id>`-bound credential. Therefore real worker lifecycle/handoff reporting cannot complete through the current public server surface.
-
-Integration needs an authenticated server endpoint or CLI that issues and returns a renewable reporter credential bound to `{project_id, actor: "worker:<node_id>"}` when the bridge spawns a worker. It also needs the reporter route to accept `JOURNAL_NOTE` from actor `supervisor`, as required by CONTRACTS §5b; the current route rejects it because `JOURNAL_NOTE` is not in `reporterEventTypes`.
+The process-wide `REPORTER_TOKEN` authorizes actor `supervisor` only. Worker events use short-lived credentials minted via `POST /api/p/:project/reporter-credentials` (supervisor bearer auth; body `{actor: "worker:<node_id>"}`; response `{token, actor, expires}`; project- and actor-bound, 15-minute TTL, renewable by re-calling — renewal mints an additional credential and earlier ones lapse at their original expiry). The bridge mints one before every worker spawn, renews long-running workers before expiry, and refreshes expired credentials on later worker turns. `/report` accepts `JOURNAL_NOTE` from actor `supervisor` (the §5b `note` transport); workers may not journal. Set `MG_REPORTER_CREDENTIAL` to the supervisor-scope `REPORTER_TOKEN`.
 
 ## One-command local bring-up
 
@@ -76,7 +74,7 @@ sh -c 'set -eu
   (cd bridge && pnpm start -- --dry-run)'
 ```
 
-`--dry-run` replaces Codex with `bridge/mock-codex.mjs`; server, SSE, FIFO, decision parsing, worktree creation, and state persistence remain real. Remove `--dry-run` only after the reporter-credential gaps above are resolved. The bridge launches Codex with the probe-verified flags, disables configured MCP servers with `-c mcp_servers={}`, and gives every child ignored stdin—the programmatic equivalent of `< /dev/null`.
+`--dry-run` replaces Codex with `bridge/mock-codex.mjs`; server, SSE, FIFO, decision parsing, worktree creation, and state persistence remain real. Remove `--dry-run` to run real Codex sessions (verified end-to-end 2026-08-30, PROGRESS.md M3). The bridge launches Codex with the probe-verified flags, disables configured MCP servers with `-c mcp_servers={}`, and gives every child ignored stdin—the programmatic equivalent of `< /dev/null`.
 
 ## VM spend controls
 
