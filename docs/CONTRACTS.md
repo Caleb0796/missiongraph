@@ -1,4 +1,4 @@
-# CONTRACTS.md — frozen interfaces v1.3 (2026-08-30)
+# CONTRACTS.md — frozen interfaces v1.4 (2026-08-30)
 
 **FROZEN.** Every track builds against these. No session edits this file; propose changes in PROGRESS.md notes → the orchestrator (Claude) amends and bumps the version. TypeScript-ish notation; code generates types from here.
 
@@ -95,6 +95,7 @@ Cursor state is maintained per browser client by the wrapper; `graph_digest(sinc
 - Preview binding (v1.2): `op_token` records the cursor at preview time; a confirm call after the cursor advanced is rejected with `error.code="preview_stale"` + a fresh preview. Native-UI structural edits on non-idle targets go through the SAME preview/confirm dialog (parity with tools).
 - Reporter credential issuance (v1.3): `POST /api/p/:project/reporter-credentials` — auth: the supervisor-scope bearer token; body `{actor: "worker:<node_id>" | "supervisor"}`; response `{token, actor, expires}` (project+actor-bound, 15-min TTL, renewable by re-calling). The bridge mints one per worker spawn and embeds it in the worker brief.
 - JOURNAL_NOTE via reporter (v1.3): `/report` ACCEPTS `JOURNAL_NOTE` when the authenticated actor is `supervisor` (this is the §5b `note` action's transport); workers may not journal.
+- Worker node binding (v1.4): a `worker:<node_id>` reporter credential may report node-scoped events (`NODE_STATE_CHANGED`, `PAUSE_ACKED`, `WORKER_LOG`, `HANDOFF_FILED`, `DEVIATION_NOTED`, `APPROVAL_CREATED`) ONLY for its own node: `payload.node_id` MUST equal the credential's bound node id, else 403. Supervisor-scope credentials are exempt from node binding.
 
 ## 5. Supervisor envelope delivery (server → codex supervisor) — v1.1, probe-verified
 
@@ -108,6 +109,8 @@ Envelope (unchanged):
  "summary":"Human added dependency audit-log→payments; payments is now blocked until audit-log completes."}
 ```
 Always self-contained: structured fields + one English `summary`. Graph rewires send `{type:"GRAPH_DIFF", ops:[...], base_seq, new_seq, stale:[...], summary}`.
+
+Deployment invariant (v1.4): exactly ONE bridge daemon per project. The bridge enforces this with an exclusive lock on its state file (second daemon exits with a clear error). Server-owned FIFO with delivery leases remains the target design; the current bridge-local queue is a RECORDED DEVIATION (PROGRESS.md M3). Delivery is at-least-once: the bridge persists its cursor after a successful supervisor turn and before executing actions, and all §5b actions are idempotent (`spawn_worker` for a node with a live worker is a no-op).
 
 ## 5b. Supervisor decision contract (supervisor turn → server) — v1.1
 
@@ -126,6 +129,7 @@ interface SupervisorDecision {
 Worker sessions get their own thread ids; the server tracks `node_id → {thread_id, worktree}`. Workers report via the reporter API (§4), never through the supervisor.
 
 ## Changelog
+- v1.4 (2026-08-30): from the M3 adversarial review — worker reporter credentials are node-bound (403 on cross-node reports); single-bridge-daemon deployment invariant + state-file lock; at-least-once delivery semantics with idempotent §5b actions.
 - v1.3 (2026-08-30): from S5's integration gaps — reporter-credential issuance endpoint; JOURNAL_NOTE accepted from supervisor via /report.
 - v1.2 (2026-08-30): from the M2 adversarial review — atomic batch mutations, ALLOWED_ORIGINS CORS, client clone persistence, 409 surface-don't-retry, cursor-bound op_token + native-UI confirm parity.
 - v1.1 (2026-08-30): §5 delivery switched from `codex queue` (nonexistent in 0.144.6) to server-FIFO + `exec resume`, per docs/PROBE.md; added §5b supervisor decision contract.
