@@ -6,6 +6,7 @@ interface PulseBarProps {
   counts: Record<DisplayState, number>
   onCatchUp: () => void
   onReset: () => void
+  onCopyMissionLink: () => void
   replaying: boolean
   connectionMode: ConnectionMode
   connectionMessage: string
@@ -26,6 +27,7 @@ export function PulseBar({
   counts,
   onCatchUp,
   onReset,
+  onCopyMissionLink,
   replaying,
   connectionMode,
   connectionMessage,
@@ -68,11 +70,6 @@ export function PulseBar({
       <div className="flex items-center gap-3">
         {connectionMode === 'fixture' && (
           <span className="offline-badge" title={connectionMessage}>
-            Offline fixture
-          </span>
-        )}
-        {connectionMessage.includes('fixture projection') && (
-          <span className="offline-badge" title={connectionMessage}>
             Dev fixture projection
           </span>
         )}
@@ -85,10 +82,17 @@ export function PulseBar({
           <span className="catch-up-count">6</span>
           {replaying ? 'Replaying changes' : 'Since you left'}
         </button>
-        <div className="live-indicator">
+        <div className={`live-indicator live-indicator--${connectionMode}`}>
           <span className="live-dot" />
-          Live
+          {connectionMode === 'live'
+            ? 'Live'
+            : connectionMode === 'loading'
+              ? 'Connecting'
+              : 'Fixture'}
         </div>
+        <button type="button" className="compat-link" onClick={onCopyMissionLink}>
+          Copy mission link
+        </button>
         <a href="/compat" className="compat-link">
           Compat
         </a>

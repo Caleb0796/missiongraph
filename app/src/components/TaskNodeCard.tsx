@@ -64,9 +64,7 @@ export function TaskNodeCard({ data, selected }: NodeProps<TaskFlowNode>) {
           </span>
         ))}
         {data.approval && <span className="mission-approval">Approval</span>}
-        {data.idleFor && (
-          <span className="mission-idle">Idle {data.idleFor}</span>
-        )}
+        {data.idleFor && <span className="mission-idle">{data.idleFor}</span>}
       </div>
       <Handle
         type="source"

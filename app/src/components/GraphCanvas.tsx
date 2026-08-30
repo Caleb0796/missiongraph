@@ -17,10 +17,13 @@ import {
   getCriticalPath,
   getDisplayState,
   getEventNodeId,
+  humanizeIdleAge,
+  idleRadar,
   type DisplayState,
 } from '../model/graph'
 import { useMissionStore } from '../store/mission-store'
-import { resetMissionDemo } from '../transport/client'
+import { copyCurrentMissionLink, resetMissionDemo } from '../transport/client'
+import { FlightPanel } from './FlightPanel'
 import { Inspector } from './Inspector'
 import { PulseBar } from './PulseBar'
 import { TaskNodeCard, type TaskFlowNode } from './TaskNodeCard'
@@ -88,11 +91,16 @@ function MissionBoard() {
     Record<string, { width: number; height: number }>
   >({})
   const [replaying, setReplaying] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
   const hasLaidOut = useRef(false)
   const { fitView, setCenter } = useReactFlow<TaskFlowNode, Edge>()
   const criticalPath = useMemo(
     () => getCriticalPath(nodes, edges),
     [edges, nodes],
+  )
+  const idleNodeIds = useMemo(
+    () => new Set(idleRadar(nodes, edges, readySince, now).map((node) => node.id)),
+    [edges, nodes, now, readySince],
   )
 
   const flowEdges: Edge[] = useMemo(
@@ -158,7 +166,10 @@ function MissionBoard() {
                 (approval) =>
                   approval.node_id === node.id && approval.status === 'pending',
               ),
-            idleFor: displayState === 'ready' ? readySince[node.id] : undefined,
+            idleFor:
+              idleNodeIds.has(node.id) && readySince[node.id]
+                ? humanizeIdleAge(readySince[node.id], now)
+                : undefined,
             critical: criticalPath.nodeIds.includes(node.id),
             highlighted: highlightedIds.includes(node.id),
           },
@@ -170,13 +181,20 @@ function MissionBoard() {
       dragPositions,
       edges,
       highlightedIds,
+      idleNodeIds,
       nodeDims,
       nodes,
       positions,
       readySince,
       selectedId,
+      now,
     ],
   )
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   useEffect(() => {
     hasLaidOut.current = false
@@ -307,6 +325,21 @@ function MissionBoard() {
     setReplaying(false)
   }
 
+  async function copyMissionLink() {
+    try {
+      await copyCurrentMissionLink()
+      useMissionStore.getState().showToast(
+        'Mission link copied',
+        'info',
+        'anyone with this link can act on this mission',
+      )
+    } catch (error) {
+      useMissionStore
+        .getState()
+        .showToast(error instanceof Error ? error.message : String(error), 'error')
+    }
+  }
+
   const counts = useMemo(() => {
     const base: Record<DisplayState, number> = {
       queued: 0,
@@ -331,6 +364,7 @@ function MissionBoard() {
         counts={counts}
         onCatchUp={() => void replayCatchUp()}
         onReset={() => void resetMissionDemo()}
+        onCopyMissionLink={() => void copyMissionLink()}
         replaying={replaying}
         connectionMode={connectionMode}
         connectionMessage={connectionMessage}
@@ -373,6 +407,7 @@ function MissionBoard() {
           <span><i className="legend-line legend-line--conflict" />File conflict</span>
           <span className="hidden xl:inline">Drag to arrange · connect ports to depend · delete to tombstone</span>
         </div>
+        <FlightPanel now={now} />
         {structuralPreview && (
           <section className="structural-confirm" role="dialog" aria-modal="true">
             <p className="structural-confirm-kicker">Blast-radius preview</p>
@@ -416,7 +451,8 @@ function MissionBoard() {
       />
       {toast && (
         <div className={`mission-toast mission-toast--${toast.tone}`} role="status">
-          {toast.message}
+          <strong>{toast.message}</strong>
+          {toast.caption && <span>{toast.caption}</span>}
         </div>
       )}
     </main>
