@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Event, EventInput, TaskNode } from "../src/events.js";
 import { GraphValidationError, initialState, reduceEvent, type GraphState } from "../src/reducer.js";
+import { baseHandoff } from "./fixtures.js";
 
 const task = (id: string, estimate_min: number): TaskNode => ({
   id,
@@ -114,5 +115,39 @@ describe("deterministic reducer", () => {
     expect(Object.keys(state.edges)).toEqual([]);
     expect(state.critical_path).toEqual(["b"]);
     expect(() => add(state, "a", 1)).toThrow("already exists");
+  });
+
+  it("requires a filed handoff before creating an approval", () => {
+    let state = add(initialState(), "a", 5);
+    state = append(state, {
+      actor: "worker:a",
+      type: "NODE_STATE_CHANGED",
+      payload: { node_id: "a", from: "queued", to: "running" },
+      idem_key: "a-running",
+    });
+    state = append(state, {
+      actor: "worker:a",
+      type: "NODE_STATE_CHANGED",
+      payload: { node_id: "a", from: "running", to: "review" },
+      idem_key: "a-review",
+    });
+    const approval = {
+      actor: "supervisor",
+      type: "APPROVAL_CREATED",
+      payload: { approval_id: "approval-a", node_id: "a", summary: "Review task a." },
+      idem_key: "approval-a",
+    } satisfies EventInput;
+
+    expect(() => append(state, approval)).toThrow("has no filed handoff");
+
+    state = append(state, {
+      actor: "worker:a",
+      type: "HANDOFF_FILED",
+      payload: { node_id: "a", handoff: baseHandoff },
+      idem_key: "a-handoff",
+    });
+    state = append(state, approval);
+
+    expect(state.approvals["approval-a"]).toMatchObject({ node_id: "a", status: "pending" });
   });
 });

@@ -411,6 +411,7 @@ function apply(state: GraphState, event: Event): void {
     case "APPROVAL_CREATED": {
       const target = node(state, event.payload.node_id);
       if (target.state !== "review") fail(`node ${target.id} is not in review`);
+      if (!state.handoffs[target.id]) fail(`node ${target.id} has no filed handoff`);
       if (state.approvals[event.payload.approval_id]) fail(`approval ${event.payload.approval_id} already exists`);
       if (Object.values(state.approvals).some((approval) => approval.node_id === target.id && approval.status === "pending")) {
         fail(`node ${target.id} already has a pending approval`);
