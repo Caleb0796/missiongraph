@@ -1,11 +1,11 @@
 import {
+  approvalQueueFromRanking,
   approvalsForNode,
   getBlastRadius,
   getCriticalPath,
   getDisplayState,
   isNonIdle,
   isPreviewStale,
-  rankedPendingApprovals,
   remainingPathWeight,
   wouldCreateCycle,
 } from '../model/graph'
@@ -564,10 +564,9 @@ function digestData() {
     counts[display as keyof typeof counts]++
   }
   const critical = getCriticalPath(state.nodes, state.edges)
-  const pendingApprovals = rankedPendingApprovals(
+  const pendingApprovals = approvalQueueFromRanking(
     state.approvals,
-    state.nodes,
-    state.edges,
+    state.approvalRanking,
   ).map((item) => ({
       approval_id: item.id,
       node_id: item.node_id,
@@ -607,6 +606,10 @@ function digestData() {
     })),
     edges: state.edges,
     pending_approvals: pendingApprovals,
+    approval_ordering_source:
+      state.approvalRankingSource === 'fixture'
+        ? 'fixture-local estimate'
+        : state.approvalRankingSource,
     ready_unassigned: ready,
   }
 }
@@ -657,9 +660,19 @@ const listReady: ToolDefinition = {
           (current as TaskNode & { ready_since?: string }).ready_since ??
           'just became ready',
         on_critical_path: critical.nodeIds.includes(current.id),
-        remaining_path_min: remainingPathWeight(current.id, state.nodes, state.edges),
-        slack_min:
-          critical.eta - remainingPathWeight(current.id, state.nodes, state.edges),
+        ...(state.connectionMode === 'fixture'
+          ? {
+              remaining_path_min: remainingPathWeight(
+                current.id,
+                state.nodes,
+                state.edges,
+              ),
+              slack_min:
+                critical.eta -
+                remainingPathWeight(current.id, state.nodes, state.edges),
+              distance_source: 'fixture-local estimate',
+            }
+          : { distance_source: 'server critical-path membership' }),
       }))
     return {
       data: {
@@ -680,16 +693,15 @@ const listPendingApprovals: ToolDefinition = {
   annotations: { readOnlyHint: true },
   execute() {
     const state = useMissionStore.getState()
-    const approvals = rankedPendingApprovals(
+    const approvals = approvalQueueFromRanking(
       state.approvals,
-      state.nodes,
-      state.edges,
+      state.approvalRanking,
     ).map((item) => ({
-        ...item,
-        node_title:
-          state.nodes.find((node) => node.id === item.node_id)?.title ?? item.node_id,
-        delay_impact_min: item.delayImpactMin,
-      }))
+      ...item,
+      node_title:
+        state.nodes.find((node) => node.id === item.node_id)?.title ?? item.node_id,
+      delay_impact_min: item.delayImpactMin,
+    }))
     return {
       data: {
         summary:
@@ -697,6 +709,10 @@ const listPendingApprovals: ToolDefinition = {
             ? 'No approvals are pending.'
             : `${approvals.length} approvals are pending, ordered by projected delay.`,
         approvals,
+        ordering_source:
+          state.approvalRankingSource === 'fixture'
+            ? 'fixture-local estimate'
+            : state.approvalRankingSource,
       },
     }
   },

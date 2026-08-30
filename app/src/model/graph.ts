@@ -1,4 +1,10 @@
-import type { Approval, GraphEdge, MissionEvent, TaskNode } from './types'
+import type {
+  Approval,
+  GraphDigest,
+  GraphEdge,
+  MissionEvent,
+  TaskNode,
+} from './types'
 
 export type DisplayState =
   | 'queued'
@@ -267,7 +273,7 @@ export function remainingPathWeight(
   return visit(nodeId)
 }
 
-export function rankedPendingApprovals(
+export function fixtureRankedPendingApprovals(
   approvals: Record<string, Approval>,
   nodes: TaskNode[],
   edges: GraphEdge[],
@@ -284,6 +290,17 @@ export function rankedPendingApprovals(
         left.created_at.localeCompare(right.created_at) ||
         left.id.localeCompare(right.id),
     )
+}
+
+export function approvalQueueFromRanking(
+  approvals: Record<string, Approval>,
+  ranking: GraphDigest['summary']['pending_approvals'],
+) {
+  return ranking.flatMap((ranked) => {
+    const approval = approvals[ranked.approval_id]
+    if (!approval || approval.status !== 'pending') return []
+    return [{ ...approval, delayImpactMin: ranked.delay_impact_min }]
+  })
 }
 
 function idleElapsed(since: string, now: number) {

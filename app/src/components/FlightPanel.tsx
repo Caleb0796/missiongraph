@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
 import {
+  approvalQueueFromRanking,
   humanizeIdleAge,
   idleRadar,
-  rankedPendingApprovals,
 } from '../model/graph'
 import { useMissionStore } from '../store/mission-store'
 
@@ -14,6 +14,10 @@ export function FlightPanel({ now }: FlightPanelProps) {
   const nodes = useMissionStore((state) => state.nodes)
   const edges = useMissionStore((state) => state.edges)
   const approvals = useMissionStore((state) => state.approvals)
+  const approvalRanking = useMissionStore((state) => state.approvalRanking)
+  const approvalRankingSource = useMissionStore(
+    (state) => state.approvalRankingSource,
+  )
   const policies = useMissionStore((state) => state.policies)
   const readySince = useMissionStore((state) => state.readySince)
   const sessionId = useMissionStore((state) => state.sessionId)
@@ -24,8 +28,8 @@ export function FlightPanel({ now }: FlightPanelProps) {
     {},
   )
   const ranked = useMemo(
-    () => rankedPendingApprovals(approvals, nodes, edges),
-    [approvals, edges, nodes],
+    () => approvalQueueFromRanking(approvals, approvalRanking),
+    [approvalRanking, approvals],
   )
   const idle = useMemo(
     () => idleRadar(nodes, edges, readySince, now),
@@ -44,7 +48,13 @@ export function FlightPanel({ now }: FlightPanelProps) {
       <section>
         <header className="flight-panel-heading">
           <div>
-            <p>Critical-path ranked</p>
+            <p>
+              {approvalRankingSource === 'server'
+                ? 'Server delay-ranked'
+                : approvalRankingSource === 'fixture'
+                  ? 'Fixture estimate-ranked'
+                  : 'Waiting for server ranking'}
+            </p>
             <h2>Approval queue</h2>
           </div>
           <span>{ranked.length}</span>

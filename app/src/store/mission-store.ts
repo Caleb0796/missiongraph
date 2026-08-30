@@ -7,6 +7,7 @@ import {
 import {
   boundedHistory,
   describeEvent,
+  fixtureRankedPendingApprovals,
   getBlastRadius,
   getCriticalPath,
   isNonIdle,
@@ -20,11 +21,16 @@ import type {
   EventPayloadMap,
   EvType,
   GraphEdge,
+  GraphDigest,
   GraphSnapshotState,
   Handoff,
   MissionEvent,
   TaskNode,
 } from '../model/types'
+import {
+  eventBelongsToProject,
+  shouldApplySnapshot,
+} from '../transport/client-logic'
 
 interface Point {
   x: number
@@ -49,7 +55,7 @@ interface StructuralPreview {
   blastRadius: { stale: string[]; pausing: string[] }
 }
 
-export type ConnectionMode = 'loading' | 'live' | 'fixture'
+export type ConnectionMode = 'loading' | 'live' | 'fixture' | 'link-error'
 
 export interface MutationOptions {
   actor?: 'human' | 'browser_agent'
@@ -70,6 +76,8 @@ interface MissionState {
   positions: Record<string, Point>
   tombstones: string[]
   approvals: Record<string, Approval>
+  approvalRanking: GraphDigest['summary']['pending_approvals']
+  approvalRankingSource: 'server' | 'fixture' | 'pending'
   policies: GraphSnapshotState['policies']
   annotations: GraphSnapshotState['annotations']
   handoffs: Record<string, Handoff>
@@ -86,6 +94,8 @@ interface MissionState {
   connectionMode: ConnectionMode
   connectionMessage: string
   sessionId: string
+  clockSkewMs: number
+  linkErrorHasStoredIdentity: boolean
   hydratePositions: (positions: Record<string, Point>) => void
   applySnapshot: (
     snapshot: GraphSnapshotState,
@@ -95,8 +105,11 @@ interface MissionState {
   applyEvent: (event: MissionEvent) => void
   recordHistoricalEvent: (event: MissionEvent) => void
   applyDigestChanges: (changes: DigestChange[], cursor: string) => void
+  applyServerDigest: (projectId: string, digest: GraphDigest) => void
   useFixture: (message: string) => void
   setConnectionMode: (mode: ConnectionMode, message: string) => void
+  setClockSkew: (clockSkewMs: number) => void
+  showInvalidMissionLink: (hasStoredIdentity: boolean) => void
   setSessionId: (sessionId: string) => void
   moveNode: (nodeId: string, point: Point) => void
   connectNodes: (upstream: string, downstream: string) => boolean
@@ -229,13 +242,30 @@ function fixtureState() {
       },
     ]),
   )
+  const nodes = [...nodeById.values()]
+  const edges = [...edgeById.values()]
+  const approvalRanking = fixtureRankedPendingApprovals(
+    approvals,
+    nodes,
+    edges,
+  ).map((approval) => ({
+    approval_id: approval.id,
+    node_id: approval.node_id,
+    node_title:
+      nodes.find((node) => node.id === approval.node_id)?.title ?? approval.node_id,
+    summary: approval.summary,
+    delay_impact_min: approval.delayImpactMin,
+    age_since: approval.created_at,
+  }))
 
   return {
-    nodes: [...nodeById.values()],
-    edges: [...edgeById.values()],
+    nodes,
+    edges,
     positions,
     tombstones,
     approvals,
+    approvalRanking,
+    approvalRankingSource: 'fixture' as const,
     policies,
     annotations,
     handoffs,
@@ -309,13 +339,27 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   connectionMode: 'loading',
   connectionMessage: 'Connecting to the live project…',
   sessionId: '',
+  clockSkewMs: 0,
+  linkErrorHasStoredIdentity: false,
   hydratePositions(positions) {
     set((state) => ({ positions: { ...positions, ...state.positions } }))
   },
   applySnapshot(snapshot, cursor, projectId) {
     set((state) => {
+      if (
+        !shouldApplySnapshot(
+          state.projectId,
+          state.cursor,
+          projectId,
+          cursor,
+        )
+      ) {
+        return state
+      }
       const view = snapshotToView(snapshot)
-      const firstLiveSnapshot = state.connectionMode === 'loading'
+      const projectChanged = state.projectId !== projectId
+      const firstLiveSnapshot =
+        projectChanged || state.connectionMode === 'fixture'
       const selectedExists =
         view.nodes.some((node) => node.id === state.selectedId) ||
         view.edges.some((edge) => edge.edge_id === state.selectedId)
@@ -325,14 +369,20 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         cursor,
         events: firstLiveSnapshot ? [] : state.events,
         changes: firstLiveSnapshot ? [] : state.changes,
+        approvalRanking: projectChanged ? [] : state.approvalRanking,
+        approvalRankingSource: projectChanged
+          ? ('pending' as const)
+          : state.approvalRankingSource,
         selectedId: selectedExists ? state.selectedId : null,
         connectionMode: 'live',
         connectionMessage: 'Live server',
+        linkErrorHasStoredIdentity: false,
       }
     })
   },
   applyEvent(event) {
     const state = get()
+    if (!eventBelongsToProject(state.projectId, event.project_id)) return
     if (event.seq !== Number(state.cursor) + 1) return
 
     const previousNodes = state.nodes
@@ -520,12 +570,26 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     )
 
     const change = eventChange(event, nodes, edges)
+    const approvalRanking =
+      state.connectionMode === 'fixture'
+        ? fixtureRankedPendingApprovals(approvals, nodes, edges).map((approval) => ({
+            approval_id: approval.id,
+            node_id: approval.node_id,
+            node_title:
+              nodes.find((node) => node.id === approval.node_id)?.title ??
+              approval.node_id,
+            summary: approval.summary,
+            delay_impact_min: approval.delayImpactMin,
+            age_since: approval.created_at,
+          }))
+        : state.approvalRanking
     set({
       nodes,
       edges,
       positions,
       tombstones,
       approvals,
+      approvalRanking,
       policies,
       annotations,
       handoffs,
@@ -549,6 +613,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
   recordHistoricalEvent(event) {
     const state = get()
+    if (!eventBelongsToProject(state.projectId, event.project_id)) return
     if (event.seq > Number(state.cursor)) {
       state.applyEvent(event)
       return
@@ -566,15 +631,39 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     })
   },
   applyDigestChanges(changes, cursor) {
-    set((state) => ({
-      changes: boundedHistory(
-        [...state.changes, ...changes].filter(
-          (change, index, all) =>
-            all.findIndex((candidate) => candidate.seq === change.seq) === index,
-        ),
-      ),
-      cursor,
-    }))
+    set((state) =>
+      Number(cursor) < Number(state.cursor)
+        ? state
+        : {
+            changes: boundedHistory(
+              [...state.changes, ...changes].filter(
+                (change, index, all) =>
+                  all.findIndex((candidate) => candidate.seq === change.seq) ===
+                  index,
+              ),
+            ),
+            cursor,
+          },
+    )
+  },
+  applyServerDigest(projectId, digest) {
+    set((state) => {
+      if (
+        state.projectId !== projectId ||
+        !shouldApplySnapshot(
+          state.projectId,
+          state.cursor,
+          projectId,
+          digest.cursor,
+        )
+      ) {
+        return state
+      }
+      return {
+        approvalRanking: digest.summary.pending_approvals,
+        approvalRankingSource: 'server',
+      }
+    })
   },
   useFixture(message) {
     set({
@@ -586,10 +675,28 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       cursor: String(shortyEvents.at(-1)?.seq ?? 0),
       connectionMode: 'fixture',
       connectionMessage: message,
+      clockSkewMs: 0,
+      linkErrorHasStoredIdentity: false,
     })
   },
   setConnectionMode(connectionMode, connectionMessage) {
-    set({ connectionMode, connectionMessage })
+    set({
+      connectionMode,
+      connectionMessage,
+      ...(connectionMode === 'link-error'
+        ? {}
+        : { linkErrorHasStoredIdentity: false }),
+    })
+  },
+  setClockSkew(clockSkewMs) {
+    set({ clockSkewMs })
+  },
+  showInvalidMissionLink(linkErrorHasStoredIdentity) {
+    set({
+      connectionMode: 'link-error',
+      connectionMessage: 'Expired or invalid mission link',
+      linkErrorHasStoredIdentity,
+    })
   },
   setSessionId(sessionId) {
     set({ sessionId })
