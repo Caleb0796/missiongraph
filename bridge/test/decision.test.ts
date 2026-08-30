@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { parseSupervisorDecision, parseThreadId } from "../src/decision.js";
+import { parseSupervisorDecision, parseThreadId, validateSupervisorDecision } from "../src/decision.js";
+import type { Snapshot, SupervisorDecision } from "../src/types.js";
 import { TestLogger } from "./helpers.js";
 
 function agentMessage(text: string): string {
@@ -27,9 +28,48 @@ describe("supervisor JSONL parsing", () => {
     ["unknown action", agentMessage('{"actions":[{"act":"merge_everything"}]}')],
     ["extra decision fields", agentMessage('{"actions":[],"comment":"no"}')],
     ["missing decision", JSON.stringify({ type: "turn.completed" })],
-  ])("turns %s into a logged safe no-op", (_label, jsonl) => {
+  ])("rejects %s so the bridge can retry it once", (_label, jsonl) => {
     const logger = new TestLogger();
-    expect(parseSupervisorDecision(jsonl, logger)).toEqual({ actions: [] });
+    expect(parseSupervisorDecision(jsonl, logger)).toBeUndefined();
     expect(logger.warningMessages).toHaveLength(1);
+  });
+
+  it("bounds and authorizes decision actions against the latest snapshot", () => {
+    const snapshot: Snapshot = {
+      cursor: "1",
+      state: {
+        seq: 1,
+        nodes: {
+          a: { id: "a", title: "A", brief: "A", state: "queued", availability: "ready", assigned: false, pause_requested: false },
+        },
+        approvals: {},
+        policies: {},
+        critical_path: ["a"],
+      },
+    };
+    const bounded = validateSupervisorDecision(
+      { actions: Array.from({ length: 12 }, (_, index) => ({ act: "note", text: `note ${index}` })) },
+      snapshot,
+    );
+    const guarded: SupervisorDecision = {
+      actions: [
+        { act: "spawn_worker", node_id: "a", brief: "Build A." },
+        { act: "spawn_worker", node_id: "a", brief: "Build A twice." },
+        { act: "rebrief_worker", node_id: "a", message: "x".repeat(16 * 1024 + 1) },
+        { act: "pause_worker", node_id: "ghost" },
+      ],
+    };
+    const validated = validateSupervisorDecision(guarded, snapshot);
+
+    expect(bounded.decision.actions).toHaveLength(10);
+    expect(bounded.journal).toEqual([expect.stringContaining("per-turn cap of 10")]);
+    expect(validated.decision.actions).toEqual([
+      { act: "spawn_worker", node_id: "a", brief: "Build A." },
+    ]);
+    expect(validated.journal).toEqual([
+      expect.stringContaining("duplicate spawn_worker"),
+      expect.stringContaining("exceeded 16 KB"),
+      expect.stringContaining("unknown node ghost"),
+    ]);
   });
 });

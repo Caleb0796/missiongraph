@@ -96,8 +96,6 @@ describe("bridge dry-run integration", () => {
         };
         const logger = new TestLogger();
         bridge = new MissionGraphBridge(bridgeConfig, logger, true);
-        await bridge.start();
-
         await mutation(
           serverUrl,
           clone.project,
@@ -123,6 +121,7 @@ describe("bridge dry-run integration", () => {
           { node_id: "smoke-node", bypass_cap: true },
           "smoke-dispatch",
         );
+        await bridge.start();
 
         for (let attempt = 0; attempt < 100 && !bridge.getState()?.workers["smoke-node"]; attempt += 1) {
           await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
@@ -154,6 +153,30 @@ describe("bridge dry-run integration", () => {
         }
         await bridge.whenIdle();
         expect(bridge.getState()?.cursor).toBe("4");
+        await mutation(
+          serverUrl,
+          clone.project,
+          clone.token,
+          "ANNOTATED",
+          { target_id: "smoke-node", note: "MALFORMED_DECISION_TEST" },
+          "smoke-malformed",
+        );
+        for (let attempt = 0; attempt < 100 && bridge.getState()?.cursor !== "6"; attempt += 1) {
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+        }
+        await bridge.whenIdle();
+        expect(bridge.getState()?.cursor).toBe("6");
+        const snapshot = await fetch(`${serverUrl}/api/p/${encodeURIComponent(clone.project)}/snapshot`, {
+          headers: { "x-mg-token": clone.token },
+        });
+        const snapshotBody = await snapshot.json() as { state: { journal: { text: string }[] } };
+        expect(snapshotBody.state.journal.map((entry) => entry.text)).toEqual([
+          "DRY-RUN SIMULATION: Supervisor observed annotation for smoke-node.",
+          expect.stringContaining("DRY-RUN SIMULATION: Supervisor decision was malformed for envelope seq 5-5"),
+        ]);
+        expect(logger.warningMessages).toEqual(expect.arrayContaining([
+          expect.stringContaining("retrying malformed supervisor decision for envelope seq 5-5"),
+        ]));
         expect(logger.errorMessages).toEqual([]);
       } finally {
         await bridge?.stop();

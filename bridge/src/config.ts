@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export interface BridgeConfig {
@@ -26,7 +27,17 @@ interface FileConfig {
   state_path?: string;
 }
 
-const bridgeRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+export function resolveBridgePackageRoot(moduleUrl: string): string {
+  let candidate = dirname(fileURLToPath(moduleUrl));
+  const root = parse(candidate).root;
+  while (candidate !== root) {
+    if (existsSync(join(candidate, "package.json"))) return candidate;
+    candidate = dirname(candidate);
+  }
+  throw new Error(`could not resolve bridge package root from ${moduleUrl}`);
+}
+
+export const bridgePackageRoot = resolveBridgePackageRoot(import.meta.url);
 
 function required(value: string | undefined, name: string): string {
   if (!value) throw new Error(`${name} is required`);
@@ -37,7 +48,7 @@ function choose(envName: string, fileValue: string | undefined): string | undefi
   return process.env[envName] || fileValue;
 }
 
-export async function loadConfig(path = resolve(bridgeRoot, "config.json")): Promise<BridgeConfig> {
+export async function loadConfig(path = resolve(bridgePackageRoot, "config.json")): Promise<BridgeConfig> {
   let file: FileConfig = {};
   try {
     file = JSON.parse(await readFile(path, "utf8")) as FileConfig;
@@ -63,6 +74,6 @@ export async function loadConfig(path = resolve(bridgeRoot, "config.json")): Pro
     codexBinaryPath: choose("MG_CODEX_PATH", file.codex_binary_path) ?? "codex",
     model: choose("MG_CODEX_MODEL", file.model) ?? "gpt-5.6-sol",
     effort: choose("MG_CODEX_EFFORT", file.effort) ?? "high",
-    statePath: resolve(choose("MG_BRIDGE_STATE", file.state_path) ?? resolve(bridgeRoot, "state.json")),
+    statePath: resolve(choose("MG_BRIDGE_STATE", file.state_path) ?? resolve(bridgePackageRoot, "state.json")),
   };
 }

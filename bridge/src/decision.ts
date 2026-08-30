@@ -1,4 +1,9 @@
-import type { Logger, SupervisorAction, SupervisorDecision } from "./types.js";
+import type { Logger, Snapshot, SupervisorAction, SupervisorDecision } from "./types.js";
+
+const maximumActions = 10;
+const maximumTextBytes = 16 * 1024;
+
+export const strictDecisionReminder = `FORMAT CORRECTION: Return exactly one unfenced JSON object and nothing else. The only top-level key is "actions". Example: {"actions":[]}`;
 
 function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -63,11 +68,11 @@ export function parseThreadId(jsonl: string): string | undefined {
   return undefined;
 }
 
-export function parseSupervisorDecision(jsonl: string, logger: Logger): SupervisorDecision {
+export function parseSupervisorDecision(jsonl: string, logger: Logger): SupervisorDecision | undefined {
   const message = agentMessages(jsonl).at(-1);
   if (!message) {
-    logger.warn("supervisor turn had no final agent_message; executing safe no-op");
-    return { actions: [] };
+    logger.warn("supervisor turn had no final agent_message");
+    return undefined;
   }
   try {
     const parsed = JSON.parse(message) as unknown;
@@ -76,7 +81,47 @@ export function parseSupervisorDecision(jsonl: string, logger: Logger): Supervis
     if (actions.some((candidate) => candidate === undefined)) throw new Error();
     return { actions: actions as SupervisorAction[] };
   } catch {
-    logger.warn("supervisor final agent_message was not a valid SupervisorDecision; executing safe no-op");
-    return { actions: [] };
+    logger.warn("supervisor final agent_message was not a valid SupervisorDecision");
+    return undefined;
   }
+}
+
+export interface ValidatedDecision {
+  decision: SupervisorDecision;
+  journal: string[];
+}
+
+export function validateSupervisorDecision(
+  decision: SupervisorDecision,
+  snapshot: Snapshot,
+): ValidatedDecision {
+  const journal: string[] = [];
+  const accepted: SupervisorAction[] = [];
+  const spawned = new Set<string>();
+  if (decision.actions.length > maximumActions) {
+    journal.push(`Supervisor decision dropped ${decision.actions.length - maximumActions} actions beyond the per-turn cap of ${maximumActions}.`);
+  }
+  for (const candidate of decision.actions.slice(0, maximumActions)) {
+    if (candidate.act !== "note" && !snapshot.state.nodes[candidate.node_id]) {
+      journal.push(`Supervisor decision skipped ${candidate.act} for unknown node ${candidate.node_id}.`);
+      continue;
+    }
+    if (candidate.act === "spawn_worker") {
+      if (spawned.has(candidate.node_id)) {
+        journal.push(`Supervisor decision skipped duplicate spawn_worker for node ${candidate.node_id} in one turn.`);
+        continue;
+      }
+      spawned.add(candidate.node_id);
+      if (Buffer.byteLength(candidate.brief) > maximumTextBytes) {
+        journal.push(`Supervisor decision skipped spawn_worker for node ${candidate.node_id} because its brief exceeded 16 KB.`);
+        continue;
+      }
+    }
+    if (candidate.act === "rebrief_worker" && Buffer.byteLength(candidate.message) > maximumTextBytes) {
+      journal.push(`Supervisor decision skipped rebrief_worker for node ${candidate.node_id} because its message exceeded 16 KB.`);
+      continue;
+    }
+    accepted.push(candidate);
+  }
+  return { decision: { actions: accepted }, journal };
 }
