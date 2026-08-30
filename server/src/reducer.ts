@@ -8,6 +8,8 @@ export class GraphValidationError extends Error {
 }
 
 export interface GraphNode extends TaskNode {
+  record_type: "task" | "group";
+  child_ids: string[];
   availability: "ready" | "blocked" | null;
   ready_since: string | null;
   ever_started: boolean;
@@ -102,6 +104,8 @@ function addNode(state: GraphState, task: TaskNode): void {
   if (state.nodes[task.id] || state.tombstones[task.id]) fail(`node ${task.id} already exists`);
   state.nodes[task.id] = {
     ...structuredClone(task),
+    record_type: "task",
+    child_ids: [],
     availability: null,
     ready_since: null,
     ever_started: task.state !== "queued",
@@ -112,7 +116,16 @@ function addNode(state: GraphState, task: TaskNode): void {
 
 function removeNode(state: GraphState, id: string, event: Event): void {
   const existing = node(state, id);
-  const { availability: _availability, ready_since: _readySince, ever_started: _everStarted, assigned: _assigned, pause_requested: _pauseRequested, ...task } = existing;
+  const {
+    record_type: _recordType,
+    child_ids: _childIds,
+    availability: _availability,
+    ready_since: _readySince,
+    ever_started: _everStarted,
+    assigned: _assigned,
+    pause_requested: _pauseRequested,
+    ...task
+  } = existing;
   state.tombstones[id] = { node: task, removed_at: event.ts, removed_seq: event.seq };
   delete state.nodes[id];
   delete state.positions[id];
@@ -132,7 +145,7 @@ function pathFrom(state: GraphState, start: string, memo: Map<string, { weight: 
   const cached = memo.get(start);
   if (cached) return cached;
   const current = state.nodes[start];
-  if (!current || current.state === "done") return { weight: 0, path: [] };
+  if (!current || current.record_type === "group" || current.state === "done") return { weight: 0, path: [] };
   const downstream = Object.values(state.edges)
     .filter(
       (candidate) =>
@@ -160,7 +173,7 @@ function computeCriticalPath(state: GraphState): string[] {
   let best = { weight: 0, path: [] as string[] };
   const memo = new Map<string, { weight: number; path: string[] }>();
   for (const id of Object.keys(state.nodes).sort()) {
-    if (state.nodes[id]?.state === "done") continue;
+    if (state.nodes[id]?.record_type === "group" || state.nodes[id]?.state === "done") continue;
     const candidate = pathFrom(state, id, memo);
     if (comparePaths(candidate, best) > 0) best = candidate;
   }
@@ -191,6 +204,11 @@ function refreshDerived(state: GraphState, ts: string): void {
   for (const id of Object.keys(state.nodes).sort()) {
     const current = state.nodes[id];
     if (!current) continue;
+    if (current.record_type === "group") {
+      current.availability = null;
+      current.ready_since = null;
+      continue;
+    }
     if (current.state !== "queued") {
       current.availability = null;
       current.ready_since = null;
@@ -220,6 +238,7 @@ const allowedTransitions: Record<NodeState, readonly NodeState[]> = {
 };
 
 function transition(target: GraphNode, from: NodeState, to: NodeState): void {
+  if (target.record_type === "group") fail(`node ${target.id} is a non-schedulable group`);
   if (target.state !== from) fail(`node ${target.id} is ${target.state}, not ${from}`);
   if (!allowedTransitions[from].includes(to)) fail(`invalid node transition ${from} -> ${to}`);
   target.state = to;
@@ -267,9 +286,13 @@ function apply(state: GraphState, event: Event): void {
       break;
     case "TASK_SPLIT": {
       const parent = node(state, event.payload.parent_id);
+      if (parent.record_type === "group") fail(`node ${parent.id} is already a group`);
       if (event.payload.children.length === 0) fail("TASK_SPLIT requires at least one child");
       const childIds = new Set(event.payload.children.map((child) => child.id));
       if (childIds.size !== event.payload.children.length) fail("TASK_SPLIT child ids must be unique");
+      for (const child of event.payload.children) {
+        if (state.nodes[child.id] || state.tombstones[child.id]) fail(`node ${child.id} already exists`);
+      }
       const incident = new Map(
         Object.values(state.edges)
           .filter((value) => value.upstream === parent.id || value.downstream === parent.id)
@@ -282,7 +305,13 @@ function apply(state: GraphState, event: Event): void {
         if (!childIds.has(remap.new_target)) fail(`remap target ${remap.new_target} is not a split child`);
         seen.add(remap.edge_id);
       }
-      removeNode(state, parent.id, event);
+      for (const edgeId of incident.keys()) delete state.edges[edgeId];
+      parent.record_type = "group";
+      parent.child_ids = [...childIds];
+      parent.availability = null;
+      parent.ready_since = null;
+      parent.assigned = true;
+      parent.pause_requested = false;
       for (const child of event.payload.children) addNode(state, child);
       for (const remap of event.payload.edge_remap) {
         const original = incident.get(remap.edge_id);

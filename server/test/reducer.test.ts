@@ -150,4 +150,48 @@ describe("deterministic reducer", () => {
 
     expect(state.approvals["approval-a"]).toMatchObject({ node_id: "a", status: "pending" });
   });
+
+  it("preserves a split parent as a non-schedulable group with its handoff", () => {
+    let state = add(initialState(), "parent", 30);
+    state = append(state, {
+      actor: "worker:parent",
+      type: "NODE_STATE_CHANGED",
+      payload: { node_id: "parent", from: "queued", to: "running" },
+      idem_key: "parent-running",
+    });
+    state = append(state, {
+      actor: "worker:parent",
+      type: "HANDOFF_FILED",
+      payload: { node_id: "parent", handoff: baseHandoff },
+      idem_key: "parent-handoff",
+    });
+    state = append(state, {
+      actor: "browser_agent",
+      type: "TASK_SPLIT",
+      payload: {
+        parent_id: "parent",
+        children: [task("child-a", 10), task("child-b", 15)],
+        edge_remap: [],
+      },
+      idem_key: "split-parent",
+    });
+
+    expect(state.nodes.parent).toMatchObject({
+      record_type: "group",
+      child_ids: ["child-a", "child-b"],
+      availability: null,
+      assigned: true,
+    });
+    expect(state.handoffs.parent).toEqual(baseHandoff);
+    expect(state.tombstones.parent).toBeUndefined();
+    expect(state.critical_path).not.toContain("parent");
+    expect(() =>
+      append(state, {
+        actor: "supervisor",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "parent", from: "review", to: "done" },
+        idem_key: "complete-parent",
+      }),
+    ).toThrow("non-schedulable group");
+  });
 });

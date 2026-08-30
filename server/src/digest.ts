@@ -116,6 +116,7 @@ export function buildDigest(state: GraphState, events: readonly Event[], since =
     paused: 0,
   };
   for (const current of Object.values(state.nodes)) {
+    if (current.record_type === "group") continue;
     if (current.state === "queued") {
       counts[current.availability ?? "blocked"] += 1;
     } else {
@@ -141,6 +142,7 @@ export function buildDigest(state: GraphState, events: readonly Event[], since =
   const ready = Object.values(state.nodes)
     .filter(
       (current) =>
+        current.record_type === "task" &&
         current.state === "queued" &&
         current.availability === "ready" &&
         !current.assigned &&

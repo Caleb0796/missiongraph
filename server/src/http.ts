@@ -231,7 +231,9 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       store.createProject(project, token, created.toISOString(), seedProjectId);
       for (const clone of cloneInputs(source, created)) store.append(project, clone.input, { ts: clone.ts });
       const state = fold(store.listEvents(project));
-      for (const current of Object.values(state.nodes).filter((node) => node.state === "running")) {
+      for (const current of Object.values(state.nodes).filter(
+        (node) => node.record_type === "task" && node.state === "running",
+      )) {
         store.append(
           project,
           {
