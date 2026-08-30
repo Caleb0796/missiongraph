@@ -143,4 +143,5 @@ test('flight queues rank delay before age and radar humanizes oldest idle work',
     ['old-ready'],
   )
   assert.equal(humanizeIdleAge(readySince['old-ready'], now), 'idle 40m')
+  assert.equal(humanizeIdleAge('17m', now), 'idle 17m')
 })

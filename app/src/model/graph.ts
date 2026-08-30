@@ -286,8 +286,15 @@ export function rankedPendingApprovals(
     )
 }
 
+function idleElapsed(since: string, now: number) {
+  const compactMinutes = /^(\d+)m$/.exec(since)
+  if (compactMinutes) return Number(compactMinutes[1]) * 60_000
+  const parsed = Date.parse(since)
+  return Number.isNaN(parsed) ? 0 : Math.max(0, now - parsed)
+}
+
 export function humanizeIdleAge(since: string, now = Date.now()) {
-  const elapsed = Math.max(0, now - Date.parse(since))
+  const elapsed = idleElapsed(since, now)
   const minutes = Math.floor(elapsed / 60_000)
   if (minutes < 1) return 'idle <1m'
   if (minutes < 60) return `idle ${minutes}m`
@@ -315,12 +322,13 @@ export function idleRadar(
         !runtime.assigned &&
         !runtime.ever_started &&
         Boolean(since) &&
-        now - Date.parse(since) >= threshold
+        idleElapsed(since, now) >= threshold
       )
     })
     .sort(
       (left, right) =>
-        readySince[left.id].localeCompare(readySince[right.id]) ||
+        idleElapsed(readySince[right.id], now) -
+          idleElapsed(readySince[left.id], now) ||
         left.id.localeCompare(right.id),
     )
 }
