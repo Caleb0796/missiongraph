@@ -1,4 +1,4 @@
-# CONTRACTS.md — frozen interfaces v1 (2026-08-30)
+# CONTRACTS.md — frozen interfaces v1.1 (2026-08-30)
 
 **FROZEN.** Every track builds against these. No session edits this file; propose changes in PROGRESS.md notes → the orchestrator (Claude) amends and bumps the version. TypeScript-ish notation; code generates types from here.
 
@@ -90,14 +90,38 @@ Cursor state is maintained per browser client by the wrapper; `graph_digest(sinc
 - WS `GET /ws?project&from_seq&token`: server→client only: `{kind:"event", event}` | `{kind:"snapshot", ...}`. Client mutations always go over HTTP. SSE fallback mirrors WS.
 - Clone: `POST /api/clone-demo` → fresh project from seed (per-visitor isolation, §13).
 
-## 5. Supervisor queue envelope (server → codex supervisor)
+## 5. Supervisor envelope delivery (server → codex supervisor) — v1.1, probe-verified
 
-One-line JSON via `codex queue`:
+`codex queue` does NOT exist in CLI 0.144.6 (docs/PROBE.md). Delivery mechanism:
+- The SERVER owns a FIFO of envelopes per project.
+- Delivery = `codex exec resume <supervisor_thread_id> '<one-line JSON envelope>'` — at most ONE in-flight resume at a time; next envelope (or a batch, concatenated as a JSON array) goes out when the previous turn returns. Session memory persists across resumes (probe P3), so the supervisor accumulates project context.
+
+Envelope (unchanged):
 ```json
 {"seq":142,"type":"EDGE_ADDED","actor":"human","upstream":"audit-log","downstream":"payments",
- "summary":"Human added dependency audit-log→payments; payments is blocked until audit-log completes."}
+ "summary":"Human added dependency audit-log→payments; payments is now blocked until audit-log completes."}
 ```
 Always self-contained: structured fields + one English `summary`. Graph rewires send `{type:"GRAPH_DIFF", ops:[...], base_seq, new_seq, stale:[...], summary}`.
+
+## 5b. Supervisor decision contract (supervisor turn → server) — v1.1
+
+The supervisor's final message each turn is a JSON decision block. The server EXECUTES it mechanically (supervisor = brain, server = hands; C4 stays intact and every scheduling decision is an auditable recorded turn):
+
+```ts
+interface SupervisorDecision {
+  actions: (
+    | { act: "spawn_worker"; node_id: string; brief: string }      // server: git worktree add + codex exec (PROBE.md commands)
+    | { act: "pause_worker" | "resume_worker" | "kill_worker"; node_id: string }
+    | { act: "rebrief_worker"; node_id: string; message: string }  // server: exec resume to that worker's thread
+    | { act: "note"; text: string }                                // → JOURNAL_NOTE event
+  )[];
+}
+```
+Worker sessions get their own thread ids; the server tracks `node_id → {thread_id, worktree}`. Workers report via the reporter API (§4), never through the supervisor.
+
+## Changelog
+- v1.1 (2026-08-30): §5 delivery switched from `codex queue` (nonexistent in 0.144.6) to server-FIFO + `exec resume`, per docs/PROBE.md; added §5b supervisor decision contract.
+- v1 (2026-08-30): initial freeze.
 
 ## 6. Naming
 
