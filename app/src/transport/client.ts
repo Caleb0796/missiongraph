@@ -15,7 +15,9 @@ import {
 import {
   configuredServer,
   parseStoredIdentity,
+  reconnectDelay,
   realtimeTransport,
+  sequenceDisposition,
   shouldReplaceStoredIdentity,
   type ClientIdentity,
 } from './client-logic'
@@ -77,11 +79,12 @@ const debounceTimers = new Map<
   { timer: number; resolve: (cursor: number) => void }
 >()
 let identity: ClientIdentity | null = null
-let seededDevProject = false
 let socket: WebSocket | null = null
 let eventSource: EventSource | null = null
 let reconnectTimer: number | null = null
 let failedWebSockets = 0
+let reconnectAttempt = 0
+let identityRecovery: Promise<void> | null = null
 let mutationQueue = Promise.resolve()
 let initialization: Promise<void> | null = null
 
@@ -181,11 +184,80 @@ async function refreshSnapshot() {
   useMissionStore
     .getState()
     .applySnapshot(snapshot.state, snapshot.cursor, identity.project)
-  if (seededDevProject) {
+}
+
+function closeRealtime() {
+  const activeSocket = socket
+  const activeSource = eventSource
+  socket = null
+  eventSource = null
+  activeSocket?.close()
+  activeSource?.close()
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer !== null) {
+    window.clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+}
+
+async function recoverExpiredIdentity() {
+  if (identityRecovery) return identityRecovery
+  identityRecovery = (async () => {
+    closeRealtime()
+    clearReconnectTimer()
+    localStorage.removeItem(IDENTITY_KEY)
+    clearSharedIdentityFromUrl()
     useMissionStore
       .getState()
-      .setConnectionMode('live', 'Live dev seed · fixture projection')
+      .setConnectionMode('loading', 'Starting a fresh mission copy…')
+    const cloned = await cloneDemo()
+    const client = { project: cloned.project, token: cloned.token }
+    await connectProject(client)
+    persistIdentity(client)
+    useMissionStore
+      .getState()
+      .showToast('previous session expired — started a fresh mission copy')
+  })().finally(() => {
+    identityRecovery = null
+  })
+  return identityRecovery
+}
+
+async function reconnect() {
+  reconnectTimer = null
+  const client = identity
+  if (!client) return
+  try {
+    await getSnapshot(client)
+    openRealtime()
+  } catch (error) {
+    if (error instanceof TransportError && shouldReplaceStoredIdentity(error.code)) {
+      try {
+        await recoverExpiredIdentity()
+      } catch {
+        scheduleReconnect()
+      }
+      return
+    }
+    scheduleReconnect()
   }
+}
+
+function scheduleReconnect(immediate = false) {
+  if (!identity || reconnectTimer !== null) return
+  closeRealtime()
+  const delay = immediate ? 0 : reconnectDelay(reconnectAttempt++)
+  useMissionStore
+    .getState()
+    .setConnectionMode(
+      'live',
+      realtimeTransport(failedWebSockets) === 'sse'
+        ? 'Live server · SSE reconnecting'
+        : 'Live server · reconnecting',
+    )
+  reconnectTimer = window.setTimeout(() => void reconnect(), delay)
 }
 
 function handleRealtimeMessage(raw: string) {
@@ -193,7 +265,15 @@ function handleRealtimeMessage(raw: string) {
     | { kind: 'event'; event: MissionEvent }
     | { kind: 'snapshot'; state: GraphSnapshotState; cursor: string }
   if (data.kind === 'event') {
-    useMissionStore.getState().applyEvent(data.event)
+    const store = useMissionStore.getState()
+    const disposition = sequenceDisposition(store.cursor, data.event.seq)
+    if (disposition === 'duplicate') return
+    if (disposition === 'gap') {
+      scheduleReconnect(true)
+      return
+    }
+    store.applyEvent(data.event)
+    reconnectAttempt = 0
   } else if (identity) {
     useMissionStore
       .getState()
@@ -201,74 +281,58 @@ function handleRealtimeMessage(raw: string) {
   }
 }
 
-function openEventSource() {
-  if (!identity) return
-  if (reconnectTimer !== null) {
-    window.clearTimeout(reconnectTimer)
-    reconnectTimer = null
-  }
-  socket?.close()
-  socket = null
-  eventSource?.close()
+function openEventSource(client: ClientIdentity) {
+  closeRealtime()
   const cursor = useMissionStore.getState().cursor
-  eventSource = new EventSource(realtimeEndpoint('sse', identity, cursor))
-  eventSource.addEventListener('message', (message) => {
+  const activeSource = new EventSource(realtimeEndpoint('sse', client, cursor))
+  eventSource = activeSource
+  activeSource.addEventListener('message', (message) => {
+    if (eventSource !== activeSource) return
     handleRealtimeMessage(String(message.data))
   })
-  eventSource.addEventListener('open', () => {
+  activeSource.addEventListener('open', () => {
+    if (eventSource !== activeSource) return
     useMissionStore.getState().setConnectionMode('live', 'Live server · SSE fallback')
   })
-  eventSource.addEventListener('error', () => {
-    if (identity) {
-      useMissionStore
-        .getState()
-        .setConnectionMode('live', 'Live server · SSE reconnecting')
-    }
+  activeSource.addEventListener('error', () => {
+    if (eventSource !== activeSource) return
+    scheduleReconnect()
   })
 }
 
-function openSocket() {
-  if (!identity) return
-  if (realtimeTransport(failedWebSockets) === 'sse') {
-    openEventSource()
-    return
-  }
-  if (reconnectTimer !== null) {
-    window.clearTimeout(reconnectTimer)
-    reconnectTimer = null
-  }
-  eventSource?.close()
-  eventSource = null
+function openSocket(client: ClientIdentity) {
+  closeRealtime()
   const cursor = useMissionStore.getState().cursor
   const activeSocket = new WebSocket(
-    realtimeEndpoint('websocket', identity, cursor),
+    realtimeEndpoint('websocket', client, cursor),
   )
   socket = activeSocket
   activeSocket.addEventListener('message', (message) => {
+    if (socket !== activeSocket) return
     failedWebSockets = 0
     handleRealtimeMessage(String(message.data))
   })
   activeSocket.addEventListener('open', () => {
-    useMissionStore
-      .getState()
-      .setConnectionMode(
-        'live',
-        seededDevProject ? 'Live dev seed · fixture projection' : 'Live server',
-      )
+    if (socket !== activeSocket) return
+    useMissionStore.getState().setConnectionMode('live', 'Live server')
   })
   activeSocket.addEventListener('close', () => {
-    if (!identity || socket !== activeSocket) return
+    if (socket !== activeSocket) return
     socket = null
     failedWebSockets++
-    if (realtimeTransport(failedWebSockets) === 'sse') {
-      openEventSource()
-      return
-    }
-    useMissionStore
-      .getState()
-      .setConnectionMode('live', 'Live server · reconnecting')
-    reconnectTimer = window.setTimeout(openSocket, 900)
+    scheduleReconnect()
   })
+}
+
+function openRealtime() {
+  const client = identity
+  if (!client) return
+  clearReconnectTimer()
+  if (realtimeTransport(failedWebSockets) === 'sse') {
+    openEventSource(client)
+  } else {
+    openSocket(client)
+  }
 }
 
 async function waitForSequence(seq: number) {
@@ -450,12 +514,19 @@ export function mutateBatch(
   return queued
 }
 
-function seededIdentityFromUrl(): ClientIdentity | null {
-  if (!import.meta.env.DEV) return null
+function sharedIdentityFromUrl(): ClientIdentity | null {
   const params = new URLSearchParams(window.location.search)
   const project = params.get('mg_project')
   const token = params.get('mg_token')
   return project && token ? { project, token } : null
+}
+
+function clearSharedIdentityFromUrl() {
+  const url = new URL(window.location.href)
+  if (!url.searchParams.has('mg_project') && !url.searchParams.has('mg_token')) return
+  url.searchParams.delete('mg_project')
+  url.searchParams.delete('mg_token')
+  window.history.replaceState(null, '', url)
 }
 
 async function bootstrap() {
@@ -463,28 +534,29 @@ async function bootstrap() {
   store.setSessionId(sessionId())
   configureMutationSender(mutate)
   try {
-    const seededIdentity = seededIdentityFromUrl()
-    seededDevProject = seededIdentity !== null
-    if (seededIdentity) {
-      await connectProject(seededIdentity)
-      return
-    }
-    const persisted = storedIdentity()
-    if (persisted) {
+    const candidate = sharedIdentityFromUrl() ?? storedIdentity()
+    let expired = false
+    if (candidate) {
       try {
-        await connectProject(persisted)
+        await connectProject(candidate)
+        persistIdentity(candidate)
         return
       } catch (error) {
         if (!(error instanceof TransportError) || !shouldReplaceStoredIdentity(error.code)) {
           throw error
         }
         localStorage.removeItem(IDENTITY_KEY)
+        clearSharedIdentityFromUrl()
+        expired = true
       }
     }
     const cloned = await cloneDemo()
     const client = { project: cloned.project, token: cloned.token }
-    persistIdentity(client)
     await connectProject(client)
+    persistIdentity(client)
+    if (expired) {
+      store.showToast('previous session expired — started a fresh mission copy')
+    }
   } catch (error) {
     identity = null
     const message =
@@ -494,15 +566,12 @@ async function bootstrap() {
 }
 
 async function connectProject(client: ClientIdentity) {
-  identity = client
   const snapshot = await getSnapshot(client)
+  identity = client
   const store = useMissionStore.getState()
   store.applySnapshot(snapshot.state, snapshot.cursor, client.project)
   await loadChangesSince('0')
-  if (seededDevProject) {
-    store.setConnectionMode('live', 'Live dev seed · fixture projection')
-  }
-  openSocket()
+  openRealtime()
 }
 
 export function initializeMissionClient() {
@@ -513,27 +582,34 @@ export function initializeMissionClient() {
 export async function resetMissionDemo() {
   localStorage.removeItem(IDENTITY_KEY)
   identity = null
-  seededDevProject = false
   failedWebSockets = 0
-  socket?.close()
-  socket = null
-  eventSource?.close()
-  eventSource = null
-  if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
-  reconnectTimer = null
+  reconnectAttempt = 0
+  closeRealtime()
+  clearReconnectTimer()
   useMissionStore
     .getState()
     .setConnectionMode('loading', 'Resetting to a fresh visitor project…')
   try {
     const cloned = await cloneDemo()
     const client = { project: cloned.project, token: cloned.token }
-    persistIdentity(client)
     await connectProject(client)
+    persistIdentity(client)
   } catch (error) {
     identity = null
     const message = error instanceof Error ? error.message : String(error)
     useMissionStore.getState().useFixture(`Offline fixture · ${message}`)
   }
+}
+
+export async function copyCurrentMissionLink() {
+  if (!identity) {
+    throw new TransportError('not_connected', 'No live project is connected.')
+  }
+  const url = new URL('/', window.location.href)
+  url.searchParams.set('mg_project', identity.project)
+  url.searchParams.set('mg_token', identity.token)
+  await navigator.clipboard.writeText(url.toString())
+  return url.toString()
 }
 
 function loadHistoryWithWebSocket(client: ClientIdentity, since: string, target: number) {

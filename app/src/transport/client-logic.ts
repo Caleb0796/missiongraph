@@ -44,3 +44,18 @@ export function shouldReplaceStoredIdentity(code: string) {
 export function realtimeTransport(failedWebSockets: number) {
   return failedWebSockets >= 3 ? 'sse' : 'websocket'
 }
+
+export function reconnectDelay(
+  attempt: number,
+  random: () => number = Math.random,
+) {
+  const base = Math.min(30_000, 500 * 2 ** Math.max(0, attempt))
+  return Math.round(base * (0.75 + random() * 0.5))
+}
+
+export function sequenceDisposition(cursor: string, incoming: number) {
+  const current = Number(cursor)
+  if (incoming <= current) return 'duplicate' as const
+  if (incoming === current + 1) return 'next' as const
+  return 'gap' as const
+}

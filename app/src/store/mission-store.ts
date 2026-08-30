@@ -35,6 +35,7 @@ interface Toast {
   id: string
   tone: 'info' | 'error'
   message: string
+  caption?: string
 }
 
 interface CameraRequest {
@@ -69,6 +70,7 @@ interface MissionState {
   positions: Record<string, Point>
   tombstones: string[]
   approvals: Record<string, Approval>
+  policies: GraphSnapshotState['policies']
   annotations: GraphSnapshotState['annotations']
   handoffs: Record<string, Handoff>
   deviations: GraphSnapshotState['deviations']
@@ -102,12 +104,12 @@ interface MissionState {
   confirmStructural: () => void
   cancelStructural: () => void
   select: (id: string | null) => void
-  approve: (nodeId: string) => void
-  reject: (nodeId: string) => void
+  approve: (nodeId: string, policyRef?: string) => void
+  reject: (nodeId: string, policyRef?: string) => void
   dispatch: (nodeId: string) => void
   setHighlights: (ids: string[]) => void
   requestCamera: (ids: string[]) => void
-  showToast: (message: string, tone?: Toast['tone']) => void
+  showToast: (message: string, tone?: Toast['tone'], caption?: string) => void
   clearToast: () => void
 }
 
@@ -143,6 +145,7 @@ function fixtureState() {
   const deviations: GraphSnapshotState['deviations'] = {}
   const workerLogs: Record<string, string[]> = {}
   const annotations: GraphSnapshotState['annotations'] = {}
+  const policies: GraphSnapshotState['policies'] = {}
 
   for (const event of shortyEvents) {
     switch (event.type) {
@@ -174,6 +177,13 @@ function fixtureState() {
         if (node) nodeById.set(node.id, { ...node, state: 'running' })
         break
       }
+      case 'POLICY_STATED':
+        policies[event.payload.policy_ref] = {
+          text: event.payload.text,
+          session_id: event.payload.session_id,
+          stated_at: event.ts,
+        }
+        break
       case 'ANNOTATED':
         ;(annotations[event.payload.target_id] ??= []).push({
           actor: event.actor,
@@ -226,6 +236,7 @@ function fixtureState() {
     positions,
     tombstones,
     approvals,
+    policies,
     annotations,
     handoffs,
     deviations,
@@ -249,6 +260,7 @@ function snapshotToView(snapshot: GraphSnapshotState) {
     positions: snapshot.positions,
     tombstones: Object.keys(snapshot.tombstones),
     approvals: snapshot.approvals,
+    policies: snapshot.policies,
     annotations: snapshot.annotations,
     handoffs: snapshot.handoffs,
     deviations: snapshot.deviations,
@@ -321,7 +333,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
   applyEvent(event) {
     const state = get()
-    if (event.seq <= Number(state.cursor)) return
+    if (event.seq !== Number(state.cursor) + 1) return
 
     const previousNodes = state.nodes
     const previousEdges = state.edges
@@ -330,6 +342,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     let positions = state.positions
     let tombstones = state.tombstones
     let approvals = state.approvals
+    let policies = state.policies
     let annotations = state.annotations
     let handoffs = state.handoffs
     let deviations = state.deviations
@@ -400,6 +413,16 @@ export const useMissionStore = create<MissionState>((set, get) => ({
             resolved_at: event.ts,
             policy_ref: event.payload.policy_ref,
             reason: event.payload.reason,
+          },
+        }
+        break
+      case 'POLICY_STATED':
+        policies = {
+          ...policies,
+          [event.payload.policy_ref]: {
+            text: event.payload.text,
+            session_id: event.payload.session_id,
+            stated_at: event.ts,
           },
         }
         break
@@ -503,6 +526,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       positions,
       tombstones,
       approvals,
+      policies,
       annotations,
       handoffs,
       deviations,
@@ -717,7 +741,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       get().showToast(error instanceof Error ? error.message : String(error), 'error'),
     )
   },
-  approve(nodeId) {
+  approve(nodeId, policyRef) {
     const approval = Object.values(get().approvals).find(
       (item) => item.node_id === nodeId && item.status === 'pending',
     )
@@ -726,11 +750,12 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       approval_id: approval.id,
       node_id: nodeId,
       rationale: 'Approved from the MissionGraph dossier after review.',
+      ...(policyRef ? { policy_ref: policyRef } : {}),
     }).catch((error: unknown) =>
       get().showToast(error instanceof Error ? error.message : String(error), 'error'),
     )
   },
-  reject(nodeId) {
+  reject(nodeId, policyRef) {
     const approval = Object.values(get().approvals).find(
       (item) => item.node_id === nodeId && item.status === 'pending',
     )
@@ -739,6 +764,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       approval_id: approval.id,
       node_id: nodeId,
       reason: 'Returned from the MissionGraph dossier for another pass.',
+      ...(policyRef ? { policy_ref: policyRef } : {}),
     }).catch((error: unknown) =>
       get().showToast(error instanceof Error ? error.message : String(error), 'error'),
     )
@@ -757,8 +783,15 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   requestCamera(nodeIds) {
     set({ cameraRequest: { id: crypto.randomUUID(), nodeIds } })
   },
-  showToast(message, tone = 'info') {
-    set({ toast: { id: crypto.randomUUID(), message, tone } })
+  showToast(message, tone = 'info', caption) {
+    set({
+      toast: {
+        id: crypto.randomUUID(),
+        message,
+        tone,
+        ...(caption ? { caption } : {}),
+      },
+    })
   },
   clearToast() {
     set({ toast: null })
