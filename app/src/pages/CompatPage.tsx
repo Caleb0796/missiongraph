@@ -8,10 +8,22 @@ import {
 function formatRaw(value: unknown) {
   if (typeof value === 'string') return value
   if (value instanceof Error) return `${value.name}: ${value.message}`
+  const seen = new WeakSet()
   try {
-    return JSON.stringify(value, null, 2)
+    return JSON.stringify(
+      value,
+      (_key, entry) => {
+        if (typeof entry === 'function') return `[fn ${entry.name || 'anonymous'}]`
+        if (typeof entry === 'object' && entry !== null) {
+          if (seen.has(entry)) return '[circular]'
+          seen.add(entry)
+        }
+        return entry
+      },
+      2,
+    )
   } catch {
-    return String(value)
+    return Object.prototype.toString.call(value)
   }
 }
 
