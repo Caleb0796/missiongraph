@@ -403,6 +403,63 @@ describe("HTTP and streaming contract", () => {
     expect(authorized.json()).toEqual({ seq: 2 });
   });
 
+  it("binds worker reporter events to the credential node", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.issueReporterCredential("project", "worker:a", "2026-08-30T10:00:00.000Z", "worker-a-token");
+    for (const nodeId of ["a", "b"]) {
+      store.append("project", {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: { id: nodeId, title: `Task ${nodeId}`, brief: `Build ${nodeId}.`, estimate_min: 10, tags: [], state: "queued" },
+        },
+        idem_key: `add-${nodeId}`,
+      });
+    }
+    const report = (type: string, payload: Record<string, unknown>, idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/p/project/report",
+        headers: { authorization: "Bearer worker-a-token" },
+        payload: { actor: "worker:a", type, payload, idem_key: idemKey },
+      });
+
+    const crossState = await report(
+      "NODE_STATE_CHANGED",
+      { node_id: "b", from: "queued", to: "running" },
+      "cross-state",
+    );
+    const crossHandoff = await report(
+      "HANDOFF_FILED",
+      { node_id: "b", handoff: baseHandoff },
+      "cross-handoff",
+    );
+    const crossApproval = await report(
+      "APPROVAL_CREATED",
+      { approval_id: "approval-b", node_id: "b", summary: "Review task B." },
+      "cross-approval",
+    );
+    const ownState = await report(
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "queued", to: "running" },
+      "own-state",
+    );
+    const ownHandoff = await report(
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: baseHandoff },
+      "own-handoff",
+    );
+    const ownApproval = await report(
+      "APPROVAL_CREATED",
+      { approval_id: "approval-a", node_id: "a", summary: "Review task A." },
+      "own-approval",
+    );
+
+    expect([crossState.statusCode, crossHandoff.statusCode, crossApproval.statusCode]).toEqual([403, 403, 403]);
+    expect([ownState.statusCode, ownHandoff.statusCode, ownApproval.statusCode]).toEqual([200, 200, 200]);
+  });
+
   it("issues renewable reporter credentials only to the supervisor scope", async () => {
     let reportTime = new Date("2026-08-30T10:00:00.000Z");
     const { app, store } = server({ now: () => reportTime });
@@ -427,6 +484,12 @@ describe("HTTP and streaming contract", () => {
 
     const missingAuth = await issue();
     const wrongAuth = await issue("Bearer wrong");
+    const unknownWorker = await app.inject({
+      method: "POST",
+      url: "/api/p/project-a/reporter-credentials",
+      headers: { authorization: "Bearer reporter-secret" },
+      payload: { actor: "worker:ghost" },
+    });
     const first = await issue("Bearer reporter-secret");
     const firstCredential = first.json<{ token: string; actor: string; expires: string }>();
     const report = (project: string, token: string, actor: string, idemKey: string) =>
@@ -454,6 +517,7 @@ describe("HTTP and streaming contract", () => {
 
     expect(missingAuth.statusCode).toBe(401);
     expect(wrongAuth.statusCode).toBe(401);
+    expect(unknownWorker.statusCode).toBe(404);
     expect(first.statusCode).toBe(200);
     expect(firstCredential).toMatchObject({ actor: "worker:a", expires: "2026-08-30T10:15:00.000Z" });
     expect(firstCredential.token).toEqual(expect.any(String));

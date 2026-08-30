@@ -63,6 +63,15 @@ function mutationSession(request: FastifyRequest): string | undefined {
   return sessionId;
 }
 
+const nodeScopedReporterEventTypes = new Set([
+  "NODE_STATE_CHANGED",
+  "PAUSE_ACKED",
+  "WORKER_LOG",
+  "HANDOFF_FILED",
+  "DEVIATION_NOTED",
+  "APPROVAL_CREATED",
+]);
+
 function baseSequence(body: Record<string, unknown>): number | undefined {
   if (body.base_seq === undefined) return undefined;
   if (!Number.isSafeInteger(body.base_seq) || (body.base_seq as number) < 0) {
@@ -315,6 +324,14 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       if (projectIdentity ? projectIdentity.actor !== input.actor : input.actor !== "supervisor") {
         return reply.code(401).send({ error: "unauthorized" });
       }
+      const payloadNodeId = "node_id" in input.payload ? input.payload.node_id : undefined;
+      if (
+        projectIdentity?.actor.startsWith("worker:") &&
+        nodeScopedReporterEventTypes.has(input.type) &&
+        payloadNodeId !== projectIdentity.actor.slice("worker:".length)
+      ) {
+        return reply.code(403).send({ error: "worker credential is bound to a different node" });
+      }
       if (!reporterEventTypes.has(input.type) && !(input.actor === "supervisor" && input.type === "JOURNAL_NOTE")) {
         throw new EventValidationError(`${input.type} is not a fleet reporter event`);
       }
@@ -337,6 +354,13 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       const actor = parseActor(body.actor);
       if (actor !== "supervisor" && !actor.startsWith("worker:")) {
         throw new EventValidationError("actor must be supervisor or worker:<node_id>");
+      }
+      if (actor.startsWith("worker:")) {
+        const nodeId = actor.slice("worker:".length);
+        const state = fold(store.listEvents(project));
+        if (!state.nodes[nodeId]) {
+          return reply.code(404).send({ error: { code: "node_not_found", message: `node ${nodeId} does not exist` } });
+        }
       }
       const credential = store.issueReporterCredential(
         project,
