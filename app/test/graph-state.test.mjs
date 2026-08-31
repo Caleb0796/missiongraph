@@ -3,18 +3,19 @@ import test from 'node:test'
 
 import {
   activeFailedNodes,
-  annotationsForTarget,
   approvalQueueFromRanking,
   approvalsForNode,
   boundedHistory,
   contextualToolNamesForState,
   eventTargetsNode,
   fixtureRankedPendingApprovals,
+  foldEdgeLineage,
   foldTaskSplit,
   getBlastRadius,
   humanizeIdleAge,
   idleRadar,
   isPreviewStale,
+  pruneEdgeLineage,
   refreshReadySince,
 } from '../src/model/graph.ts'
 
@@ -272,25 +273,7 @@ test('TASK_SPLIT fold remaps incident edges exactly and preserves durable lineag
   )
 })
 
-test('edge dossiers follow remap annotation lineage and active failures exclude groups', () => {
-  const inherited = {
-    actor: 'human',
-    note: 'Preserve this rationale.',
-    ts: '2026-08-30T10:00:00.000Z',
-  }
-  const current = {
-    actor: 'browser_agent',
-    note: 'Annotated after remap.',
-    ts: '2026-08-30T10:01:00.000Z',
-  }
-  assert.deepEqual(
-    annotationsForTarget(
-      { predecessor: [inherited], replacement: [current] },
-      { replacement: ['predecessor'] },
-      'replacement',
-    ),
-    [current, inherited],
-  )
+test('active failures exclude retired split parents', () => {
   assert.deepEqual(
     activeFailedNodes([
       task('failed-child', 'failed'),
@@ -305,6 +288,149 @@ test('edge dossiers follow remap annotation lineage and active failures exclude 
     ]),
     [],
   )
+})
+
+test('stable edge remaps retain annotations recorded before and after a split', () => {
+  const edge = {
+    edge_id: 'parent-successor',
+    upstream: 'parent',
+    downstream: 'successor',
+    kind: 'depends',
+  }
+  const folded = foldTaskSplit(
+    [task('parent'), task('successor')],
+    [edge],
+    {
+      parent_id: 'parent',
+      children: [task('entry'), task('terminal')],
+      edge_remap: [{ edge_id: edge.edge_id, new_target: 'terminal' }],
+    },
+  )
+  const annotations = {
+    [edge.edge_id]: [
+      {
+        actor: 'human',
+        note: 'Preserve this rationale.',
+        ts: '2026-08-30T10:00:00.000Z',
+      },
+    ],
+  }
+  const remapped = folded.edges.find(
+    (candidate) => candidate.edge_id === edge.edge_id,
+  )
+  assert.deepEqual(remapped, {
+    ...edge,
+    upstream: 'terminal',
+  })
+  annotations[remapped.edge_id].push({
+    actor: 'browser_agent',
+    note: 'Annotated after remap.',
+    ts: '2026-08-30T10:01:00.000Z',
+  })
+  assert.deepEqual(
+    annotations[remapped.edge_id].map((annotation) => annotation.note),
+    ['Preserve this rationale.', 'Annotated after remap.'],
+  )
+})
+
+test('edge lineage rebuilds from split folds, prunes removals, and evicts oldest entries', () => {
+  const parent = task('parent', 'queued', {
+    record_type: 'group',
+    child_ids: ['entry', 'terminal'],
+  })
+  const nodes = [
+    task('upstream'),
+    parent,
+    task('entry', 'queued', { parent_id: 'parent' }),
+    task('terminal', 'queued', { parent_id: 'parent' }),
+  ]
+  const remapped = {
+    edge_id: 'incoming',
+    upstream: 'upstream',
+    downstream: 'entry',
+    kind: 'depends',
+  }
+  let lineage = foldEdgeLineage(
+    {},
+    {
+      seq: 10,
+      project_id: 'project',
+      ts: '2026-08-30T10:00:00.000Z',
+      actor: 'human',
+      type: 'TASK_SPLIT',
+      payload: {
+        parent_id: 'parent',
+        children: [task('entry'), task('terminal')],
+        edge_remap: [{ edge_id: 'incoming', new_target: 'entry' }],
+      },
+      idem_key: 'split',
+    },
+    nodes,
+    [remapped],
+  )
+  assert.deepEqual(lineage, { incoming: { parent_id: 'parent', seq: 10 } })
+
+  const internal = {
+    edge_id: 'internal',
+    upstream: 'entry',
+    downstream: 'terminal',
+    kind: 'depends',
+  }
+  lineage = foldEdgeLineage(
+    lineage,
+    {
+      seq: 11,
+      project_id: 'project',
+      ts: '2026-08-30T10:00:01.000Z',
+      actor: 'human',
+      type: 'EDGE_ADDED',
+      payload: internal,
+      idem_key: 'internal',
+    },
+    nodes,
+    [remapped, internal],
+  )
+  assert.deepEqual(lineage.internal, { parent_id: 'parent', seq: 11 })
+  assert.deepEqual(lineage, {
+    incoming: { parent_id: 'parent', seq: 10 },
+    internal: { parent_id: 'parent', seq: 11 },
+  })
+
+  lineage = foldEdgeLineage(
+    lineage,
+    {
+      seq: 12,
+      project_id: 'project',
+      ts: '2026-08-30T10:00:02.000Z',
+      actor: 'human',
+      type: 'EDGE_REMOVED',
+      payload: { edge_id: 'incoming' },
+      idem_key: 'remove',
+    },
+    nodes,
+    [internal],
+  )
+  assert.deepEqual(lineage, { internal: { parent_id: 'parent', seq: 11 } })
+
+  const manyEdges = Array.from({ length: 501 }, (_, index) => ({
+    edge_id: `edge-${String(index).padStart(3, '0')}`,
+    upstream: 'entry',
+    downstream: 'terminal',
+    kind: 'depends',
+  }))
+  const bounded = pruneEdgeLineage(
+    Object.fromEntries(
+      manyEdges.map((edge, index) => [
+        edge.edge_id,
+        { parent_id: 'parent', seq: index },
+      ]),
+    ),
+    nodes,
+    manyEdges,
+  )
+  assert.equal(Object.keys(bounded).length, 500)
+  assert.equal(bounded['edge-000'], undefined)
+  assert.deepEqual(bounded['edge-500'], { parent_id: 'parent', seq: 500 })
 })
 
 test('splitting the last failed task unregisters failure and selection aliases', () => {

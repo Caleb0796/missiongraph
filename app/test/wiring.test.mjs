@@ -47,7 +47,7 @@ test('stale-epoch 409 responses are discarded before digest application', async 
   )
 })
 
-test('queued, debounced, batch, and preview mutations retain initiation context', async () => {
+test('queued and preview mutations retain context while debounce captures it at timer fire', async () => {
   const client = await source('../src/transport/client.ts')
   const tools = await source('../src/webmcp/tools.ts')
   const store = await source('../src/store/mission-store.ts')
@@ -61,7 +61,7 @@ test('queued, debounced, batch, and preview mutations retain initiation context'
   )
   assert.match(
     mutateBlock,
-    /const context = captureMutationContext\(options\.staleMode\)/,
+    /\(\) => \{\s*const context = captureMutationContext\(options\.staleMode\)\s*return enqueueMutation/,
   )
   assert.match(
     mutateBlock,
@@ -73,7 +73,10 @@ test('queued, debounced, batch, and preview mutations retain initiation context'
   )
   assert.match(batchBlock, /postMutationBatch\(batch, actor, context\)/)
   assert.match(tools, /const applyMutation = prepareMutation\(/)
-  assert.match(store, /prepareStoreMutation\('EDGE_ADDED', payload/)
+  assert.match(
+    store,
+    /const prepare = \(\) => prepareStoreMutation\('EDGE_ADDED', payload, \{\s*staleMode: 'silent',\s*\}\)/,
+  )
 })
 
 test('plan_seed uses one batch and native edits stage a visible confirmation', async () => {
@@ -260,8 +263,11 @@ test('M5 split shares cursor-bound UI confirmation and recomputes its atomic bat
   assert.doesNotMatch(tools, /pausing\.map\([\s\S]*?'PAUSE_REQUESTED'/)
   assert.match(client, /export function prepareBatchMutation\(/)
   assert.match(split, /type: 'TASK_SPLIT'/)
-  assert.match(split, /type: 'EDGE_REMOVED'/)
+  assert.match(split, /edge_remap: edgeRemap\.map/)
+  assert.doesNotMatch(split, /type: 'EDGE_REMOVED'/)
   assert.match(split, /type: 'EDGE_ADDED'/)
+  assert.match(tools, /proposal: \{\s*children: plan\.children\.map/)
+  assert.match(tools, /edge_remap: result\.preview\.proposal\.edgeRemap\.map/)
 })
 
 test('M5 contextual registry updates all three tiers idempotently', async () => {
@@ -303,6 +309,7 @@ test('M5 visual wiring exposes blast radius, relayout, split ancestry, and pause
   assert.match(graph, /parent_id: payload\.parent_id/)
   assert.match(canvas, /topologyRevision === scheduledRevision/)
   assert.match(canvas, /projectId === scheduledProjectId/)
+  assert.match(canvas, /setLayoutRetry\(\(current\) => current \+ 1\)/)
 })
 
 test('selection settling, project clearing, and cosmetic 409 handling preserve local intent', async () => {
@@ -324,16 +331,18 @@ test('selection settling, project clearing, and cosmetic 409 handling preserve l
   assert.match(client, /await refreshSnapshot\(candidate\)/)
 })
 
-test('lineage and remap annotation dossiers do not depend on bounded event history', async () => {
+test('lineage folds and remap dossiers do not depend on bounded event history', async () => {
   const store = await source('../src/store/mission-store.ts')
   const tools = await source('../src/webmcp/tools.ts')
   const inspector = await source('../src/components/Inspector.tsx')
   assert.match(store, /parentByChild/)
   assert.match(store, /foldTaskSplit\(nodes, edges, event\.payload\)/)
+  assert.match(store, /foldEdgeLineage\(/)
+  assert.match(store, /pruneEdgeLineage\(/)
   assert.match(tools, /const splitParent = task\.parent_id/)
-  assert.match(tools, /annotationsForTarget\(/)
+  assert.match(tools, /state\.annotations\[id\] \?\? \[\]/)
   assert.match(tools, /\{ target_id: targetId, note \}/)
   assert.match(inspector, /runtimeNode\?\.parent_id/)
-  assert.match(inspector, /annotationsForTarget\(/)
+  assert.match(inspector, /annotations\[edge\.edge_id\] \?\? \[\]/)
   assert.doesNotMatch(tools, /event\.payload\.children\.some\(\(child\) => child\.id === id\)/)
 })

@@ -71,9 +71,23 @@ test('stale split re-preview recomputes children and preserves a concurrent inci
   const recompute = () => {
     const plan = buildSplitPlan(parent, subtasks, edges)
     plans.push(plan)
+    const titles = new Map(
+      [...nodes, ...plan.children].map((node) => [node.id, node.title]),
+    )
     return {
       title: 'Split Payments',
       ids: ['payments'],
+      proposal: {
+        children: plan.children.map(({ id, title }) => ({ id, title })),
+        edgeRemap: plan.edgeRemap.map((remap) => ({
+          edgeId: remap.edgeId,
+          upstream: remap.upstream,
+          upstreamTitle: titles.get(remap.upstream),
+          downstream: remap.downstream,
+          downstreamTitle: titles.get(remap.downstream),
+          kind: remap.kind,
+        })),
+      },
       apply: async () => {
         ;({ nodes, edges } = applyPlan(nodes, edges, plan))
         return plan
@@ -113,6 +127,14 @@ test('stale split re-preview recomputes children and preserves a concurrent inci
       (remap) => remap.edge_id === 'payments-receipt',
     ),
   )
+  assert.deepEqual(
+    stale.operation.proposal.children.map((child) => child.id),
+    plans[1].children.map((child) => child.id),
+  )
+  assert.deepEqual(
+    stale.operation.proposal.edgeRemap.map((remap) => remap.edgeId).sort(),
+    ['auth-payments', 'payments-receipt'],
+  )
 
   const confirmed = await controller.confirm(
     operation.key,
@@ -122,6 +144,10 @@ test('stale split re-preview recomputes children and preserves a concurrent inci
     () => false,
   )
   assert.equal(confirmed.applied, true)
+  assert.deepEqual(
+    confirmed.value.children.map((child) => child.id),
+    stale.operation.proposal.children.map((child) => child.id),
+  )
   assert.ok(edges.some((edge) => edge.edge_id === 'payments-receipt'))
   assert.ok(
     edges.every(
@@ -146,6 +172,10 @@ test('a confirm-time 409 keeps the operation and rebinds a recomputed preview', 
       return {
         title: 'Split Payments',
         ids: ['payments'],
+        proposal: {
+          children: [{ id: `child-${planNumber}`, title: `Child ${planNumber}` }],
+          edgeRemap: [],
+        },
         apply: async () => {
           if (planNumber === 1) {
             cursor = '9'
@@ -166,6 +196,7 @@ test('a confirm-time 409 keeps the operation and rebinds a recomputed preview', 
   assert.equal(stale.applied, false)
   assert.equal(stale.operation.baseCursor, '9')
   assert.equal(stale.operation.opToken, 'token-2')
+  assert.equal(stale.operation.proposal.children[0].id, 'child-2')
   assert.equal(plans, 2)
   assert.deepEqual(
     await controller.confirm(

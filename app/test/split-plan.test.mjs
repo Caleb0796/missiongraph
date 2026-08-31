@@ -58,7 +58,7 @@ test('split planner emits one TASK_SPLIT batch with correctly directed edge rema
   ])
   assert.equal(
     plan.batch.filter((item) => item.type === 'EDGE_REMOVED').length,
-    2,
+    0,
   )
   assert.equal(
     plan.batch.filter((item) => item.type === 'PAUSE_REQUESTED').length,
@@ -67,24 +67,32 @@ test('split planner emits one TASK_SPLIT batch with correctly directed edge rema
   const added = plan.batch
     .filter((item) => item.type === 'EDGE_ADDED')
     .map((item) => item.payload)
+  assert.equal(added.length, 1)
+  assert.equal(added[0].upstream, entry)
+  assert.equal(added[0].downstream, terminal)
   assert.ok(
-    added.some(
+    added.every(
       (edge) =>
-        edge.edge_id === 'auth-payments' &&
-        edge.upstream === 'auth' &&
-        edge.downstream === entry,
+        edge.edge_id !== 'auth-payments' &&
+        edge.edge_id !== 'payments-receipts',
     ),
   )
-  assert.ok(
-    added.some(
-      (edge) => edge.upstream === terminal && edge.downstream === 'receipts',
-    ),
-  )
-  assert.ok(
-    added.some(
-      (edge) => edge.upstream === entry && edge.downstream === terminal,
-    ),
-  )
+  assert.deepEqual(plan.edgeRemap, [
+    {
+      edgeId: 'auth-payments',
+      upstream: 'auth',
+      downstream: entry,
+      kind: 'depends',
+      newTarget: entry,
+    },
+    {
+      edgeId: 'payments-receipts',
+      upstream: terminal,
+      downstream: 'receipts',
+      kind: 'depends',
+      newTarget: terminal,
+    },
+  ])
 })
 
 test('split planner rejects cyclic child dependencies before mutation', () => {
