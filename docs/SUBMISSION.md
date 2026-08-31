@@ -45,4 +45,4 @@ Server-side FIFO with delivery leases, timeline scrubbing (time travel over the 
 - [ ] **Live URL**: https://missiongraph.vercel.app (VM + frontend must stay up through Sep 21)
 - [ ] **Video**: YouTube, public, <3:00, audio narration (see docs/VIDEO_SCRIPT.md)
 - [ ] **Repo**: made public at submission time, MIT license visible
-- [ ] **Testing note for judges**: works in ChatGPT's built-in browser natively; in Chrome 149+ enable `chrome://flags/#enable-webmcp-testing`. First visit auto-clones a private copy of a real mission — three suggestion chips show what to ask your agent first.
+- [ ] **Testing note for judges**: works in ChatGPT's built-in browser natively — latest app, model GPT-5.6 Sol or Terra (Luna has WebMCP disabled), Settings → Browser → Permissions → "Enable site tools" ON, non-Enterprise workspace. In Chrome 149+ enable `chrome://flags/#enable-webmcp-testing`. First visit auto-clones a private copy of a real mission — three suggestion chips show what to ask your agent first.

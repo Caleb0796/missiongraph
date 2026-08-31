@@ -36,7 +36,7 @@ Parallel agent fleets are fast — and illegible. A linear chat loop is legible 
 
 ## Try it
 
-**Browsers**: ChatGPT's built-in browser (native WebMCP), or Chrome 149+ with `chrome://flags/#enable-webmcp-testing` enabled. The page shows an enable-flag banner when WebMCP is absent (a labeled offline fixture keeps the canvas explorable).
+**Browsers**: ChatGPT's built-in browser — native WebMCP; needs the latest app, model GPT-5.6 Sol or Terra (Luna has WebMCP disabled), and Settings → Browser → Permissions → "Enable site tools" turned on. Or Chrome 149+ with `chrome://flags/#enable-webmcp-testing` enabled. The page shows an enable banner when WebMCP is absent (a labeled offline fixture keeps the canvas explorable).
 
 Ask your agent things like: *"Catch me up on this mission."* · *"Approve anything under 50 changed lines with green tests — that's my policy."* · *"What's idle and worth staffing?"* · *"Split the containerize task into build and deploy halves — show me the blast radius first."*
 

@@ -271,6 +271,7 @@ test('judge first-run prompts and WebMCP guidance are wired into the canvas', as
     /first-run-prompts:not\(\.first-run-prompts--menu-open\) \{ display: none; \}/,
   )
   assert.match(canvas, /ChatGPT&apos;s built-in browser works natively/)
+  assert.match(canvas, /Enable site tools/)
   assert.match(canvas, /chrome:\/\/flags\/#enable-webmcp-testing/)
   assert.match(canvas, /href="\/compat"/)
 })

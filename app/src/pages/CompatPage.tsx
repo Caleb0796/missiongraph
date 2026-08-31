@@ -111,7 +111,9 @@ export function CompatPage() {
           <section className="mt-8 rounded-xl border border-amber-400/40 bg-amber-400/10 p-5 text-amber-100">
             <h2 className="font-semibold">WebMCP is not enabled</h2>
             <p className="mt-1 text-sm leading-6">
-              Enable chrome://flags/#enable-webmcp-testing or open in ChatGPT&apos;s browser.
+              In ChatGPT: Settings → Browser → Permissions → Enable site tools, with
+              model GPT-5.6 Sol or Terra (Luna has WebMCP off). In Chrome: enable
+              chrome://flags/#enable-webmcp-testing, then relaunch.
             </p>
           </section>
         )}

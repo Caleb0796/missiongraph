@@ -4,6 +4,8 @@
 
 安全性说明：页面首次访问会自动克隆一个访客私有副本，agent 的任何写操作只影响它自己的副本，不触碰种子或他人数据。
 
+若 agent 报 `ENVIRONMENT NOT READY`（尤其是 Enable site tools）：这是 app 侧门禁，不是应用缺陷，且 agent 通常打不开自己的设置页——需要人手动核对四项后重跑：① app 升到最新版；② 对话模型选 GPT-5.6 Sol 或 Terra（Luna 关闭了 WebMCP）；③ Settings → Browser → Permissions → Enable site tools 打开；④ 个人（非 Enterprise/Edu）工作区。重跑途中若出现 "model is at capacity" 换模型提示，确保仍停留在 Sol/Terra，否则 WebMCP 会静默失效。
+
 ---
 
 ## TASK FOR CHATGPT (paste everything below this line)

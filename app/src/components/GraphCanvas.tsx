@@ -578,7 +578,9 @@ function MissionBoard() {
           <aside className="webmcp-banner" role="status">
             <strong>Enable WebMCP to work with your agent.</strong>
             <span>
-              ChatGPT&apos;s built-in browser works natively. In Chrome, enable{' '}
+              ChatGPT&apos;s built-in browser works natively once site tools are on:
+              Settings → Browser → Permissions → <strong>Enable site tools</strong>,
+              with model GPT-5.6 Sol or Terra. In Chrome, enable{' '}
               <code>chrome://flags/#enable-webmcp-testing</code>, then relaunch.
             </span>
             <a href="/compat">Check compatibility</a>

@@ -16,6 +16,8 @@ Updated by the executing agent after every milestone (see AGENTS.md).
 
 ### ChatGPT built-in browser
 
+**Attempt log** — ① 2026-08-31 (pre-S13): red light from the merged ChatGPT/Codex app; root cause was OUR late-registration race (registry memoized a terminal no-runtime result before the in-app browser injected `modelContext`) — fixed in `abd085e`. ② 2026-08-31 (post-S13, app model 5.6 Sol): the agent correctly stopped at the Act 0 gate with `ENVIRONMENT NOT READY: "Enable site tools" unavailable or disabled`; `/compat` showed `waiting` for namespace/tier instead of a false `none` — the S13 fix is confirmed live in production. Remaining blocker is the app-side toggle (Settings → Browser → Permissions → Enable site tools), which the human must flip before the rerun.
+
 1. After a human runs `vercel login` and deploys from `app/` with `npx vercel --yes`, open the resulting HTTPS URL in ChatGPT's built-in browser.
 2. Confirm the yellow enable banner is absent. Record the displayed API namespace and dynamic-tools tier, plus the full user agent from the hello result.
 3. Click **Get tools**. Confirm the raw result contains `hello_missiongraph`, its empty-object input schema, and `annotations.readOnlyHint: true`.
