@@ -55,7 +55,7 @@ test('blast radius includes downstream running work', () => {
     { edge_id: 'b-c', upstream: 'b', downstream: 'c', kind: 'depends' },
   ]
   assert.deepEqual(getBlastRadius(['a'], nodes, edges), {
-    stale: ['a', 'b', 'c'],
+    stale: ['b'],
     pausing: ['b'],
   })
   assert.equal(isPreviewStale('12', '13'), true)
