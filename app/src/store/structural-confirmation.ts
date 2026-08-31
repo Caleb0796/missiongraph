@@ -1,9 +1,22 @@
+export interface StructuralOperationProposal {
+  children: { id: string; title: string }[]
+  edgeRemap: {
+    edgeId: string
+    upstream: string
+    upstreamTitle: string
+    downstream: string
+    downstreamTitle: string
+    kind: 'depends' | 'conflicts'
+  }[]
+}
+
 export interface StructuralOperationSnapshot {
   key: string
   opToken: string
   title: string
   ids: string[]
   notice?: string
+  proposal?: StructuralOperationProposal
   baseCursor: string
   projectId: string | null
 }
@@ -12,6 +25,7 @@ export interface StructuralOperationPlan {
   title: string
   ids: string[]
   notice?: string
+  proposal?: StructuralOperationProposal
   apply: () => Promise<unknown>
 }
 
@@ -31,6 +45,16 @@ function snapshot(operation: PendingStructuralOperation) {
     title: operation.title,
     ids: [...operation.ids],
     ...(operation.notice ? { notice: operation.notice } : {}),
+    ...(operation.proposal
+      ? {
+          proposal: {
+            children: operation.proposal.children.map((child) => ({ ...child })),
+            edgeRemap: operation.proposal.edgeRemap.map((remap) => ({
+              ...remap,
+            })),
+          },
+        }
+      : {}),
     baseCursor: operation.baseCursor,
     projectId: operation.projectId,
   }
@@ -57,6 +81,7 @@ export class StructuralConfirmationController {
       title: plan.title,
       ids: [...plan.ids],
       ...(plan.notice ? { notice: plan.notice } : {}),
+      ...(plan.proposal ? { proposal: plan.proposal } : {}),
       baseCursor: operation.cursor,
       projectId: operation.projectId,
       recompute: operation.recompute,
@@ -75,6 +100,7 @@ export class StructuralConfirmationController {
     pending.title = plan.title
     pending.ids = [...plan.ids]
     pending.notice = plan.notice
+    pending.proposal = plan.proposal
     pending.baseCursor = cursor
     pending.apply = plan.apply
     return { applied: false, operation: snapshot(pending) } as const

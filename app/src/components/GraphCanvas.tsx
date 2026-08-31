@@ -110,9 +110,14 @@ function MissionBoard() {
   >({})
   const [replaying, setReplaying] = useState(false)
   const [relayouting, setRelayouting] = useState(false)
+  const [layoutRetry, setLayoutRetry] = useState(0)
   const [now, setNow] = useState(() => Date.now())
   const hasLaidOut = useRef(false)
-  const topologySignature = useRef('')
+  const layoutRequest = useRef<{
+    projectId: string | null
+    revision: number
+    signature: string
+  } | null>(null)
   const relayoutTimer = useRef<number | null>(null)
   const layoutDebounce = useRef<number | null>(null)
   const { fitView, setCenter } = useReactFlow<TaskFlowNode, Edge>()
@@ -239,7 +244,7 @@ function MissionBoard() {
 
   useEffect(() => {
     hasLaidOut.current = false
-    topologySignature.current = ''
+    layoutRequest.current = null
     const resetRelayouting = window.setTimeout(() => setRelayouting(false), 0)
     if (relayoutTimer.current !== null) {
       window.clearTimeout(relayoutTimer.current)
@@ -261,11 +266,22 @@ function MissionBoard() {
       .sort()
       .join(',')}`
     const firstLayout = !hasLaidOut.current
-    if (!firstLayout && topologySignature.current === signature) return
+    if (
+      !firstLayout &&
+      layoutRequest.current?.projectId === projectId &&
+      layoutRequest.current.revision === topologyRevision &&
+      layoutRequest.current.signature === signature
+    ) {
+      return
+    }
     hasLaidOut.current = true
-    topologySignature.current = signature
     const scheduledRevision = topologyRevision
     const scheduledProjectId = projectId
+    layoutRequest.current = {
+      projectId: scheduledProjectId,
+      revision: scheduledRevision,
+      signature,
+    }
     const isCurrentLayout = () =>
       useMissionStore.getState().topologyRevision === scheduledRevision &&
       useMissionStore.getState().projectId === scheduledProjectId
@@ -275,7 +291,16 @@ function MissionBoard() {
         nodes.map((node) => node.id),
         flowEdges,
       ).then((positions) => {
-        if (!isCurrentLayout()) return
+        if (!isCurrentLayout()) {
+          if (
+            layoutRequest.current?.projectId === scheduledProjectId &&
+            layoutRequest.current.revision === scheduledRevision
+          ) {
+            layoutRequest.current = null
+            setLayoutRetry((current) => current + 1)
+          }
+          return
+        }
         if (firstLayout) hydratePositions(positions)
         else relayoutPositions(positions)
         window.setTimeout(() => {
@@ -312,6 +337,7 @@ function MissionBoard() {
     fitView,
     flowEdges,
     hydratePositions,
+    layoutRetry,
     nodes,
     projectId,
     relayoutPositions,
@@ -531,6 +557,31 @@ function MissionBoard() {
             <p className="structural-confirm-kicker">Blast-radius preview</p>
             <h2>{structuralPreview.title}</h2>
             {structuralPreview.notice && <p>{structuralPreview.notice}.</p>}
+            {structuralPreview.proposal && (
+              <div className="structural-confirm-plan">
+                <p>
+                  Children:{' '}
+                  {structuralPreview.proposal.children
+                    .map((child) => child.title)
+                    .join(', ')}.
+                </p>
+                {structuralPreview.proposal.edgeRemap.length > 0 ? (
+                  <ul>
+                    {structuralPreview.proposal.edgeRemap.map((remap) => (
+                      <li key={remap.edgeId}>
+                        {remap.kind === 'depends' ? 'Dependency' : 'Conflict'}{' '}
+                        {remap.edgeId} reattaches as{' '}
+                        {remap.upstreamTitle}{' '}
+                        {remap.kind === 'depends' ? '→' : '↔'}{' '}
+                        {remap.downstreamTitle}.
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>No existing relationships need reattachment.</p>
+                )}
+              </div>
+            )}
             {structuralPreview.blastRadius.stale.length > 0 ? (
               <p>
                 Context may become stale for{' '}

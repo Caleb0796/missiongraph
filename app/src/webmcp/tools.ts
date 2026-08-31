@@ -1,7 +1,6 @@
 import {
   approvalQueueFromRanking,
   activeFailedNodes,
-  annotationsForTarget,
   approvalsForNode,
   contextualToolNamesForState,
   getCriticalPath,
@@ -126,6 +125,21 @@ function preview(
     preview: {
       op_token: staged.opToken,
       blast_radius: staged.blastRadius,
+      ...(staged.proposal
+        ? {
+            proposal: {
+              children: staged.proposal.children,
+              edge_remap: staged.proposal.edgeRemap.map((remap) => ({
+                edge_id: remap.edgeId,
+                upstream: remap.upstream,
+                upstream_title: remap.upstreamTitle,
+                downstream: remap.downstream,
+                downstream_title: remap.downstreamTitle,
+                kind: remap.kind,
+              })),
+            },
+          }
+        : {}),
     },
   }
 }
@@ -156,6 +170,21 @@ async function confirmed(
       preview: {
         op_token: result.preview.opToken,
         blast_radius: result.preview.blastRadius,
+        ...(result.preview.proposal
+          ? {
+              proposal: {
+                children: result.preview.proposal.children,
+                edge_remap: result.preview.proposal.edgeRemap.map((remap) => ({
+                  edge_id: remap.edgeId,
+                  upstream: remap.upstream,
+                  upstream_title: remap.upstreamTitle,
+                  downstream: remap.downstream,
+                  downstream_title: remap.downstreamTitle,
+                  kind: remap.kind,
+                })),
+              },
+            }
+          : {}),
       },
       error: {
         code: 'preview_stale',
@@ -472,6 +501,12 @@ async function executeSplit(
       throw new Error(`Task ${id} is already a split parent.`)
     }
     const plan = buildSplitPlan(currentParent, subtasks, state.edges)
+    const titles = new Map(
+      [...state.nodes, ...plan.children].map((candidate) => [
+        candidate.id,
+        candidate.title,
+      ]),
+    )
     const prepare = () => {
       const applyBatch = prepareBatchMutation(plan.batch, {
         actor,
@@ -488,7 +523,6 @@ async function executeSplit(
           )
         const children = splitEvent?.payload.children ?? plan.children
         const store = useMissionStore.getState()
-        store.recordEdgeLineage(plan.edgeLineage)
         store.setHighlights(children.map((child) => child.id))
         store.requestCamera([
           currentParent.id,
@@ -516,6 +550,20 @@ async function executeSplit(
               'this task is still executing — the supervisor will re-brief its worker after the split',
           }
         : {}),
+      proposal: {
+        children: plan.children.map((child) => ({
+          id: child.id,
+          title: child.title,
+        })),
+        edgeRemap: plan.edgeRemap.map((remap) => ({
+          edgeId: remap.edgeId,
+          upstream: remap.upstream,
+          upstreamTitle: titles.get(remap.upstream) ?? remap.upstream,
+          downstream: remap.downstream,
+          downstreamTitle: titles.get(remap.downstream) ?? remap.downstream,
+          kind: remap.kind,
+        })),
+      },
       prepare,
     }
   }
@@ -1173,6 +1221,11 @@ const getNode: ToolDefinition = {
     if (!edge) throw new Error(`Task or edge ${id} does not exist.`)
     const upstream = node(edge.upstream)
     const downstream = node(edge.downstream)
+    const splitParent = state.edgeLineage[id]
+      ? state.nodes.find(
+          (candidate) => candidate.id === state.edgeLineage[id].parent_id,
+        )
+      : undefined
     return {
       data: {
         summary:
@@ -1180,11 +1233,14 @@ const getNode: ToolDefinition = {
             ? `“${downstream.title}” depends on “${upstream.title}”.`
             : `“${upstream.title}” and “${downstream.title}” have an advisory work conflict.`,
         edge,
-        annotations: annotationsForTarget(
-          state.annotations,
-          state.edgeLineage,
-          id,
-        ),
+        annotations: state.annotations[id] ?? [],
+        split_history: splitParent
+          ? {
+              parent_id: splitParent.id,
+              parent_title: splitParent.title,
+              summary: `This relationship was reattached when “${splitParent.title}” was split.`,
+            }
+          : null,
       },
     }
   },

@@ -3,7 +3,6 @@ import type {
   EventPayloadMap,
   GraphDigest,
   GraphEdge,
-  GraphSnapshotState,
   MissionEvent,
   TaskNode,
 } from './types'
@@ -139,13 +138,67 @@ export function foldTaskSplit(
   }
 }
 
-export function annotationsForTarget(
-  annotations: GraphSnapshotState['annotations'],
-  edgeLineage: Record<string, string[]>,
-  targetId: string,
+export interface EdgeLineageEntry {
+  parent_id: string
+  seq: number
+}
+
+export type EdgeLineage = Record<string, EdgeLineageEntry>
+
+function edgeParentId(edge: GraphEdge, nodes: TaskNode[]) {
+  const byId = new Map(nodes.map((node) => [node.id, node]))
+  const upstreamParent = byId.get(edge.upstream)?.parent_id
+  const downstreamParent = byId.get(edge.downstream)?.parent_id
+  return upstreamParent === downstreamParent
+    ? upstreamParent
+    : upstreamParent ?? downstreamParent
+}
+
+export function pruneEdgeLineage(
+  lineage: EdgeLineage,
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+  limit = 500,
 ) {
-  const targetIds = [targetId, ...(edgeLineage[targetId] ?? [])]
-  return targetIds.flatMap((id) => annotations[id] ?? [])
+  const edgeIds = new Set(edges.map((edge) => edge.edge_id))
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  return Object.fromEntries(
+    Object.entries(lineage)
+      .filter(
+        ([edgeId, entry]) =>
+          edgeIds.has(edgeId) && nodeIds.has(entry.parent_id),
+      )
+      .sort(
+        ([leftId, left], [rightId, right]) =>
+          left.seq - right.seq || leftId.localeCompare(rightId),
+      )
+      .slice(-limit),
+  )
+}
+
+export function foldEdgeLineage(
+  current: EdgeLineage,
+  event: MissionEvent,
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+) {
+  const next = { ...current }
+  if (event.type === 'TASK_SPLIT') {
+    event.payload.edge_remap.forEach((remap) => {
+      next[remap.edge_id] = {
+        parent_id: event.payload.parent_id,
+        seq: event.seq,
+      }
+    })
+  }
+  if (event.type === 'EDGE_ADDED') {
+    const parentId = edgeParentId(event.payload, nodes)
+    if (parentId) {
+      next[event.payload.edge_id] = { parent_id: parentId, seq: event.seq }
+    }
+  }
+  if (event.type === 'EDGE_REMOVED') delete next[event.payload.edge_id]
+  return pruneEdgeLineage(next, nodes, edges)
 }
 
 export function getDisplayState(

@@ -8,12 +8,15 @@ import {
   boundedHistory,
   describeEvent,
   fixtureRankedPendingApprovals,
+  foldEdgeLineage,
   foldTaskSplit,
   getBlastRadius,
   getCriticalPath,
   isNonIdle,
+  pruneEdgeLineage,
   refreshReadySince,
   wouldCreateCycle,
+  type EdgeLineage,
 } from '../model/graph'
 import type {
   Approval,
@@ -32,7 +35,10 @@ import {
   shouldApplyDigest,
   shouldApplySnapshot,
 } from '../transport/client-logic'
-import { StructuralConfirmationController } from './structural-confirmation'
+import {
+  StructuralConfirmationController,
+  type StructuralOperationProposal,
+} from './structural-confirmation'
 
 interface Point {
   x: number
@@ -58,12 +64,14 @@ interface StructuralPreview {
   baseCursor: string
   blastRadius: { stale: string[]; pausing: string[] }
   notice?: string
+  proposal?: StructuralOperationProposal
 }
 
 export interface StructuralPlanInput {
   title: string
   ids: string[]
   notice?: string
+  proposal?: StructuralOperationProposal
   prepare: () => () => Promise<unknown>
 }
 
@@ -111,7 +119,7 @@ interface MissionState {
   approvalRankingStale: boolean
   policies: GraphSnapshotState['policies']
   annotations: GraphSnapshotState['annotations']
-  edgeLineage: Record<string, string[]>
+  edgeLineage: EdgeLineage
   handoffs: Record<string, Handoff>
   deviations: GraphSnapshotState['deviations']
   workerLogs: Record<string, string[]>
@@ -172,7 +180,6 @@ interface MissionState {
   dispatch: (nodeId: string) => void
   setNodeRunState: (nodeId: string, state: 'pause' | 'resume') => void
   setHighlights: (ids: string[]) => void
-  recordEdgeLineage: (lineage: Record<string, string[]>) => void
   setContextualToolsDegraded: (degraded: boolean) => void
   requestCamera: (ids: string[]) => void
   showExplainOverlay: (id: string, text: string, ttlSeconds: number) => void
@@ -410,19 +417,21 @@ function snapshotToView(snapshot: GraphSnapshotState) {
       node.child_ids.forEach((childId) => parentByChild.set(childId, node.id))
     }
   })
+  const nodes = Object.values(snapshot.nodes).map((node) => ({
+    ...node,
+    ...(parentByChild.has(node.id)
+      ? { parent_id: parentByChild.get(node.id) }
+      : {}),
+  }))
+  const edges = Object.values(snapshot.edges).map((edge) => ({
+    edge_id: edge.id,
+    upstream: edge.upstream,
+    downstream: edge.downstream,
+    kind: edge.kind,
+  }))
   return {
-    nodes: Object.values(snapshot.nodes).map((node) => ({
-      ...node,
-      ...(parentByChild.has(node.id)
-        ? { parent_id: parentByChild.get(node.id) }
-        : {}),
-    })),
-    edges: Object.values(snapshot.edges).map((edge) => ({
-      edge_id: edge.id,
-      upstream: edge.upstream,
-      downstream: edge.downstream,
-      kind: edge.kind,
-    })),
+    nodes,
+    edges,
     positions: snapshot.positions,
     tombstones: Object.keys(snapshot.tombstones),
     approvals: snapshot.approvals,
@@ -526,7 +535,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         view.edges.some((edge) => edge.edge_id === state.selectedId)
       return {
         ...view,
-        edgeLineage: projectChanged ? {} : state.edgeLineage,
+        edgeLineage: projectChanged
+          ? {}
+          : pruneEdgeLineage(state.edgeLineage, view.nodes, view.edges),
         topologyRevision: state.topologyRevision + (topologyChanged ? 1 : 0),
         projectId,
         cursor,
@@ -563,6 +574,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     let approvals = state.approvals
     let policies = state.policies
     let annotations = state.annotations
+    let edgeLineage = state.edgeLineage
     let handoffs = state.handoffs
     let deviations = state.deviations
     let workerLogs = state.workerLogs
@@ -762,6 +774,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         break
     }
 
+    edgeLineage = foldEdgeLineage(edgeLineage, event, nodes, edges)
+
     readySince = refreshReadySince(
       previousNodes,
       previousEdges,
@@ -794,6 +808,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       approvalRanking,
       policies,
       annotations,
+      edgeLineage,
       handoffs,
       deviations,
       workerLogs,
@@ -830,6 +845,12 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     }
     const change = eventChange(event, state.nodes, state.edges)
     set({
+      edgeLineage: foldEdgeLineage(
+        state.edgeLineage,
+        event,
+        state.nodes,
+        state.edges,
+      ),
       events: boundedHistory([
         ...state.events.filter((item) => item.seq !== event.seq),
         event,
@@ -959,8 +980,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       downstream,
       kind: 'depends',
     } as const
-    const prepare = () =>
-      prepareStoreMutation('EDGE_ADDED', payload, { staleMode: 'silent' })
+    const prepare = () => prepareStoreMutation('EDGE_ADDED', payload, {
+      staleMode: 'silent',
+    })
     const touched = state.nodes.filter(
       (node) => node.id === upstream || node.id === downstream,
     )
@@ -1058,6 +1080,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           title: plan.title,
           ids: plan.ids,
           ...(plan.notice ? { notice: plan.notice } : {}),
+          ...(plan.proposal ? { proposal: plan.proposal } : {}),
           apply: plan.prepare(),
         }
       },
@@ -1069,6 +1092,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       baseCursor: operation.baseCursor,
       blastRadius: getBlastRadius(operation.ids, state.nodes, state.edges),
       notice: operation.notice,
+      proposal: operation.proposal,
     }
     set({ structuralPreview })
     return structuralPreview
@@ -1094,6 +1118,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         baseCursor: pending.baseCursor,
         blastRadius: getBlastRadius(pending.ids, get().nodes, get().edges),
         notice: pending.notice,
+        proposal: pending.proposal,
       }
       set({ structuralPreview })
       return { applied: false, preview: structuralPreview }
@@ -1171,18 +1196,6 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
   setHighlights(highlightedIds) {
     set({ highlightedIds })
-  },
-  recordEdgeLineage(lineage) {
-    set((state) => ({
-      edgeLineage: Object.fromEntries(
-        Object.entries({ ...state.edgeLineage, ...lineage }).map(
-          ([edgeId, ancestors]) => [
-            edgeId,
-            [...new Set(ancestors.flatMap((id) => [id, ...(state.edgeLineage[id] ?? [])]))],
-          ],
-        ),
-      ),
-    }))
   },
   setContextualToolsDegraded(contextualToolsDegraded) {
     set({ contextualToolsDegraded })

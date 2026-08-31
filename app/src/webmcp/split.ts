@@ -15,7 +15,13 @@ export interface SplitPlan {
   children: TaskNode[]
   entryIds: string[]
   terminalIds: string[]
-  edgeLineage: Record<string, string[]>
+  edgeRemap: {
+    edgeId: string
+    upstream: string
+    downstream: string
+    kind: GraphEdge['kind']
+    newTarget: string
+  }[]
 }
 
 export function buildSplitPlan(
@@ -70,46 +76,35 @@ export function buildSplitPlan(
   const incident = edges.filter(
     (edge) => edge.upstream === parent.id || edge.downstream === parent.id,
   )
-  const remapTargets = incident.map((edge) => ({
-    edge,
-    targets:
+  const edgeRemap = incident.map((edge) => {
+    const newTarget = (
       edge.kind === 'conflicts'
         ? children.map((child) => child.id)
         : edge.downstream === parent.id
           ? entryIds
-          : terminalIds,
-  }))
+          : terminalIds
+    )[0]!
+    return {
+      edgeId: edge.edge_id,
+      upstream: edge.upstream === parent.id ? newTarget : edge.upstream,
+      downstream: edge.downstream === parent.id ? newTarget : edge.downstream,
+      kind: edge.kind,
+      newTarget,
+    }
+  })
   const batch: MutationBatchItem[] = [
     {
       type: 'TASK_SPLIT',
       payload: {
         parent_id: parent.id,
         children,
-        edge_remap: remapTargets.map(({ edge, targets }) => ({
-          edge_id: edge.edge_id,
-          new_target: targets[0]!,
+        edge_remap: edgeRemap.map((remap) => ({
+          edge_id: remap.edgeId,
+          new_target: remap.newTarget,
         })),
       },
     },
   ]
-  const edgeLineage: Record<string, string[]> = {}
-
-  for (const { edge, targets } of remapTargets) {
-    batch.push({ type: 'EDGE_REMOVED', payload: { edge_id: edge.edge_id } })
-    targets.forEach((target, index) => {
-      const edgeId = index === 0 ? edge.edge_id : crypto.randomUUID()
-      if (edgeId !== edge.edge_id) edgeLineage[edgeId] = [edge.edge_id]
-      batch.push({
-        type: 'EDGE_ADDED',
-        payload: {
-          edge_id: edgeId,
-          upstream: edge.upstream === parent.id ? target : edge.upstream,
-          downstream: edge.downstream === parent.id ? target : edge.downstream,
-          kind: edge.kind,
-        },
-      })
-    })
-  }
   for (const subtask of subtasks) {
     for (const dependency of subtask.deps) {
       batch.push({
@@ -124,5 +119,5 @@ export function buildSplitPlan(
     }
   }
 
-  return { batch, children, entryIds, terminalIds, edgeLineage }
+  return { batch, children, entryIds, terminalIds, edgeRemap }
 }

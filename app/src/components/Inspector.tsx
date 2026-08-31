@@ -1,6 +1,5 @@
 import { useMemo, useState } from 'react'
 import {
-  annotationsForTarget,
   describeEvent,
   eventTargetsNode,
   getDisplayState,
@@ -98,6 +97,11 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
     : undefined
   const downstream = edge
     ? nodes.find((candidate) => candidate.id === edge.downstream)
+    : undefined
+  const edgeParent = edge
+    ? nodes.find(
+        (candidate) => candidate.id === edgeLineage[edge.edge_id]?.parent_id,
+      )
     : undefined
   const decisions = relevantEvents.filter((event) =>
     ['APPROVAL_CREATED', 'APPROVED', 'REJECTED', 'ANNOTATED'].includes(event.type),
@@ -249,15 +253,17 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
                 ? `${downstream?.title} cannot finish its intended work until ${upstream?.title} has delivered the prerequisite.`
                 : `${upstream?.title} and ${downstream?.title} touch overlapping implementation areas. They may proceed in parallel, but their workers should coordinate before handoff.`}
             </p>
-            {annotationsForTarget(
-              annotations,
-              edgeLineage,
-              edge.edge_id,
-            ).map((annotation) => (
+            {(annotations[edge.edge_id] ?? []).map((annotation) => (
               <ProseRecord key={`${annotation.ts}-${annotation.note}`}>
                 {annotation.note}
               </ProseRecord>
             ))}
+            {edgeParent && (
+              <ProseRecord>
+                This relationship was reattached when “{edgeParent.title}” was
+                split.
+              </ProseRecord>
+            )}
           </>
         )}
 

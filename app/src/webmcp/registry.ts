@@ -62,6 +62,17 @@ export interface ToolOutcome {
   preview?: {
     op_token: string
     blast_radius: { stale: string[]; pausing: string[] }
+    proposal?: {
+      children: { id: string; title: string }[]
+      edge_remap: {
+        edge_id: string
+        upstream: string
+        upstream_title: string
+        downstream: string
+        downstream_title: string
+        kind: 'depends' | 'conflicts'
+      }[]
+    }
   }
 }
 
