@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/http.ts",
-    "start": "node dist/http.js",
+    "start": "node dist/src/http.js",
     "test": "vitest run"
   },
   "dependencies": {
