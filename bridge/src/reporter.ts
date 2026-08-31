@@ -25,7 +25,10 @@ export function reporterPayload(
 }
 
 export class ReporterClient {
-  constructor(private readonly config: BridgeConfig) {}
+  constructor(
+    private readonly config: BridgeConfig,
+    private readonly dryRun = false,
+  ) {}
 
   get url(): string {
     return `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/report`;
@@ -61,17 +64,20 @@ export class ReporterClient {
   }
 
   async post(event: ReporterEvent): Promise<number> {
+    const body = this.dryRun && event.type === "JOURNAL_NOTE" && typeof event.payload.text === "string"
+      ? { ...event, payload: { ...event.payload, text: `DRY-RUN SIMULATION: ${event.payload.text}` } }
+      : event;
     const response = await fetch(this.url, {
       method: "POST",
       headers: {
         authorization: `Bearer ${this.config.reporterCredential}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify(event),
+      body: JSON.stringify(body),
     });
     if (!response.ok) throw new Error(`reporter POST failed (${response.status}): ${await response.text()}`);
-    const body = (await response.json()) as { seq?: unknown };
-    if (!Number.isSafeInteger(body.seq)) throw new Error("reporter POST response did not contain a sequence");
-    return body.seq as number;
+    const responseBody = (await response.json()) as { seq?: unknown };
+    if (!Number.isSafeInteger(responseBody.seq)) throw new Error("reporter POST response did not contain a sequence");
+    return responseBody.seq as number;
   }
 }

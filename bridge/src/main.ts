@@ -1,12 +1,15 @@
+import { pathToFileURL } from "node:url";
+
 import { MissionGraphBridge } from "./bridge.js";
 import { loadConfig } from "./config.js";
 import { consoleLogger } from "./types.js";
 
-function argumentsFrom(argv: string[]): { dryRun: boolean; configPath?: string } {
+export function argumentsFrom(argv: string[]): { dryRun: boolean; configPath?: string } {
   let dryRun = false;
   let configPath: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
+    if (argument === "--") continue;
     if (argument === "--dry-run") dryRun = true;
     else if (argument === "--config") {
       configPath = argv[index + 1];
@@ -23,17 +26,42 @@ async function main(): Promise<void> {
   const options = argumentsFrom(process.argv.slice(2));
   const config = await loadConfig(options.configPath);
   const bridge = new MissionGraphBridge(config, consoleLogger, options.dryRun);
-  await bridge.start();
-  consoleLogger.info(`bridge running for project ${config.projectId}${options.dryRun ? " in dry-run mode" : ""}`);
-  await new Promise<void>((resolvePromise) => {
-    const stop = (): void => resolvePromise();
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
+  let stopRequested = false;
+  let shutdown: Promise<void> | undefined;
+  let resolveStop!: () => void;
+  const stopped = new Promise<void>((resolvePromise) => {
+    resolveStop = resolvePromise;
   });
-  await bridge.stop();
+  const stop = (): void => {
+    if (stopRequested) return;
+    stopRequested = true;
+    shutdown = bridge.stop();
+    void shutdown.then(resolveStop, resolveStop);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    try {
+      await bridge.start();
+    } catch (error) {
+      if (stopRequested) return;
+      throw error;
+    }
+    if (!stopRequested) {
+      consoleLogger.info(`bridge running for project ${config.projectId}${options.dryRun ? " in dry-run mode" : ""}`);
+    }
+    await stopped;
+  } finally {
+    process.removeListener("SIGINT", stop);
+    process.removeListener("SIGTERM", stop);
+    if (shutdown) await shutdown;
+    else await bridge.stop();
+  }
 }
 
-main().catch((error: unknown) => {
-  process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error: unknown) => {
+    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { reporterPayload } from "../src/reporter.js";
+import { ReporterClient, reporterPayload } from "../src/reporter.js";
 import { workerBrief } from "../src/prompts.js";
+import { config } from "./helpers.js";
 
 describe("reporter contract", () => {
   it("builds exact fleet event envelopes", () => {
@@ -54,5 +55,20 @@ describe("reporter contract", () => {
     expect(brief).toContain("WORKER_LOG");
     expect(brief).toContain("HANDOFF_FILED");
     expect(brief).toContain("APPROVAL_CREATED exactly once");
+  });
+
+  it("prefixes every dry-run journal write as simulated history", async () => {
+    let body: { payload?: { text?: string } } = {};
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body)) as typeof body;
+      return Response.json({ seq: 1 });
+    }));
+    try {
+      const reporter = new ReporterClient(config("/tmp/missiongraph-dry-run"), true);
+      await reporter.post(reporterPayload("supervisor", "JOURNAL_NOTE", { text: "Synthetic note." }));
+      expect(body.payload?.text).toBe("DRY-RUN SIMULATION: Synthetic note.");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

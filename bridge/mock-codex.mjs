@@ -5,14 +5,34 @@ import { createHash } from "node:crypto";
 const args = process.argv.slice(2);
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const agent = (value) => emit({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(value) } });
+const includesPair = (flag, value) => args.some((argument, index) => argument === flag && args[index + 1] === value);
+const finish = async () => {
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+};
+
+for (const name of ["REPORTER_TOKEN", "MG_REPORTER_CREDENTIAL", "MG_VISITOR_TOKEN"]) {
+  if (process.env[name] !== undefined) {
+    process.stderr.write(`forbidden inherited environment variable: ${name}\n`);
+    process.exit(3);
+  }
+}
 
 if (args[0] !== "exec") process.exit(2);
 
 if (args[1] === "resume") {
   const threadId = args[2];
   const message = args[3] ?? "";
+  const supervisor = threadId?.startsWith("mock-supervisor");
+  if (!includesPair("-s", supervisor ? "read-only" : "workspace-write")) process.exit(4);
+  if (supervisor && args.includes("sandbox_workspace_write.network_access=true")) process.exit(5);
+  if (!supervisor && !args.includes("sandbox_workspace_write.network_access=true")) process.exit(6);
   emit({ type: "thread.started", thread_id: threadId });
-  if (threadId === "mock-supervisor") {
+  if (supervisor) {
+    if (threadId === "mock-supervisor-malformed" || message.startsWith("FORMAT CORRECTION:")) {
+      emit({ type: "item.completed", item: { type: "agent_message", text: "not-json" } });
+      await finish();
+      process.exit(0);
+    }
     let envelopes = [];
     try {
       const parsed = JSON.parse(message);
@@ -20,7 +40,12 @@ if (args[1] === "resume") {
     } catch {
       envelopes = [];
     }
+    let malformed = false;
     const actions = envelopes.flatMap((envelope) => {
+      if (envelope?.type === "ANNOTATED" && envelope.note === "MALFORMED_DECISION_TEST") {
+        malformed = true;
+        return [];
+      }
       if (envelope?.type === "DISPATCHED" && typeof envelope.node_id === "string") {
         return [{
           act: "spawn_worker",
@@ -33,19 +58,24 @@ if (args[1] === "resume") {
       }
       return [];
     });
-    agent({ actions });
+    if (malformed) emit({ type: "item.completed", item: { type: "agent_message", text: "not-json" } });
+    else agent({ actions });
   } else {
     agent({ worker_ack: true });
   }
+  await finish();
   process.exit(0);
 }
 
 const brief = args[1] ?? "";
 if (brief.startsWith("MISSIONGRAPH SUPERVISOR")) {
+  if (!includesPair("-s", "read-only") || args.includes("sandbox_workspace_write.network_access=true")) process.exit(7);
   emit({ type: "thread.started", thread_id: "mock-supervisor" });
   agent({ actions: [] });
 } else {
+  if (!includesPair("-s", "workspace-write") || !args.includes("sandbox_workspace_write.network_access=true")) process.exit(8);
   const nodeId = brief.match(/Node ID: ([^\n]+)/)?.[1] ?? createHash("sha1").update(brief).digest("hex").slice(0, 8);
   emit({ type: "thread.started", thread_id: `mock-worker-${nodeId}` });
   agent({ worker_complete: true });
 }
+await finish();

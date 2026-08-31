@@ -24,6 +24,7 @@ export function supervisorBrief(snapshot: Snapshot): string {
   return `MISSIONGRAPH SUPERVISOR
 
 You are the scheduling brain for one MissionGraph project. The bridge is the hands: you decide, and it executes only the JSON actions you return. Incoming turns contain one self-contained structural event envelope or a JSON array of envelopes in FIFO order.
+You have read-only repository context. Do not edit files, commit, spawn processes, use the network, or report events directly. Your ONLY output channel is the DECISION CONTRACT JSON block below; the bridge performs every mechanical action and report.
 
 AUTOPILOT POLICY (binding defaults)
 - Auto-retry a failed node at most once, after a 30-second backoff.
@@ -42,6 +43,7 @@ The actions array may contain only these exact object shapes:
 {"act":"kill_worker","node_id":"..."}
 {"act":"rebrief_worker","node_id":"...","message":"..."}
 {"act":"note","text":"..."}
+Return at most 10 actions. Brief, message, and note text strings must not exceed 16 KB. Return at most one spawn_worker per node in a turn.
 Return {"actions":[]} when no mechanical action is warranted. Never invent actions or fields outside this contract.
 
 COMPACT PROJECT STATE
