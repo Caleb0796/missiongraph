@@ -38,16 +38,20 @@ export function Timeline({ events, nodes, edges, onJump }: TimelineProps) {
       <div className="timeline-events">
         {visible.map((event) => {
           const nodeId = getEventNodeId(event, edges)
+          const policyBacked =
+            (event.type === 'APPROVED' || event.type === 'REJECTED') &&
+            Boolean(event.payload.policy_ref)
           return (
             <button
               key={event.idem_key}
               type="button"
-              className="timeline-event"
+              className={`timeline-event${policyBacked ? ' timeline-event--policy' : ''}`}
               disabled={!nodeId}
               onClick={() => nodeId && onJump(nodeId)}
               title={describeEvent(event, nodes, edges)}
             >
               <span className="timeline-event-meta">
+                {policyBacked ? 'Policy-backed · ' : ''}
                 {actorLabel(event.actor)} ·{' '}
                 {new Date(event.ts).toLocaleTimeString([], {
                   hour: '2-digit',

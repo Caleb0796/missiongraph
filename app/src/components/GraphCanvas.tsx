@@ -17,10 +17,20 @@ import {
   getCriticalPath,
   getDisplayState,
   getEventNodeId,
+  humanizeIdleAge,
+  idleRadar,
   type DisplayState,
 } from '../model/graph'
 import { useMissionStore } from '../store/mission-store'
-import { resetMissionDemo } from '../transport/client'
+import {
+  copyCurrentMissionLink,
+  openStoredMission,
+  reconnectMission,
+  resetMissionDemo,
+  startFreshMissionCopy,
+} from '../transport/client'
+import { skewCorrectedNow } from '../transport/client-logic'
+import { FlightPanel } from './FlightPanel'
 import { Inspector } from './Inspector'
 import { PulseBar } from './PulseBar'
 import { TaskNodeCard, type TaskFlowNode } from './TaskNodeCard'
@@ -69,6 +79,10 @@ function MissionBoard() {
   const cameraRequest = useMissionStore((state) => state.cameraRequest)
   const connectionMode = useMissionStore((state) => state.connectionMode)
   const connectionMessage = useMissionStore((state) => state.connectionMessage)
+  const clockSkewMs = useMissionStore((state) => state.clockSkewMs)
+  const linkErrorHasStoredIdentity = useMissionStore(
+    (state) => state.linkErrorHasStoredIdentity,
+  )
   const projectId = useMissionStore((state) => state.projectId)
   const toast = useMissionStore((state) => state.toast)
   const structuralPreview = useMissionStore((state) => state.structuralPreview)
@@ -88,11 +102,20 @@ function MissionBoard() {
     Record<string, { width: number; height: number }>
   >({})
   const [replaying, setReplaying] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
   const hasLaidOut = useRef(false)
   const { fitView, setCenter } = useReactFlow<TaskFlowNode, Edge>()
   const criticalPath = useMemo(
     () => getCriticalPath(nodes, edges),
     [edges, nodes],
+  )
+  const correctedNow = skewCorrectedNow(now, clockSkewMs)
+  const idleNodeIds = useMemo(
+    () =>
+      new Set(
+        idleRadar(nodes, edges, readySince, correctedNow).map((node) => node.id),
+      ),
+    [correctedNow, edges, nodes, readySince],
   )
 
   const flowEdges: Edge[] = useMemo(
@@ -158,7 +181,10 @@ function MissionBoard() {
                 (approval) =>
                   approval.node_id === node.id && approval.status === 'pending',
               ),
-            idleFor: displayState === 'ready' ? readySince[node.id] : undefined,
+            idleFor:
+              idleNodeIds.has(node.id) && readySince[node.id]
+                ? humanizeIdleAge(readySince[node.id], correctedNow)
+                : undefined,
             critical: criticalPath.nodeIds.includes(node.id),
             highlighted: highlightedIds.includes(node.id),
           },
@@ -170,13 +196,20 @@ function MissionBoard() {
       dragPositions,
       edges,
       highlightedIds,
+      idleNodeIds,
       nodeDims,
       nodes,
       positions,
       readySince,
       selectedId,
+      correctedNow,
     ],
   )
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   useEffect(() => {
     hasLaidOut.current = false
@@ -307,6 +340,25 @@ function MissionBoard() {
     setReplaying(false)
   }
 
+  async function copyMissionLink() {
+    try {
+      const result = await copyCurrentMissionLink()
+      useMissionStore
+        .getState()
+        .showToast(
+          result.copied ? 'Mission link copied' : 'Copy this mission link manually',
+          'info',
+          result.copied
+            ? 'anyone with this link can act on this mission'
+            : result.url,
+        )
+    } catch (error) {
+      useMissionStore
+        .getState()
+        .showToast(error instanceof Error ? error.message : String(error), 'error')
+    }
+  }
+
   const counts = useMemo(() => {
     const base: Record<DisplayState, number> = {
       queued: 0,
@@ -331,9 +383,14 @@ function MissionBoard() {
         counts={counts}
         onCatchUp={() => void replayCatchUp()}
         onReset={() => void resetMissionDemo()}
+        onCopyMissionLink={() => void copyMissionLink()}
+        onReconnect={() => void reconnectMission()}
+        onStartFreshMission={() => void startFreshMissionCopy()}
+        onOpenStoredMission={() => void openStoredMission()}
         replaying={replaying}
         connectionMode={connectionMode}
         connectionMessage={connectionMessage}
+        linkErrorHasStoredIdentity={linkErrorHasStoredIdentity}
       />
       <div className="canvas-stage">
         <ReactFlow<TaskFlowNode, Edge>
@@ -373,6 +430,7 @@ function MissionBoard() {
           <span><i className="legend-line legend-line--conflict" />File conflict</span>
           <span className="hidden xl:inline">Drag to arrange · connect ports to depend · delete to tombstone</span>
         </div>
+        <FlightPanel now={correctedNow} />
         {structuralPreview && (
           <section className="structural-confirm" role="dialog" aria-modal="true">
             <p className="structural-confirm-kicker">Blast-radius preview</p>
@@ -416,7 +474,8 @@ function MissionBoard() {
       />
       {toast && (
         <div className={`mission-toast mission-toast--${toast.tone}`} role="status">
-          {toast.message}
+          <strong>{toast.message}</strong>
+          {toast.caption && <span>{toast.caption}</span>}
         </div>
       )}
     </main>

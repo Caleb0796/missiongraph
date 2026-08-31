@@ -7,6 +7,7 @@ import {
 import {
   boundedHistory,
   describeEvent,
+  fixtureRankedPendingApprovals,
   getBlastRadius,
   getCriticalPath,
   isNonIdle,
@@ -20,11 +21,17 @@ import type {
   EventPayloadMap,
   EvType,
   GraphEdge,
+  GraphDigest,
   GraphSnapshotState,
   Handoff,
   MissionEvent,
   TaskNode,
 } from '../model/types'
+import {
+  eventBelongsToProject,
+  shouldApplyDigest,
+  shouldApplySnapshot,
+} from '../transport/client-logic'
 
 interface Point {
   x: number
@@ -35,6 +42,7 @@ interface Toast {
   id: string
   tone: 'info' | 'error'
   message: string
+  caption?: string
 }
 
 interface CameraRequest {
@@ -48,7 +56,7 @@ interface StructuralPreview {
   blastRadius: { stale: string[]; pausing: string[] }
 }
 
-export type ConnectionMode = 'loading' | 'live' | 'fixture'
+export type ConnectionMode = 'loading' | 'live' | 'fixture' | 'link-error'
 
 export interface MutationOptions {
   actor?: 'human' | 'browser_agent'
@@ -61,6 +69,12 @@ export type MutationSender = <T extends EvType>(
   options?: MutationOptions,
 ) => Promise<number>
 
+export type MutationPreparer = <T extends EvType>(
+  type: T,
+  payload: EventPayloadMap[T],
+  options?: MutationOptions,
+) => () => Promise<number>
+
 interface MissionState {
   nodes: TaskNode[]
   edges: GraphEdge[]
@@ -69,6 +83,10 @@ interface MissionState {
   positions: Record<string, Point>
   tombstones: string[]
   approvals: Record<string, Approval>
+  approvalRanking: GraphDigest['summary']['pending_approvals']
+  approvalRankingSource: 'server' | 'fixture' | 'pending'
+  approvalRankingStale: boolean
+  policies: GraphSnapshotState['policies']
   annotations: GraphSnapshotState['annotations']
   handoffs: Record<string, Handoff>
   deviations: GraphSnapshotState['deviations']
@@ -84,6 +102,8 @@ interface MissionState {
   connectionMode: ConnectionMode
   connectionMessage: string
   sessionId: string
+  clockSkewMs: number
+  linkErrorHasStoredIdentity: boolean
   hydratePositions: (positions: Record<string, Point>) => void
   applySnapshot: (
     snapshot: GraphSnapshotState,
@@ -92,9 +112,17 @@ interface MissionState {
   ) => void
   applyEvent: (event: MissionEvent) => void
   recordHistoricalEvent: (event: MissionEvent) => void
-  applyDigestChanges: (changes: DigestChange[], cursor: string) => void
+  applyDigestChanges: (
+    projectId: string,
+    changes: DigestChange[],
+    cursor: string,
+  ) => void
+  applyServerDigest: (projectId: string, digest: GraphDigest) => void
+  markApprovalRankingStale: (projectId: string) => void
   useFixture: (message: string) => void
   setConnectionMode: (mode: ConnectionMode, message: string) => void
+  setClockSkew: (clockSkewMs: number) => void
+  showInvalidMissionLink: (hasStoredIdentity: boolean) => void
   setSessionId: (sessionId: string) => void
   moveNode: (nodeId: string, point: Point) => void
   connectNodes: (upstream: string, downstream: string) => boolean
@@ -102,16 +130,17 @@ interface MissionState {
   confirmStructural: () => void
   cancelStructural: () => void
   select: (id: string | null) => void
-  approve: (nodeId: string) => void
-  reject: (nodeId: string) => void
+  approve: (nodeId: string, policyRef?: string) => void
+  reject: (nodeId: string, policyRef?: string) => void
   dispatch: (nodeId: string) => void
   setHighlights: (ids: string[]) => void
   requestCamera: (ids: string[]) => void
-  showToast: (message: string, tone?: Toast['tone']) => void
+  showToast: (message: string, tone?: Toast['tone'], caption?: string) => void
   clearToast: () => void
 }
 
 let mutationSender: MutationSender | null = null
+let mutationPreparer: MutationPreparer | null = null
 let pendingStructuralOperation: {
   title: string
   ids: string[]
@@ -119,8 +148,12 @@ let pendingStructuralOperation: {
   apply: () => Promise<number>
 } | null = null
 
-export function configureMutationSender(sender: MutationSender) {
+export function configureMutationSender(
+  sender: MutationSender,
+  preparer: MutationPreparer,
+) {
   mutationSender = sender
+  mutationPreparer = preparer
 }
 
 function sendMutation<T extends EvType>(
@@ -134,6 +167,34 @@ function sendMutation<T extends EvType>(
   return mutationSender(type, payload, options)
 }
 
+function prepareStoreMutation<T extends EvType>(
+  type: T,
+  payload: EventPayloadMap[T],
+  options?: MutationOptions,
+) {
+  if (!mutationPreparer) {
+    return () => Promise.reject(new Error('MissionGraph transport is not ready.'))
+  }
+  return mutationPreparer(type, payload, options)
+}
+
+function mutationErrorWasNotified(error: unknown) {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'notified' in error &&
+    error.notified === true
+  )
+}
+
+function reportMutationError(error: unknown, state: MissionState) {
+  if (mutationErrorWasNotified(error)) return
+  state.showToast(
+    error instanceof Error ? error.message : String(error),
+    'error',
+  )
+}
+
 function fixtureState() {
   const nodeById = new Map<string, TaskNode>()
   const edgeById = new Map<string, GraphEdge>()
@@ -143,6 +204,7 @@ function fixtureState() {
   const deviations: GraphSnapshotState['deviations'] = {}
   const workerLogs: Record<string, string[]> = {}
   const annotations: GraphSnapshotState['annotations'] = {}
+  const policies: GraphSnapshotState['policies'] = {}
 
   for (const event of shortyEvents) {
     switch (event.type) {
@@ -174,6 +236,13 @@ function fixtureState() {
         if (node) nodeById.set(node.id, { ...node, state: 'running' })
         break
       }
+      case 'POLICY_STATED':
+        policies[event.payload.policy_ref] = {
+          text: event.payload.text,
+          session_id: event.payload.session_id,
+          stated_at: event.ts,
+        }
+        break
       case 'ANNOTATED':
         ;(annotations[event.payload.target_id] ??= []).push({
           actor: event.actor,
@@ -219,13 +288,32 @@ function fixtureState() {
       },
     ]),
   )
+  const nodes = [...nodeById.values()]
+  const edges = [...edgeById.values()]
+  const approvalRanking = fixtureRankedPendingApprovals(
+    approvals,
+    nodes,
+    edges,
+  ).map((approval) => ({
+    approval_id: approval.id,
+    node_id: approval.node_id,
+    node_title:
+      nodes.find((node) => node.id === approval.node_id)?.title ?? approval.node_id,
+    summary: approval.summary,
+    delay_impact_min: approval.delayImpactMin,
+    age_since: approval.created_at,
+  }))
 
   return {
-    nodes: [...nodeById.values()],
-    edges: [...edgeById.values()],
+    nodes,
+    edges,
     positions,
     tombstones,
     approvals,
+    approvalRanking,
+    approvalRankingSource: 'fixture' as const,
+    approvalRankingStale: false,
+    policies,
     annotations,
     handoffs,
     deviations,
@@ -249,6 +337,7 @@ function snapshotToView(snapshot: GraphSnapshotState) {
     positions: snapshot.positions,
     tombstones: Object.keys(snapshot.tombstones),
     approvals: snapshot.approvals,
+    policies: snapshot.policies,
     annotations: snapshot.annotations,
     handoffs: snapshot.handoffs,
     deviations: snapshot.deviations,
@@ -297,13 +386,27 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   connectionMode: 'loading',
   connectionMessage: 'Connecting to the live project…',
   sessionId: '',
+  clockSkewMs: 0,
+  linkErrorHasStoredIdentity: false,
   hydratePositions(positions) {
     set((state) => ({ positions: { ...positions, ...state.positions } }))
   },
   applySnapshot(snapshot, cursor, projectId) {
     set((state) => {
+      if (
+        !shouldApplySnapshot(
+          state.projectId,
+          state.cursor,
+          projectId,
+          cursor,
+        )
+      ) {
+        return state
+      }
       const view = snapshotToView(snapshot)
-      const firstLiveSnapshot = state.connectionMode === 'loading'
+      const projectChanged = state.projectId !== projectId
+      const firstLiveSnapshot =
+        projectChanged || state.connectionMode === 'fixture'
       const selectedExists =
         view.nodes.some((node) => node.id === state.selectedId) ||
         view.edges.some((edge) => edge.edge_id === state.selectedId)
@@ -313,15 +416,24 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         cursor,
         events: firstLiveSnapshot ? [] : state.events,
         changes: firstLiveSnapshot ? [] : state.changes,
+        approvalRanking: projectChanged ? [] : state.approvalRanking,
+        approvalRankingSource: projectChanged
+          ? ('pending' as const)
+          : state.approvalRankingSource,
+        approvalRankingStale: projectChanged
+          ? false
+          : state.approvalRankingStale,
         selectedId: selectedExists ? state.selectedId : null,
         connectionMode: 'live',
         connectionMessage: 'Live server',
+        linkErrorHasStoredIdentity: false,
       }
     })
   },
   applyEvent(event) {
     const state = get()
-    if (event.seq <= Number(state.cursor)) return
+    if (!eventBelongsToProject(state.projectId, event.project_id)) return
+    if (event.seq !== Number(state.cursor) + 1) return
 
     const previousNodes = state.nodes
     const previousEdges = state.edges
@@ -330,6 +442,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     let positions = state.positions
     let tombstones = state.tombstones
     let approvals = state.approvals
+    let policies = state.policies
     let annotations = state.annotations
     let handoffs = state.handoffs
     let deviations = state.deviations
@@ -400,6 +513,16 @@ export const useMissionStore = create<MissionState>((set, get) => ({
             resolved_at: event.ts,
             policy_ref: event.payload.policy_ref,
             reason: event.payload.reason,
+          },
+        }
+        break
+      case 'POLICY_STATED':
+        policies = {
+          ...policies,
+          [event.payload.policy_ref]: {
+            text: event.payload.text,
+            session_id: event.payload.session_id,
+            stated_at: event.ts,
           },
         }
         break
@@ -497,12 +620,27 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     )
 
     const change = eventChange(event, nodes, edges)
+    const approvalRanking =
+      state.connectionMode === 'fixture'
+        ? fixtureRankedPendingApprovals(approvals, nodes, edges).map((approval) => ({
+            approval_id: approval.id,
+            node_id: approval.node_id,
+            node_title:
+              nodes.find((node) => node.id === approval.node_id)?.title ??
+              approval.node_id,
+            summary: approval.summary,
+            delay_impact_min: approval.delayImpactMin,
+            age_since: approval.created_at,
+          }))
+        : state.approvalRanking
     set({
       nodes,
       edges,
       positions,
       tombstones,
       approvals,
+      approvalRanking,
+      policies,
       annotations,
       handoffs,
       deviations,
@@ -525,6 +663,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
   recordHistoricalEvent(event) {
     const state = get()
+    if (!eventBelongsToProject(state.projectId, event.project_id)) return
     if (event.seq > Number(state.cursor)) {
       state.applyEvent(event)
       return
@@ -541,16 +680,48 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       ]),
     })
   },
-  applyDigestChanges(changes, cursor) {
-    set((state) => ({
-      changes: boundedHistory(
-        [...state.changes, ...changes].filter(
-          (change, index, all) =>
-            all.findIndex((candidate) => candidate.seq === change.seq) === index,
-        ),
-      ),
-      cursor,
-    }))
+  applyDigestChanges(projectId, changes, cursor) {
+    set((state) =>
+      !shouldApplyDigest(state.projectId, state.cursor, projectId, cursor)
+        ? state
+        : {
+            changes: boundedHistory(
+              [...state.changes, ...changes].filter(
+                (change, index, all) =>
+                  all.findIndex((candidate) => candidate.seq === change.seq) ===
+                  index,
+              ),
+            ),
+            cursor,
+          },
+    )
+  },
+  applyServerDigest(projectId, digest) {
+    set((state) => {
+      if (
+        state.projectId !== projectId ||
+        !shouldApplySnapshot(
+          state.projectId,
+          state.cursor,
+          projectId,
+          digest.cursor,
+        )
+      ) {
+        return state
+      }
+      return {
+        approvalRanking: digest.summary.pending_approvals,
+        approvalRankingSource: 'server',
+        approvalRankingStale: false,
+      }
+    })
+  },
+  markApprovalRankingStale(projectId) {
+    set((state) =>
+      state.projectId === projectId
+        ? { approvalRankingStale: true }
+        : state,
+    )
   },
   useFixture(message) {
     set({
@@ -562,10 +733,28 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       cursor: String(shortyEvents.at(-1)?.seq ?? 0),
       connectionMode: 'fixture',
       connectionMessage: message,
+      clockSkewMs: 0,
+      linkErrorHasStoredIdentity: false,
     })
   },
   setConnectionMode(connectionMode, connectionMessage) {
-    set({ connectionMode, connectionMessage })
+    set({
+      connectionMode,
+      connectionMessage,
+      ...(connectionMode === 'link-error'
+        ? {}
+        : { linkErrorHasStoredIdentity: false }),
+    })
+  },
+  setClockSkew(clockSkewMs) {
+    set({ clockSkewMs })
+  },
+  showInvalidMissionLink(linkErrorHasStoredIdentity) {
+    set({
+      connectionMode: 'link-error',
+      connectionMessage: 'Expired or invalid mission link',
+      linkErrorHasStoredIdentity,
+    })
   },
   setSessionId(sessionId) {
     set({ sessionId })
@@ -576,9 +765,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       'NODE_MOVED',
       { node_id: nodeId, x: point.x, y: point.y },
       { debounceKey: `move:${nodeId}` },
-    ).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    ).catch((error: unknown) => reportMutationError(error, get()))
   },
   connectNodes(upstream, downstream) {
     const state = get()
@@ -606,7 +793,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       downstream,
       kind: 'depends',
     } as const
-    const apply = () => sendMutation('EDGE_ADDED', payload)
+    const apply = prepareStoreMutation('EDGE_ADDED', payload)
     const touched = state.nodes.filter(
       (node) => node.id === upstream || node.id === downstream,
     )
@@ -627,9 +814,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       })
       return true
     }
-    void apply().catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    void apply().catch((error: unknown) => reportMutationError(error, get()))
     return true
   },
   removeSelected() {
@@ -640,9 +825,12 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       (candidate) => candidate.edge_id === state.selectedId,
     )
     const apply = node
-      ? () => sendMutation('TASK_REMOVED', { node_id: node.id, tombstone: true })
+      ? prepareStoreMutation('TASK_REMOVED', {
+          node_id: node.id,
+          tombstone: true,
+        })
       : edge
-        ? () => sendMutation('EDGE_REMOVED', { edge_id: edge.edge_id })
+        ? prepareStoreMutation('EDGE_REMOVED', { edge_id: edge.edge_id })
         : null
     if (!apply) return
     const ids = node ? [node.id] : [edge!.upstream, edge!.downstream]
@@ -673,9 +861,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       })
       return
     }
-    void apply().catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    void apply().catch((error: unknown) => reportMutationError(error, get()))
   },
   confirmStructural() {
     const pending = pendingStructuralOperation
@@ -699,7 +885,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     pendingStructuralOperation = null
     set({ structuralPreview: null })
     void pending.apply().catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
+      reportMutationError(error, get()),
     )
   },
   cancelStructural() {
@@ -713,11 +899,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     void sendMutation('SELECTION_CHANGED', {
       client_id: sessionId,
       selected: id ? [id] : [],
-    }).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    }).catch((error: unknown) => reportMutationError(error, get()))
   },
-  approve(nodeId) {
+  approve(nodeId, policyRef) {
     const approval = Object.values(get().approvals).find(
       (item) => item.node_id === nodeId && item.status === 'pending',
     )
@@ -726,11 +910,10 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       approval_id: approval.id,
       node_id: nodeId,
       rationale: 'Approved from the MissionGraph dossier after review.',
-    }).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+      ...(policyRef ? { policy_ref: policyRef } : {}),
+    }).catch((error: unknown) => reportMutationError(error, get()))
   },
-  reject(nodeId) {
+  reject(nodeId, policyRef) {
     const approval = Object.values(get().approvals).find(
       (item) => item.node_id === nodeId && item.status === 'pending',
     )
@@ -739,17 +922,14 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       approval_id: approval.id,
       node_id: nodeId,
       reason: 'Returned from the MissionGraph dossier for another pass.',
-    }).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+      ...(policyRef ? { policy_ref: policyRef } : {}),
+    }).catch((error: unknown) => reportMutationError(error, get()))
   },
   dispatch(nodeId) {
     void sendMutation('DISPATCHED', {
       node_id: nodeId,
       bypass_cap: true,
-    }).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    }).catch((error: unknown) => reportMutationError(error, get()))
   },
   setHighlights(highlightedIds) {
     set({ highlightedIds })
@@ -757,8 +937,15 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   requestCamera(nodeIds) {
     set({ cameraRequest: { id: crypto.randomUUID(), nodeIds } })
   },
-  showToast(message, tone = 'info') {
-    set({ toast: { id: crypto.randomUUID(), message, tone } })
+  showToast(message, tone = 'info', caption) {
+    set({
+      toast: {
+        id: crypto.randomUUID(),
+        message,
+        tone,
+        ...(caption ? { caption } : {}),
+      },
+    })
   },
   clearToast() {
     set({ toast: null })

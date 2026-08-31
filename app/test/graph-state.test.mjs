@@ -2,10 +2,14 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  approvalQueueFromRanking,
   approvalsForNode,
   boundedHistory,
   eventTargetsNode,
+  fixtureRankedPendingApprovals,
   getBlastRadius,
+  humanizeIdleAge,
+  idleRadar,
   isPreviewStale,
   refreshReadySince,
 } from '../src/model/graph.ts'
@@ -98,5 +102,96 @@ test('history is bounded and node dossiers include annotations and all approvals
       'a',
     ).map((approval) => approval.id),
     ['earlier', 'later'],
+  )
+})
+
+test('flight queues rank delay before age and radar humanizes oldest idle work', () => {
+  const nodes = [
+    task('old-ready', 'queued', { assigned: false, ever_started: false }),
+    task('new-ready', 'queued', { assigned: false, ever_started: false }),
+    task('long-review', 'review', { estimate_min: 20 }),
+    task('short-review', 'review', { estimate_min: 5 }),
+  ]
+  const approvals = {
+    short: {
+      id: 'short',
+      node_id: 'short-review',
+      summary: 'Short review',
+      created_at: '2026-08-30T10:00:00.000Z',
+      created_seq: 1,
+      status: 'pending',
+    },
+    long: {
+      id: 'long',
+      node_id: 'long-review',
+      summary: 'Long review',
+      created_at: '2026-08-30T10:05:00.000Z',
+      created_seq: 2,
+      status: 'pending',
+    },
+  }
+  assert.deepEqual(
+    fixtureRankedPendingApprovals(approvals, nodes, []).map((item) => item.id),
+    ['long', 'short'],
+  )
+  const now = Date.parse('2026-08-30T11:00:00.000Z')
+  const readySince = {
+    'old-ready': '2026-08-30T10:20:00.000Z',
+    'new-ready': '2026-08-30T10:55:00.000Z',
+  }
+  assert.deepEqual(
+    idleRadar(nodes, [], readySince, now).map((item) => item.id),
+    ['old-ready'],
+  )
+  assert.equal(humanizeIdleAge(readySince['old-ready'], now), 'idle 40m')
+  assert.equal(humanizeIdleAge('17m', now), 'idle 17m')
+})
+
+test('approval queue consumes server ranking instead of local path weight', () => {
+  const approvals = {
+    locallyLong: {
+      id: 'locallyLong',
+      node_id: 'long',
+      summary: 'Locally long',
+      created_at: '2026-08-30T10:00:00.000Z',
+      created_seq: 1,
+      status: 'pending',
+    },
+    serverFirst: {
+      id: 'serverFirst',
+      node_id: 'short',
+      summary: 'Server says first',
+      created_at: '2026-08-30T10:01:00.000Z',
+      created_seq: 2,
+      status: 'pending',
+    },
+  }
+  const serverRanking = [
+    {
+      approval_id: 'serverFirst',
+      node_id: 'short',
+      node_title: 'Short',
+      summary: 'Server says first',
+      delay_impact_min: 90,
+      age_since: '2026-08-30T10:01:00.000Z',
+    },
+    {
+      approval_id: 'locallyLong',
+      node_id: 'long',
+      node_title: 'Long',
+      summary: 'Locally long',
+      delay_impact_min: 10,
+      age_since: '2026-08-30T10:00:00.000Z',
+    },
+  ]
+  assert.deepEqual(
+    approvalQueueFromRanking(approvals, serverRanking).map((item) => [
+      item.id,
+      item.delayImpactMin,
+    ]),
+    [
+      ['serverFirst', 90],
+      ['locallyLong', 10],
+    ],
   )
 })

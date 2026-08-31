@@ -6,9 +6,14 @@ interface PulseBarProps {
   counts: Record<DisplayState, number>
   onCatchUp: () => void
   onReset: () => void
+  onCopyMissionLink: () => void
+  onReconnect: () => void
+  onStartFreshMission: () => void
+  onOpenStoredMission: () => void
   replaying: boolean
   connectionMode: ConnectionMode
   connectionMessage: string
+  linkErrorHasStoredIdentity: boolean
 }
 
 function Stat({ label, value, tone }: { label: string; value: number; tone: string }) {
@@ -26,9 +31,14 @@ export function PulseBar({
   counts,
   onCatchUp,
   onReset,
+  onCopyMissionLink,
+  onReconnect,
+  onStartFreshMission,
+  onOpenStoredMission,
   replaying,
   connectionMode,
   connectionMessage,
+  linkErrorHasStoredIdentity,
 }: PulseBarProps) {
   return (
     <header className="pulse-bar">
@@ -43,7 +53,14 @@ export function PulseBar({
             MissionGraph
           </p>
           <p className="truncate font-mono text-[9px] tracking-[0.16em] text-slate-600 uppercase">
-            Shorty · {connectionMode === 'fixture' ? 'fixture simulation' : 'live project'}
+            Shorty ·{' '}
+            {connectionMode === 'live'
+              ? 'live project'
+              : connectionMode === 'fixture'
+                ? 'fixture simulation'
+                : connectionMode === 'link-error'
+                  ? 'mission link unavailable'
+                  : 'connecting'}
           </p>
         </div>
       </div>
@@ -68,11 +85,6 @@ export function PulseBar({
       <div className="flex items-center gap-3">
         {connectionMode === 'fixture' && (
           <span className="offline-badge" title={connectionMessage}>
-            Offline fixture
-          </span>
-        )}
-        {connectionMessage.includes('fixture projection') && (
-          <span className="offline-badge" title={connectionMessage}>
             Dev fixture projection
           </span>
         )}
@@ -85,10 +97,42 @@ export function PulseBar({
           <span className="catch-up-count">6</span>
           {replaying ? 'Replaying changes' : 'Since you left'}
         </button>
-        <div className="live-indicator">
+        <div className={`live-indicator live-indicator--${connectionMode}`}>
           <span className="live-dot" />
-          Live
+          {connectionMode === 'live'
+            ? 'Live'
+            : connectionMode === 'loading'
+              ? 'Connecting'
+              : connectionMode === 'fixture'
+                ? 'Fixture'
+                : 'Link expired'}
         </div>
+        {connectionMode === 'link-error' && (
+          <div className="connection-recovery" role="alert">
+            <span>Expired or invalid mission link</span>
+            <button type="button" onClick={onStartFreshMission}>
+              Start a fresh mission copy
+            </button>
+            {linkErrorHasStoredIdentity && (
+              <button type="button" onClick={onOpenStoredMission}>
+                Open my stored mission
+              </button>
+            )}
+          </div>
+        )}
+        {connectionMode === 'fixture' && (
+          <button type="button" className="compat-link" onClick={onReconnect}>
+            Reconnect
+          </button>
+        )}
+        <button
+          type="button"
+          className="compat-link"
+          onClick={onCopyMissionLink}
+          disabled={connectionMode !== 'live'}
+        >
+          Copy mission link
+        </button>
         <a href="/compat" className="compat-link">
           Compat
         </a>

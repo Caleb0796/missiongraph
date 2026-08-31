@@ -1,4 +1,10 @@
-import type { Approval, GraphEdge, MissionEvent, TaskNode } from './types'
+import type {
+  Approval,
+  GraphDigest,
+  GraphEdge,
+  MissionEvent,
+  TaskNode,
+} from './types'
 
 export type DisplayState =
   | 'queued'
@@ -15,6 +21,8 @@ export interface CriticalPath {
   edgeIds: string[]
   eta: number
 }
+
+export const IDLE_THRESHOLD_MS = 10 * 60_000
 
 export function getDisplayState(
   node: TaskNode,
@@ -237,6 +245,107 @@ export function approvalsForNode(
       (left, right) =>
         left.created_seq - right.created_seq ||
         left.created_at.localeCompare(right.created_at) ||
+        left.id.localeCompare(right.id),
+    )
+}
+
+export function remainingPathWeight(
+  nodeId: string,
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+) {
+  const byId = new Map(nodes.map((item) => [item.id, item]))
+  const memo = new Map<string, number>()
+  function visit(id: string): number {
+    const cached = memo.get(id)
+    if (cached !== undefined) return cached
+    const current = byId.get(id)
+    if (!current) return 0
+    const tails = edges
+      .filter((edge) => edge.kind === 'depends' && edge.upstream === id)
+      .map((edge) => visit(edge.downstream))
+    const result =
+      (current.state === 'done' ? 0 : current.estimate_min) +
+      Math.max(0, ...tails)
+    memo.set(id, result)
+    return result
+  }
+  return visit(nodeId)
+}
+
+export function fixtureRankedPendingApprovals(
+  approvals: Record<string, Approval>,
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+) {
+  return Object.values(approvals)
+    .filter((approval) => approval.status === 'pending')
+    .map((approval) => ({
+      ...approval,
+      delayImpactMin: remainingPathWeight(approval.node_id, nodes, edges),
+    }))
+    .sort(
+      (left, right) =>
+        right.delayImpactMin - left.delayImpactMin ||
+        left.created_at.localeCompare(right.created_at) ||
+        left.id.localeCompare(right.id),
+    )
+}
+
+export function approvalQueueFromRanking(
+  approvals: Record<string, Approval>,
+  ranking: GraphDigest['summary']['pending_approvals'],
+) {
+  return ranking.flatMap((ranked) => {
+    const approval = approvals[ranked.approval_id]
+    if (!approval || approval.status !== 'pending') return []
+    return [{ ...approval, delayImpactMin: ranked.delay_impact_min }]
+  })
+}
+
+function idleElapsed(since: string, now: number) {
+  const compactMinutes = /^(\d+)m$/.exec(since)
+  if (compactMinutes) return Number(compactMinutes[1]) * 60_000
+  const parsed = Date.parse(since)
+  return Number.isNaN(parsed) ? 0 : Math.max(0, now - parsed)
+}
+
+export function humanizeIdleAge(since: string, now = Date.now()) {
+  const elapsed = idleElapsed(since, now)
+  const minutes = Math.floor(elapsed / 60_000)
+  if (minutes < 1) return 'idle <1m'
+  if (minutes < 60) return `idle ${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `idle ${hours}h`
+  return `idle ${Math.floor(hours / 24)}d`
+}
+
+export function idleRadar(
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+  readySince: Record<string, string>,
+  now = Date.now(),
+  threshold = IDLE_THRESHOLD_MS,
+) {
+  return nodes
+    .filter((node) => {
+      const runtime = node as TaskNode & {
+        assigned?: boolean
+        ever_started?: boolean
+      }
+      const since = readySince[node.id]
+      return (
+        getDisplayState(node, nodes, edges) === 'ready' &&
+        !runtime.assigned &&
+        !runtime.ever_started &&
+        Boolean(since) &&
+        idleElapsed(since, now) >= threshold
+      )
+    })
+    .sort(
+      (left, right) =>
+        idleElapsed(readySince[right.id], now) -
+          idleElapsed(readySince[left.id], now) ||
         left.id.localeCompare(right.id),
     )
 }

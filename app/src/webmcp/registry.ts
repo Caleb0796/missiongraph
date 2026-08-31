@@ -1,4 +1,5 @@
 import { TransportError } from '../transport/client'
+import { toolCursorForProject } from '../transport/client-logic'
 import { useMissionStore } from '../store/mission-store'
 
 export type ModelContextNamespace = 'document' | 'navigator'
@@ -104,7 +105,7 @@ const helloMissionGraph: ToolDefinition = {
 
 let initialization: Promise<RegistryStatus> | undefined
 let definitions: ToolDefinition[] = [helloMissionGraph]
-let clientCursor: string | null = null
+let clientCursor: { projectId: string | null; cursor: string } | null = null
 
 export function getWebMcpRuntime(): WebMcpRuntime | null {
   if (document.modelContext) {
@@ -136,7 +137,13 @@ async function executeDefinition(
     definition.name === 'graph_digest' && typeof inputs.since === 'string'
       ? inputs.since
       : null
-  const since = explicitSince ?? clientCursor ?? storeBefore.cursor
+  const since =
+    explicitSince ??
+    toolCursorForProject(
+      clientCursor,
+      storeBefore.projectId,
+      storeBefore.cursor,
+    )
   let outcome: ToolOutcome
   try {
     outcome = await definition.execute(inputs, options)
@@ -144,10 +151,16 @@ async function executeDefinition(
     outcome = { error: errorShape(error) }
   }
   const storeAfter = useMissionStore.getState()
-  const changes = storeAfter.changes
-    .filter((change) => change.seq > Number(since))
-    .slice(-50)
-  clientCursor = storeAfter.cursor
+  const projectChanged = storeAfter.projectId !== storeBefore.projectId
+  const changes = projectChanged
+    ? []
+    : storeAfter.changes
+        .filter((change) => change.seq > Number(since))
+        .slice(-50)
+  clientCursor = {
+    projectId: storeAfter.projectId,
+    cursor: projectChanged ? '0' : storeAfter.cursor,
+  }
   return JSON.stringify({
     ok: !outcome.error,
     ...outcome,

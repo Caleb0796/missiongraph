@@ -1,10 +1,12 @@
 import {
+  approvalQueueFromRanking,
   approvalsForNode,
   getBlastRadius,
   getCriticalPath,
   getDisplayState,
   isNonIdle,
   isPreviewStale,
+  remainingPathWeight,
   wouldCreateCycle,
 } from '../model/graph'
 import type { EdgeKind, GraphEdge, MissionEvent, TaskNode } from '../model/types'
@@ -13,6 +15,7 @@ import {
   loadChangesSince,
   mutate,
   mutateBatch,
+  prepareMutation,
   type MutationBatchItem,
 } from '../transport/client'
 import type { ToolDefinition, ToolOutcome } from './registry'
@@ -53,6 +56,12 @@ function optionalString(value: unknown, label: string) {
   return value === undefined ? undefined : string(value, label)
 }
 
+function optionalBoolean(value: unknown, label: string) {
+  if (value === undefined) return undefined
+  if (typeof value !== 'boolean') throw new Error(`${label} must be a boolean.`)
+  return value
+}
+
 function number(value: unknown, label: string) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     throw new Error(`${label} must be a positive number.`)
@@ -81,19 +90,9 @@ function node(id: string) {
   return found
 }
 
-function approval(id: string, allowPolicyRejection = false) {
+function approval(id: string) {
   const state = useMissionStore.getState()
   const found = state.approvals[id]
-  if (!found && allowPolicyRejection && state.nodes[0]) {
-    return {
-      id,
-      node_id: state.nodes[0].id,
-      summary: 'Unknown approval used only to reach the server policy guard.',
-      created_at: new Date().toISOString(),
-      created_seq: 0,
-      status: 'pending' as const,
-    }
-  }
   if (!found || found.status !== 'pending') {
     throw new Error(`Pending approval ${id} does not exist.`)
   }
@@ -136,7 +135,7 @@ async function confirmed(
   }
   pendingOperations.delete(token)
   if (isPreviewStale(pending.cursor, useMissionStore.getState().cursor)) {
-    const fresh = preview(key, pending.ids, pending.apply)
+    const fresh = preview(key, ids, apply)
     return {
       ...fresh,
       error: {
@@ -147,26 +146,6 @@ async function confirmed(
     }
   }
   return pending.apply()
-}
-
-function remainingWeight(nodeId: string, nodes: TaskNode[], edges: GraphEdge[]) {
-  const byId = new Map(nodes.map((item) => [item.id, item]))
-  const memo = new Map<string, number>()
-  function visit(id: string): number {
-    const cached = memo.get(id)
-    if (cached !== undefined) return cached
-    const current = byId.get(id)
-    if (!current) return 0
-    const tails = edges
-      .filter((edge) => edge.kind === 'depends' && edge.upstream === id)
-      .map((edge) => visit(edge.downstream))
-    const result =
-      (current.state === 'done' ? 0 : current.estimate_min) +
-      Math.max(0, ...tails)
-    memo.set(id, result)
-    return result
-  }
-  return visit(nodeId)
 }
 
 function pathBetween(from: string, to: string) {
@@ -454,17 +433,18 @@ const link: ToolDefinition = {
     }
     const edgeId = crypto.randomUUID()
     const key = `link:${upstream}:${downstream}:${kind}`
+    const applyMutation = prepareMutation(
+      'EDGE_ADDED',
+      { edge_id: edgeId, upstream, downstream, kind },
+      { actor: 'browser_agent' },
+    )
     return confirmed(
       key,
       inputs,
       [upstream, downstream],
       isNonIdle(upstreamNode) || isNonIdle(downstreamNode),
       async () => {
-        await mutate(
-          'EDGE_ADDED',
-          { edge_id: edgeId, upstream, downstream, kind },
-          { actor: 'browser_agent' },
-        )
+        await applyMutation()
         return {
           data: {
             summary:
@@ -494,13 +474,18 @@ const unlink: ToolDefinition = {
     const edge = state.edges.find((item) => item.edge_id === edgeId)
     if (!edge) throw new Error(`Edge ${edgeId} does not exist.`)
     const touched = [node(edge.upstream), node(edge.downstream)]
+    const applyMutation = prepareMutation(
+      'EDGE_REMOVED',
+      { edge_id: edgeId },
+      { actor: 'browser_agent' },
+    )
     return confirmed(
       `unlink:${edgeId}`,
       inputs,
       touched.map((item) => item.id),
       touched.some(isNonIdle),
       async () => {
-        await mutate('EDGE_REMOVED', { edge_id: edgeId }, { actor: 'browser_agent' })
+        await applyMutation()
         return {
           data: {
             summary: `Removed the ${edge.kind} relationship between “${touched[0].title}” and “${touched[1].title}”.`,
@@ -551,17 +536,18 @@ const remove: ToolDefinition = {
     const hasIncidentEdge = useMissionStore
       .getState()
       .edges.some((edge) => edge.upstream === nodeId || edge.downstream === nodeId)
+    const applyMutation = prepareMutation(
+      'TASK_REMOVED',
+      { node_id: nodeId, tombstone: true },
+      { actor: 'browser_agent' },
+    )
     return confirmed(
       `remove:${nodeId}`,
       inputs,
       [nodeId],
       isNonIdle(target) || hasIncidentEdge,
       async () => {
-        await mutate(
-          'TASK_REMOVED',
-          { node_id: nodeId, tombstone: true },
-          { actor: 'browser_agent' },
-        )
+        await applyMutation()
         return {
           data: { summary: `Tombstoned and removed “${target.title}”.`, node_id: nodeId },
         }
@@ -586,24 +572,33 @@ function digestData() {
     counts[display as keyof typeof counts]++
   }
   const critical = getCriticalPath(state.nodes, state.edges)
-  const pendingApprovals = Object.values(state.approvals)
-    .filter((item) => item.status === 'pending')
-    .map((item) => ({
+  const pendingApprovals = approvalQueueFromRanking(
+    state.approvals,
+    state.approvalRanking,
+  ).map((item) => ({
       approval_id: item.id,
       node_id: item.node_id,
       node_title:
         state.nodes.find((node) => node.id === item.node_id)?.title ?? item.node_id,
       summary: item.summary,
-      delay_impact_min: remainingWeight(item.node_id, state.nodes, state.edges),
+      delay_impact_min: item.delayImpactMin,
     }))
-    .sort((left, right) => right.delay_impact_min - left.delay_impact_min)
   const ready = state.nodes
     .filter(
       (current) =>
         getDisplayState(current, state.nodes, state.edges) === 'ready' &&
         !(current as TaskNode & { assigned?: boolean }).assigned,
     )
-    .map((current) => ({ id: current.id, title: current.title }))
+    .map((current) => ({
+      id: current.id,
+      title: current.title,
+      idle_since: state.readySince[current.id] ?? null,
+    }))
+    .sort(
+      (left, right) =>
+        (left.idle_since ?? '').localeCompare(right.idle_since ?? '') ||
+        left.id.localeCompare(right.id),
+    )
   return {
     summary: `The graph has ${state.nodes.length} tasks; ${counts.running} are running, ${counts.review} await review, ${counts.failed} failed, and ${counts.done} are done.`,
     counts_by_state: counts,
@@ -619,6 +614,10 @@ function digestData() {
     })),
     edges: state.edges,
     pending_approvals: pendingApprovals,
+    approval_ordering_source:
+      state.approvalRankingSource === 'fixture'
+        ? 'fixture-local estimate'
+        : state.approvalRankingSource,
     ready_unassigned: ready,
   }
 }
@@ -669,9 +668,19 @@ const listReady: ToolDefinition = {
           (current as TaskNode & { ready_since?: string }).ready_since ??
           'just became ready',
         on_critical_path: critical.nodeIds.includes(current.id),
-        remaining_path_min: remainingWeight(current.id, state.nodes, state.edges),
-        slack_min:
-          critical.eta - remainingWeight(current.id, state.nodes, state.edges),
+        ...(state.connectionMode === 'fixture'
+          ? {
+              remaining_path_min: remainingPathWeight(
+                current.id,
+                state.nodes,
+                state.edges,
+              ),
+              slack_min:
+                critical.eta -
+                remainingPathWeight(current.id, state.nodes, state.edges),
+              distance_source: 'fixture-local estimate',
+            }
+          : { distance_source: 'server critical-path membership' }),
       }))
     return {
       data: {
@@ -692,20 +701,15 @@ const listPendingApprovals: ToolDefinition = {
   annotations: { readOnlyHint: true },
   execute() {
     const state = useMissionStore.getState()
-    const approvals = Object.values(state.approvals)
-      .filter((item) => item.status === 'pending')
-      .map((item) => ({
-        ...item,
-        node_title:
-          state.nodes.find((node) => node.id === item.node_id)?.title ?? item.node_id,
-        delay_impact_min: remainingWeight(item.node_id, state.nodes, state.edges),
-      }))
-      .sort(
-        (left, right) =>
-          right.delay_impact_min - left.delay_impact_min ||
-          left.created_at.localeCompare(right.created_at) ||
-          left.id.localeCompare(right.id),
-      )
+    const approvals = approvalQueueFromRanking(
+      state.approvals,
+      state.approvalRanking,
+    ).map((item) => ({
+      ...item,
+      node_title:
+        state.nodes.find((node) => node.id === item.node_id)?.title ?? item.node_id,
+      delay_impact_min: item.delayImpactMin,
+    }))
     return {
       data: {
         summary:
@@ -713,6 +717,42 @@ const listPendingApprovals: ToolDefinition = {
             ? 'No approvals are pending.'
             : `${approvals.length} approvals are pending, ordered by projected delay.`,
         approvals,
+        ordering_source:
+          state.approvalRankingSource === 'fixture'
+            ? 'fixture-local estimate'
+            : state.approvalRankingSource,
+      },
+    }
+  },
+}
+
+const statePolicy: ToolDefinition = {
+  name: 'state_policy',
+  description:
+    'Record the human’s verbatim approval policy for this browser session and mint its policy reference.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      text: { type: 'string', description: 'The human-stated approval policy.' },
+    },
+    required: ['text'],
+    additionalProperties: false,
+  },
+  async execute(inputs) {
+    const text = string(inputs.text, 'text')
+    const sessionId = useMissionStore.getState().sessionId
+    if (!sessionId) throw new Error('The browser session identity is not ready.')
+    const policyRef = crypto.randomUUID()
+    await mutate(
+      'POLICY_STATED',
+      { policy_ref: policyRef, text, scope: 'session', session_id: sessionId },
+      { actor: 'browser_agent' },
+    )
+    return {
+      data: {
+        summary: `Recorded the session approval policy: ${text}`,
+        policy_ref: policyRef,
+        scope: 'session',
       },
     }
   },
@@ -720,7 +760,7 @@ const listPendingApprovals: ToolDefinition = {
 
 const approve: ToolDefinition = {
   name: 'approve',
-  description: 'Approve pending work under an optional human-stated session policy.',
+  description: 'Approve pending work under a human-stated session policy.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -728,26 +768,26 @@ const approve: ToolDefinition = {
       policy_ref: { type: 'string' },
       rationale: { type: 'string' },
     },
-    required: ['id'],
+    required: ['id', 'policy_ref'],
     additionalProperties: false,
   },
   async execute(inputs) {
-    const policyRef = optionalString(inputs.policy_ref, 'policy_ref')
-    const item = approval(string(inputs.id, 'id'), !policyRef)
+    const policyRef = string(inputs.policy_ref, 'policy_ref')
+    const item = approval(string(inputs.id, 'id'))
     const rationale = optionalString(inputs.rationale, 'rationale')
     await mutate(
       'APPROVED',
       {
         approval_id: item.id,
         node_id: item.node_id,
-        ...(policyRef ? { policy_ref: policyRef } : {}),
+        policy_ref: policyRef,
         ...(rationale ? { rationale } : {}),
       },
       { actor: 'browser_agent' },
     )
     return {
       data: {
-        summary: `Approved “${node(item.node_id).title}”${policyRef ? ` under policy ${policyRef}` : ''}.`,
+        summary: `Approved “${node(item.node_id).title}” under policy ${policyRef}.`,
         approval_id: item.id,
       },
     }
@@ -756,7 +796,7 @@ const approve: ToolDefinition = {
 
 const reject: ToolDefinition = {
   name: 'reject',
-  description: 'Reject pending work with revision guidance under an optional session policy.',
+  description: 'Reject pending work with revision guidance under a session policy.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -764,20 +804,20 @@ const reject: ToolDefinition = {
       reason: { type: 'string', description: 'Actionable guidance for the worker.' },
       policy_ref: { type: 'string' },
     },
-    required: ['id', 'reason'],
+    required: ['id', 'reason', 'policy_ref'],
     additionalProperties: false,
   },
   async execute(inputs) {
     const reason = string(inputs.reason, 'reason')
-    const policyRef = optionalString(inputs.policy_ref, 'policy_ref')
-    const item = approval(string(inputs.id, 'id'), !policyRef)
+    const policyRef = string(inputs.policy_ref, 'policy_ref')
+    const item = approval(string(inputs.id, 'id'))
     await mutate(
       'REJECTED',
       {
         approval_id: item.id,
         node_id: item.node_id,
         reason,
-        ...(policyRef ? { policy_ref: policyRef } : {}),
+        policy_ref: policyRef,
       },
       { actor: 'browser_agent' },
     )
@@ -785,6 +825,77 @@ const reject: ToolDefinition = {
       data: {
         summary: `Rejected “${node(item.node_id).title}” with guidance: ${reason}`,
         approval_id: item.id,
+      },
+    }
+  },
+}
+
+const dispatch: ToolDefinition = {
+  name: 'dispatch',
+  description: 'Dispatch a ready unassigned task to the Codex supervisor.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: { type: 'string', description: 'The ready task ID.' },
+      brief_override: { type: 'string' },
+      bypass_cap: {
+        type: 'boolean',
+        default: true,
+        description: 'Whether this explicit dispatch may use the one-slot cap bypass.',
+      },
+    },
+    required: ['id'],
+    additionalProperties: false,
+  },
+  async execute(inputs) {
+    const id = string(inputs.id, 'id')
+    const target = node(id)
+    const briefOverride = optionalString(inputs.brief_override, 'brief_override')
+    const bypassCap = optionalBoolean(inputs.bypass_cap, 'bypass_cap') ?? true
+    await mutate(
+      'DISPATCHED',
+      {
+        node_id: id,
+        ...(briefOverride ? { brief_override: briefOverride } : {}),
+        bypass_cap: bypassCap,
+      },
+      { actor: 'browser_agent' },
+    )
+    return {
+      data: {
+        summary: `Dispatched “${target.title}” to the Codex supervisor.`,
+        node_id: id,
+        bypass_cap: bypassCap,
+      },
+    }
+  },
+}
+
+const retryWithGuidance: ToolDefinition = {
+  name: 'retry_with_guidance',
+  description: 'Request another attempt on a failed task with actionable guidance.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: { type: 'string', description: 'The failed task ID.' },
+      guidance: { type: 'string', minLength: 1 },
+    },
+    required: ['id', 'guidance'],
+    additionalProperties: false,
+  },
+  async execute(inputs) {
+    const id = string(inputs.id, 'id')
+    const target = node(id)
+    const guidance = string(inputs.guidance, 'guidance')
+    await mutate(
+      'RETRY_REQUESTED',
+      { node_id: id, guidance },
+      { actor: 'browser_agent' },
+    )
+    return {
+      data: {
+        summary: `Requested another attempt on “${target.title}” with guidance: ${guidance}`,
+        node_id: id,
       },
     }
   },
@@ -957,7 +1068,7 @@ const highlightPath: ToolDefinition = {
   },
 }
 
-export const m2Tools: ToolDefinition[] = [
+export const missionTools: ToolDefinition[] = [
   planSeed,
   addTask,
   link,
@@ -967,8 +1078,11 @@ export const m2Tools: ToolDefinition[] = [
   graphDigest,
   listReady,
   listPendingApprovals,
+  statePolicy,
   approve,
   reject,
+  dispatch,
+  retryWithGuidance,
   getNode,
   getCriticalPathTool,
   getSelection,
