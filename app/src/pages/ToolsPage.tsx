@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { GraphCanvas } from '../components/GraphCanvas'
 import { useMissionStore } from '../store/mission-store'
 import {
+  executeRegisteredTool,
   executeToolDirect,
   getWebMcpRuntime,
   initializeWebMcp,
@@ -67,7 +68,11 @@ export function ToolsPage() {
         if (!tool) throw new Error(`${selected} is not visible in getTools().`)
         setOutput(
           prettyResult(
-            await runtime.modelContext.executeTool(tool, JSON.stringify(parsed)),
+            await executeRegisteredTool(
+              runtime,
+              tool,
+              parsed as Record<string, unknown>,
+            ),
           ),
         )
       } else {

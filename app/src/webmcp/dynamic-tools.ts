@@ -15,6 +15,18 @@ export interface DynamicRegistrationTarget<T extends NamedTool> {
   provideContext?: (context: { tools: T[] }) => Promise<void> | void
 }
 
+export interface InspectableRegistrationTarget<T extends NamedTool>
+  extends DynamicRegistrationTarget<T> {
+  getTools: () => Promise<NamedTool[]>
+}
+
+export interface ExecutableRegistrationTarget<T extends NamedTool> {
+  executeTool: (
+    tool: T,
+    input: string | Record<string, unknown>,
+  ) => Promise<string | null>
+}
+
 export interface DynamicToolStatus {
   degraded: boolean
   error?: unknown
@@ -28,6 +40,93 @@ interface DynamicToolControllerOptions {
 
 function uniqueTools<T extends NamedTool>(tools: T[]) {
   return [...new Map(tools.map((tool) => [tool.name, tool])).values()]
+}
+
+async function waitForToolPresence<T extends NamedTool>(
+  target: InspectableRegistrationTarget<T>,
+  name: string,
+  expected: boolean,
+  delay: (milliseconds: number) => Promise<void>,
+) {
+  for (const milliseconds of [0, 10, 50]) {
+    if (milliseconds > 0) await delay(milliseconds)
+    const present = (await target.getTools()).some((tool) => tool.name === name)
+    if (present === expected) return true
+  }
+  return false
+}
+
+function normalizeExecutionResult(result: string | null) {
+  if (result === null) return null
+  try {
+    const parsed = JSON.parse(result) as unknown
+    return typeof parsed === 'string' ? parsed : result
+  } catch {
+    return result
+  }
+}
+
+export async function executeRegisteredTool<T extends NamedTool>(
+  runtime: { modelContext: ExecutableRegistrationTarget<T> },
+  tool: T,
+  inputs: Record<string, unknown>,
+) {
+  try {
+    return normalizeExecutionResult(
+      await runtime.modelContext.executeTool(tool, JSON.stringify(inputs)),
+    )
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!/WebMCP executeTool requires an object input/i.test(message)) {
+      throw error
+    }
+    return normalizeExecutionResult(
+      await runtime.modelContext.executeTool(tool, inputs),
+    )
+  }
+}
+
+export async function detectDynamicRegistrationTier<T extends NamedTool>(
+  target: InspectableRegistrationTarget<T>,
+  probe: T,
+  delay: (milliseconds: number) => Promise<void> = (milliseconds) =>
+    new Promise((resolve) => globalThis.setTimeout(resolve, milliseconds)),
+): Promise<DynamicRegistrationTier> {
+  const existing = (await target.getTools()).some(
+    (tool) => tool.name === probe.name,
+  )
+  if (existing) {
+    return typeof target.provideContext === 'function' ? 'provide-context' : 'none'
+  }
+
+  const controller = new AbortController()
+  try {
+    await target.registerTool(probe, { signal: controller.signal })
+    const registered = await waitForToolPresence(
+      target,
+      probe.name,
+      true,
+      delay,
+    )
+    if (!registered) {
+      throw new Error(`WebMCP registered ${probe.name} but getTools() did not expose it.`)
+    }
+
+    controller.abort()
+    const unregistered = await waitForToolPresence(
+      target,
+      probe.name,
+      false,
+      delay,
+    )
+    if (unregistered) return 'abort-controller'
+    return typeof target.provideContext === 'function'
+      ? 'provide-context'
+      : 'none'
+  } catch (error) {
+    controller.abort()
+    throw error
+  }
 }
 
 export class DynamicToolController<T extends NamedTool> {

@@ -1,8 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import {
+  executeRegisteredTool,
+  getWebMcpRegistryStatus,
   getWebMcpRuntime,
   initializeWebMcp,
-  type RegistryStatus,
+  recheckWebMcp,
+  subscribeWebMcpRegistry,
 } from '../webmcp/registry'
 
 function formatRaw(value: unknown) {
@@ -28,15 +31,34 @@ function formatRaw(value: unknown) {
 }
 
 export function CompatPage() {
-  const [status, setStatus] = useState<RegistryStatus | null>(null)
+  const status = useSyncExternalStore(
+    subscribeWebMcpRegistry,
+    getWebMcpRegistryStatus,
+    getWebMcpRegistryStatus,
+  )
   const [rawResult, setRawResult] = useState('No self-test run yet.')
   const [running, setRunning] = useState(false)
+  const runtimeAvailable = getWebMcpRuntime() !== null
 
   useEffect(() => {
-    void initializeWebMcp()
-      .then(setStatus)
-      .catch((error) => setRawResult(formatRaw(error)))
+    void initializeWebMcp().catch((error) => setRawResult(formatRaw(error)))
   }, [])
+
+  async function recheckRuntime() {
+    setRunning(true)
+    try {
+      const next = await recheckWebMcp()
+      setRawResult(
+        next.state === 'active'
+          ? `WebMCP detected via ${next.namespace}; ${next.dynamicToolsTier} dynamic-tools tier.`
+          : 'WebMCP is still unavailable. MissionGraph will keep checking in the background.',
+      )
+    } catch (error) {
+      setRawResult(formatRaw(error))
+    } finally {
+      setRunning(false)
+    }
+  }
 
   async function getTools() {
     setRunning(true)
@@ -61,7 +83,7 @@ export function CompatPage() {
       const tools = await runtime.modelContext.getTools()
       const helloTool = tools.find((tool) => tool.name === 'hello_missiongraph')
       if (!helloTool) throw new Error('hello_missiongraph was not found by getTools().')
-      setRawResult(formatRaw(await runtime.modelContext.executeTool(helloTool, '{}')))
+      setRawResult(formatRaw(await executeRegisteredTool(runtime, helloTool, {})))
     } catch (error) {
       setRawResult(formatRaw(error))
     } finally {
@@ -86,11 +108,18 @@ export function CompatPage() {
           execution checks before any browser agent is involved.
         </p>
 
-        {!getWebMcpRuntime() && (
+        {status.state !== 'active' && (
           <section className="mt-8 rounded-xl border border-amber-400/40 bg-amber-400/10 p-5 text-amber-100">
-            <h2 className="font-semibold">WebMCP is not enabled</h2>
+            <h2 className="font-semibold">
+              {runtimeAvailable
+                ? 'WebMCP registration is retrying'
+                : 'WebMCP is not enabled'}
+            </h2>
             <p className="mt-1 text-sm leading-6">
-              Enable chrome://flags/#enable-webmcp-testing or open in ChatGPT&apos;s browser.
+              {runtimeAvailable
+                ? status.error ??
+                  'MissionGraph detected the API and is waiting for tool registration.'
+                : 'In ChatGPT: Settings → Browser → Permissions → Enable site tools, with model GPT-5.6 Sol or Terra. In Chrome: enable chrome://flags/#enable-webmcp-testing, then relaunch.'}
             </p>
           </section>
         )}
@@ -99,13 +128,15 @@ export function CompatPage() {
           <div>
             <p className="text-slate-400">API namespace</p>
             <p className="mt-1 font-mono text-cyan-200">
-              {status?.namespace ?? 'none detected'}
+              {status.state === 'active' ? status.namespace : 'waiting'}
             </p>
           </div>
           <div>
             <p className="text-slate-400">Dynamic-tools tier</p>
             <p className="mt-1 font-mono text-cyan-200">
-              {status?.dynamicToolsTier ?? 'none detected'}
+              {status.state === 'active'
+                ? status.dynamicToolsTier
+                : 'waiting'}
             </p>
           </div>
         </section>
@@ -119,6 +150,9 @@ export function CompatPage() {
               </p>
             </div>
             <div className="flex flex-wrap gap-3">
+              <button type="button" onClick={recheckRuntime} disabled={running} className="compat-button">
+                Re-check runtime
+              </button>
               <button type="button" onClick={getTools} disabled={running} className="compat-button">
                 Get tools
               </button>

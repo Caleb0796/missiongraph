@@ -1,7 +1,12 @@
 import { TransportError } from '../transport/client'
 import { toolCursorForProject } from '../transport/client-logic'
 import { useMissionStore } from '../store/mission-store'
-import { DynamicToolController } from './dynamic-tools'
+import {
+  detectDynamicRegistrationTier,
+  DynamicToolController,
+} from './dynamic-tools'
+
+export { executeRegisteredTool } from './dynamic-tools'
 
 export type ModelContextNamespace = 'document' | 'navigator'
 export type DynamicToolsTier = 'abort-controller' | 'provide-context' | 'none'
@@ -10,6 +15,10 @@ export interface RegistryStatus {
   namespace: ModelContextNamespace | null
   dynamicToolsTier: DynamicToolsTier
 }
+
+export type RegistryRuntimeStatus =
+  | { state: 'waiting'; error?: string }
+  | ({ state: 'active' } & RegistryStatus)
 
 interface RegisteredTool {
   name: string
@@ -42,7 +51,10 @@ interface ModelContext {
     tools: ModelContextTool[]
   }) => Promise<void> | void
   getTools: () => Promise<RegisteredTool[]>
-  executeTool: (tool: RegisteredTool, input: string) => Promise<string | null>
+  executeTool: (
+    tool: RegisteredTool,
+    input: string | Record<string, unknown>,
+  ) => Promise<string | null>
 }
 
 declare global {
@@ -115,12 +127,19 @@ const helloMissionGraph: ToolDefinition = {
   },
 }
 
-let initialization: Promise<RegistryStatus> | undefined
+let initialization: Promise<RegistryRuntimeStatus> | undefined
 let definitions: ToolDefinition[] = [helloMissionGraph]
 let coreDefinitions: ToolDefinition[] = [helloMissionGraph]
 let contextualDefinitions: ToolDefinition[] = []
 let currentContextualDefinitions: () => ToolDefinition[] = () => []
 let clientCursor: { projectId: string | null; cursor: string } | null = null
+let registryStatus: RegistryRuntimeStatus = { state: 'waiting' }
+const registryStatusListeners = new Set<() => void>()
+const retryDelays = [100, 200, 400, 800, 1_600, 2_000]
+let retryDelayIndex = 0
+let retryTimer: ReturnType<typeof globalThis.setTimeout> | null = null
+let coreControllers: AbortController[] = []
+let clearProvidedContext: (() => Promise<void>) | null = null
 let dynamicController: DynamicToolController<ModelContextTool> | null = null
 let unsubscribeContext: (() => void) | null = null
 
@@ -198,88 +217,190 @@ function wrapTool(definition: ToolDefinition): ModelContextTool {
   }
 }
 
-function isAbortError(error: unknown) {
-  return error instanceof DOMException && error.name === 'AbortError'
+function registrationErrorMessage(error: unknown) {
+  if (error instanceof Error) return `${error.name}: ${error.message}`
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'message' in error &&
+    typeof error.message === 'string'
+  ) {
+    return error.message
+  }
+  const message = String(error)
+  return message === '[object Object]'
+    ? 'WebMCP registration failed with an opaque browser error.'
+    : message
 }
 
-async function bootstrapWebMcp(): Promise<RegistryStatus> {
-  const runtime = getWebMcpRuntime()
-  if (!runtime) {
-    console.info('[MissionGraph] WebMCP unavailable; dynamic-tools tier=none')
-    return { namespace: null, dynamicToolsTier: 'none' }
+function setRegistryStatus(status: RegistryRuntimeStatus) {
+  if (
+    status.state === registryStatus.state &&
+    (status.state !== 'active' ||
+      (registryStatus.state === 'active' &&
+        status.namespace === registryStatus.namespace &&
+        status.dynamicToolsTier === registryStatus.dynamicToolsTier)) &&
+    (status.state !== 'waiting' ||
+      (registryStatus.state === 'waiting' &&
+        status.error === registryStatus.error))
+  ) {
+    return
   }
+  registryStatus = status
+  registryStatusListeners.forEach((listener) => listener())
+}
 
-  const controller = new AbortController()
-  controller.abort()
-  let registrationError: unknown
-  try {
-    await runtime.modelContext.registerTool(wrapTool(helloMissionGraph), {
-      signal: controller.signal,
+function clearRetryTimer() {
+  if (retryTimer === null) return
+  globalThis.clearTimeout(retryTimer)
+  retryTimer = null
+}
+
+function scheduleWebMcpRetry() {
+  if (retryTimer !== null || registryStatus.state === 'active') return
+  const delay = retryDelays[Math.min(retryDelayIndex, retryDelays.length - 1)]
+  retryDelayIndex++
+  retryTimer = globalThis.setTimeout(() => {
+    retryTimer = null
+    void startWebMcpInitialization().catch((error) => {
+      console.warn(
+        '[MissionGraph] WebMCP registration failed; waiting to retry.',
+        registrationErrorMessage(error),
+      )
     })
-  } catch (error) {
-    registrationError = error
-  }
+  }, delay)
+}
 
-  const registeredTools = await runtime.modelContext.getTools()
-  const helloWasRegistered = registeredTools.some(
-    (tool) => tool.name === helloMissionGraph.name,
+async function bootstrapWebMcp(
+  runtime: WebMcpRuntime,
+): Promise<RegistryStatus> {
+  const probe = wrapTool(helloMissionGraph)
+  const dynamicToolsTier = await detectDynamicRegistrationTier(
+    runtime.modelContext,
+    probe,
   )
-  let dynamicToolsTier: DynamicToolsTier
-  if (!helloWasRegistered) {
-    if (registrationError && !isAbortError(registrationError)) {
-      throw registrationError
-    }
-    dynamicToolsTier = 'abort-controller'
-  } else if (typeof runtime.modelContext.provideContext === 'function') {
-    dynamicToolsTier = 'provide-context'
-  } else {
-    dynamicToolsTier = 'none'
-  }
+  const registeredTools = await runtime.modelContext.getTools()
 
   const coreTools = coreDefinitions.map(wrapTool)
-  if (dynamicToolsTier !== 'provide-context') {
-    const existing = new Set(registeredTools.map((tool) => tool.name))
-    const initialTools =
-      dynamicToolsTier === 'none'
-        ? [...coreTools, ...contextualDefinitions.map(wrapTool)]
-        : coreTools
-    for (const tool of initialTools) {
-      if (!existing.has(tool.name)) await runtime.modelContext.registerTool(tool)
-      existing.add(tool.name)
-    }
-  }
-
-  dynamicController = new DynamicToolController(
-    runtime.modelContext,
-    dynamicToolsTier,
-    coreTools,
-    {
-      onStatus(status) {
-        useMissionStore.getState().setContextualToolsDegraded(status.degraded)
-        if (status.degraded) {
-          console.warn(
-            '[MissionGraph] contextual WebMCP tools degraded after 3 registration attempts; retrying on the next selection change.',
-            status.error,
-          )
+  const nextCoreControllers: AbortController[] = []
+  let nextDynamicController: DynamicToolController<ModelContextTool> | null = null
+  let nextUnsubscribeContext: (() => void) | null = null
+  try {
+    if (dynamicToolsTier !== 'provide-context') {
+      const existing = new Set(registeredTools.map((tool) => tool.name))
+      const initialTools =
+        dynamicToolsTier === 'none'
+          ? [...coreTools, ...contextualDefinitions.map(wrapTool)]
+          : coreTools
+      for (const tool of initialTools) {
+        if (!existing.has(tool.name)) {
+          if (dynamicToolsTier === 'abort-controller') {
+            const controller = new AbortController()
+            nextCoreControllers.push(controller)
+            await runtime.modelContext.registerTool(tool, {
+              signal: controller.signal,
+            })
+          } else {
+            await runtime.modelContext.registerTool(tool)
+          }
         }
-      },
-    },
-  )
-  await refreshContextualTools(true)
-  unsubscribeContext = useMissionStore.subscribe((state, previous) => {
-    if (
-      state.selectedId !== previous.selectedId ||
-      state.nodes !== previous.nodes ||
-      state.edges !== previous.edges
-    ) {
-      void refreshContextualTools(state.selectedId !== previous.selectedId)
+        existing.add(tool.name)
+      }
     }
-  })
+
+    nextDynamicController = new DynamicToolController(
+      runtime.modelContext,
+      dynamicToolsTier,
+      coreTools,
+      {
+        onStatus(status) {
+          useMissionStore.getState().setContextualToolsDegraded(status.degraded)
+          if (status.degraded) {
+            console.warn(
+              '[MissionGraph] contextual WebMCP tools degraded after 3 registration attempts; retrying on the next selection change.',
+              status.error,
+            )
+          }
+        },
+      },
+    )
+    const contextualTools = [
+      ...new Map(
+        currentContextualDefinitions().map((definition) => [
+          definition.name,
+          definition,
+        ]),
+      ).values(),
+    ]
+    await nextDynamicController.update(
+      contextualTools.map(wrapTool),
+      true,
+    )
+    nextUnsubscribeContext = useMissionStore.subscribe((state, previous) => {
+      if (
+        state.selectedId !== previous.selectedId ||
+        state.nodes !== previous.nodes ||
+        state.edges !== previous.edges
+      ) {
+        void refreshContextualTools(state.selectedId !== previous.selectedId)
+      }
+    })
+
+    coreControllers = nextCoreControllers
+    dynamicController = nextDynamicController
+    unsubscribeContext = nextUnsubscribeContext
+    if (dynamicToolsTier === 'provide-context') {
+      clearProvidedContext = async () => {
+        await runtime.modelContext.provideContext?.({ tools: [] })
+      }
+    }
+  } catch (error) {
+    nextUnsubscribeContext?.()
+    nextDynamicController?.dispose()
+    nextCoreControllers.forEach((controller) => controller.abort())
+    if (dynamicToolsTier === 'provide-context') {
+      await runtime.modelContext.provideContext?.({ tools: [] })
+    }
+    throw error
+  }
 
   console.info(
     `[MissionGraph] WebMCP namespace=${runtime.namespace}; dynamic-tools tier=${dynamicToolsTier}`,
   )
   return { namespace: runtime.namespace, dynamicToolsTier }
+}
+
+async function initializeWebMcpRuntime(): Promise<RegistryRuntimeStatus> {
+  const runtime = getWebMcpRuntime()
+  if (!runtime) {
+    setRegistryStatus({ state: 'waiting' })
+    scheduleWebMcpRetry()
+    return registryStatus
+  }
+
+  try {
+    const status = await bootstrapWebMcp(runtime)
+    retryDelayIndex = 0
+    clearRetryTimer()
+    const activeStatus: RegistryRuntimeStatus = { state: 'active', ...status }
+    setRegistryStatus(activeStatus)
+    return activeStatus
+  } catch (error) {
+    setRegistryStatus({
+      state: 'waiting',
+      error: registrationErrorMessage(error),
+    })
+    scheduleWebMcpRetry()
+    throw error
+  }
+}
+
+function startWebMcpInitialization() {
+  if (registryStatus.state === 'active') return Promise.resolve(registryStatus)
+  initialization ??= initializeWebMcpRuntime().finally(() => {
+    initialization = undefined
+  })
+  return initialization
 }
 
 export interface ContextualToolConfiguration {
@@ -295,8 +416,24 @@ export function initializeWebMcp(
   contextualDefinitions = contextual.all
   currentContextualDefinitions = contextual.current
   definitions = [...coreDefinitions, ...contextualDefinitions]
-  initialization ??= bootstrapWebMcp()
-  return initialization
+  return startWebMcpInitialization()
+}
+
+export function getWebMcpRegistryStatus() {
+  return registryStatus
+}
+
+export function subscribeWebMcpRegistry(listener: () => void) {
+  registryStatusListeners.add(listener)
+  return () => registryStatusListeners.delete(listener)
+}
+
+export function recheckWebMcp() {
+  if (registryStatus.state === 'active') return Promise.resolve(registryStatus)
+  clearRetryTimer()
+  retryDelayIndex = 0
+  setRegistryStatus({ state: 'waiting' })
+  return startWebMcpInitialization()
 }
 
 export async function refreshContextualTools(retryDegraded = false) {
@@ -313,10 +450,25 @@ export async function refreshContextualTools(retryDegraded = false) {
 }
 
 export function disposeWebMcpRegistry() {
+  clearRetryTimer()
   unsubscribeContext?.()
   unsubscribeContext = null
   dynamicController?.dispose()
   dynamicController = null
+  coreControllers.forEach((controller) => controller.abort())
+  coreControllers = []
+  if (clearProvidedContext) {
+    void clearProvidedContext().catch((error) => {
+      console.warn(
+        '[MissionGraph] failed to clear provided WebMCP context.',
+        registrationErrorMessage(error),
+      )
+    })
+  }
+  clearProvidedContext = null
+  initialization = undefined
+  retryDelayIndex = 0
+  setRegistryStatus({ state: 'waiting' })
   useMissionStore.getState().setContextualToolsDegraded(false)
 }
 
