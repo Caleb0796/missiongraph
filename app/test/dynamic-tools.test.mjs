@@ -41,16 +41,57 @@ test('abort-controller tier unregisters contextual tools without leaks or duplic
     'abort-controller',
     [tool('core')],
   )
-  await controller.update([tool('split_selected'), tool('split_selected')])
-  assert.deepEqual([...context.active], ['split_selected'])
+  await controller.update([
+    tool('split_selected'),
+    tool('annotate_selected'),
+    tool('split_selected'),
+  ])
+  assert.deepEqual([...context.active].sort(), [
+    'annotate_selected',
+    'split_selected',
+  ])
   const unchangedEvents = context.toolchange.length
-  await controller.update([tool('split_selected')])
+  await controller.update([tool('split_selected'), tool('annotate_selected')])
   assert.equal(context.toolchange.length, unchangedEvents)
-  await controller.update([tool('annotate_selected')])
-  assert.deepEqual([...context.active], ['annotate_selected'])
+  await controller.update([tool('annotate_selected'), tool('explain_selected')])
+  assert.deepEqual([...context.active].sort(), [
+    'annotate_selected',
+    'explain_selected',
+  ])
+  assert.equal(context.toolchange.length, 4)
   await controller.update([])
   assert.deepEqual([...context.active], [])
-  assert.ok(context.toolchange.length >= 4)
+  assert.equal(context.toolchange.length, 6)
+})
+
+test('registration failures stop after three attempts until a selection retry', async () => {
+  let attempts = 0
+  const statuses = []
+  const target = {
+    registerTool() {
+      attempts++
+      throw new Error('browser rejected registration')
+    },
+  }
+  const controller = new DynamicToolController(
+    target,
+    'abort-controller',
+    [tool('core')],
+    {
+      delay: async () => undefined,
+      onStatus: (status) => statuses.push(status.degraded),
+    },
+  )
+  await controller.update([tool('split_selected')])
+  assert.equal(attempts, 3)
+  assert.equal(statuses.at(-1), true)
+
+  await controller.update([tool('annotate_selected')])
+  assert.equal(attempts, 3)
+
+  await controller.update([tool('annotate_selected')], true)
+  assert.equal(attempts, 6)
+  assert.deepEqual(statuses.slice(-2), [false, true])
 })
 
 test('provide-context tier replaces the full set and converges after rapid selection changes', async () => {
@@ -75,6 +116,26 @@ test('provide-context tier replaces the full set and converges after rapid selec
     'digest',
   ])
   assert.ok(context.toolchange.length >= 1)
+})
+
+test('provide-context failures share the bounded retry budget', async () => {
+  let attempts = 0
+  const controller = new DynamicToolController(
+    {
+      registerTool() {},
+      provideContext() {
+        attempts++
+        throw new Error('context rejected')
+      },
+    },
+    'provide-context',
+    [tool('core')],
+    { delay: async () => undefined },
+  )
+  await controller.update([tool('split_selected')])
+  assert.equal(attempts, 3)
+  await controller.update([tool('annotate_selected')])
+  assert.equal(attempts, 3)
 })
 
 test('fallback tier leaves its always-registered contextual surface untouched', async () => {

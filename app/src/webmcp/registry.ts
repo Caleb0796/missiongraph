@@ -242,15 +242,26 @@ async function bootstrapWebMcp(): Promise<RegistryStatus> {
     runtime.modelContext,
     dynamicToolsTier,
     coreTools,
+    {
+      onStatus(status) {
+        useMissionStore.getState().setContextualToolsDegraded(status.degraded)
+        if (status.degraded) {
+          console.warn(
+            '[MissionGraph] contextual WebMCP tools degraded after 3 registration attempts; retrying on the next selection change.',
+            status.error,
+          )
+        }
+      },
+    },
   )
-  await refreshContextualTools()
+  await refreshContextualTools(true)
   unsubscribeContext = useMissionStore.subscribe((state, previous) => {
     if (
       state.selectedId !== previous.selectedId ||
       state.nodes !== previous.nodes ||
       state.edges !== previous.edges
     ) {
-      void refreshContextualTools()
+      void refreshContextualTools(state.selectedId !== previous.selectedId)
     }
   })
 
@@ -277,7 +288,7 @@ export function initializeWebMcp(
   return initialization
 }
 
-export async function refreshContextualTools() {
+export async function refreshContextualTools(retryDegraded = false) {
   if (!dynamicController) return
   const unique = [
     ...new Map(
@@ -287,7 +298,7 @@ export async function refreshContextualTools() {
       ]),
     ).values(),
   ]
-  await dynamicController.update(unique.map(wrapTool))
+  await dynamicController.update(unique.map(wrapTool), retryDegraded)
 }
 
 export function disposeWebMcpRegistry() {
@@ -295,6 +306,7 @@ export function disposeWebMcpRegistry() {
   unsubscribeContext = null
   dynamicController?.dispose()
   dynamicController = null
+  useMissionStore.getState().setContextualToolsDegraded(false)
 }
 
 export async function executeToolDirect(
