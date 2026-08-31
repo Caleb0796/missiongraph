@@ -403,7 +403,14 @@ function MissionBoard() {
               duration: firstLayout ? 0 : 520,
             })
             if (firstLayout) {
-              void fitting.then(() => {
+              // Reveal must not depend on the camera settling: fitView awaits a
+              // rAF commit, and hidden/backgrounded tabs never fire rAF — gating
+              // on it alone leaves the canvas blank forever there. Positions are
+              // already hydrated, so reveal on whichever finishes first.
+              const revealFallback = new Promise<void>((resolve) => {
+                window.setTimeout(resolve, 180)
+              })
+              void Promise.race([fitting, revealFallback]).then(() => {
                 if (!isCurrentLayout()) return
                 hasLaidOut.current = true
                 setLayoutReadyFor({ projectId: scheduledProjectId })

@@ -415,6 +415,7 @@ test('canvas gates first paint and replays changes with visible cancellable paci
   const styles = await source('../src/index.css')
   assert.match(canvas, /const prelayout = layoutReadyFor\?\.projectId !== projectId/)
   assert.match(canvas, /setLayoutReadyFor\(\{ projectId: scheduledProjectId \}\)/)
+  assert.match(canvas, /Promise\.race\(\[fitting, revealFallback\]\)/)
   assert.match(canvas, /duration: firstLayout \? 0 : 520/)
   assert.match(canvas, /canvas--prelayout/)
   assert.match(styles, /canvas--prelayout \.react-flow__node \{ pointer-events: none; opacity: 0; \}/)
