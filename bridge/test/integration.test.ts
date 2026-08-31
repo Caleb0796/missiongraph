@@ -54,6 +54,59 @@ async function mutation(
   return ((await response.json()) as { seq: number }).seq;
 }
 
+async function confirmedMutation(
+  serverUrl: string,
+  project: string,
+  token: string,
+  type: string,
+  payload: Record<string, unknown>,
+  idemKey: string,
+): Promise<number> {
+  const sessionResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(project)}/browser-sessions`, {
+    method: "POST",
+    headers: { "x-mg-token": token },
+  });
+  if (!sessionResponse.ok) {
+    throw new Error(`browser session failed (${sessionResponse.status}): ${await sessionResponse.text()}`);
+  }
+  const session = (await sessionResponse.json()) as { session_id: string; session_proof: string };
+  const sessionHeaders = {
+    "x-mg-token": token,
+    "x-mg-session": session.session_id,
+    "x-mg-session-proof": session.session_proof,
+  };
+  const draftResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(project)}/action-drafts`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...sessionHeaders },
+    body: JSON.stringify({ mutation: { type, payload }, summary: `Confirm ${type} in the bridge integration test.` }),
+  });
+  if (!draftResponse.ok) {
+    throw new Error(`action draft failed (${draftResponse.status}): ${await draftResponse.text()}`);
+  }
+  const draft = (await draftResponse.json()) as { draft_id: string };
+  const confirmationResponse = await fetch(
+    `${serverUrl}/api/p/${encodeURIComponent(project)}/action-drafts/${encodeURIComponent(draft.draft_id)}/confirm`,
+    { method: "POST", headers: sessionHeaders },
+  );
+  if (!confirmationResponse.ok) {
+    throw new Error(`action confirmation failed (${confirmationResponse.status}): ${await confirmationResponse.text()}`);
+  }
+  const capability = (await confirmationResponse.json()) as { capability_ref: string; capability: string };
+  const response = await fetch(`${serverUrl}/api/p/${encodeURIComponent(project)}/mutations`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...sessionHeaders,
+      "x-mg-capability-ref": capability.capability_ref,
+      "x-mg-capability": capability.capability,
+      "x-mg-nonce": `bridge-integration-${idemKey}`,
+    },
+    body: JSON.stringify({ type, payload, idem_key: idemKey }),
+  });
+  if (!response.ok) throw new Error(`mutation ${type} failed (${response.status}): ${await response.text()}`);
+  return ((await response.json()) as { seq: number }).seq;
+}
+
 async function stopProcess(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
@@ -113,7 +166,7 @@ describe("bridge dry-run integration", () => {
           },
           "smoke-add",
         );
-        await mutation(
+        await confirmedMutation(
           serverUrl,
           clone.project,
           clone.token,
