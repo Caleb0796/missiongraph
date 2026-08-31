@@ -4,9 +4,12 @@ import test from 'node:test'
 import {
   bootstrapRetryDelay,
   clockSampleIsFresh,
+  claimFirstRunPrompts,
   connectionProvedStable,
   configuredServer,
+  copyText,
   digestRetryDelay,
+  dismissFirstRunPrompts,
   estimateClockSkew,
   eventBelongsToProject,
   identityFailureDisposition,
@@ -20,6 +23,14 @@ import {
   skewCorrectedNow,
   toolCursorForProject,
 } from '../src/transport/client-logic.ts'
+
+function memoryStorage() {
+  const values = new Map()
+  return {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+  }
+}
 
 test('production uses only an absolute configured API URL', () => {
   assert.deepEqual(configuredServer('https://api.example.test/', false), {
@@ -69,6 +80,72 @@ test('WebMCP cursor restarts history at zero after a project switch', () => {
   assert.equal(toolCursorForProject(previous, 'project-b', '48'), '0')
   assert.equal(toolCursorForProject(previous, 'project-a', '101'), '100')
   assert.equal(toolCursorForProject(null, 'project-b', '48'), '48')
+})
+
+test('first-run prompts appear once and dismissal stays project-scoped', () => {
+  const storage = memoryStorage()
+  assert.equal(claimFirstRunPrompts('project-a', storage), true)
+  assert.equal(claimFirstRunPrompts('project-a', storage), false)
+  assert.equal(claimFirstRunPrompts('project-b', storage), true)
+  dismissFirstRunPrompts('project-a', storage)
+  assert.equal(claimFirstRunPrompts('project-a', storage), false)
+})
+
+test('clipboard denial falls back to a temporary execCommand control', async () => {
+  const calls = []
+  const textarea = {
+    value: '',
+    style: {},
+    setAttribute: (...args) => calls.push(['attribute', ...args]),
+    select: () => calls.push(['select']),
+    remove: () => calls.push(['remove']),
+  }
+  const copied = await copyText(
+    'Ask your agent',
+    {
+      writeText: async () => {
+        throw new Error('denied')
+      },
+    },
+    {
+      body: { append: (element) => calls.push(['append', element]) },
+      createElement: () => textarea,
+      execCommand: (command) => {
+        calls.push(['execCommand', command])
+        return true
+      },
+    },
+  )
+  assert.equal(copied, true)
+  assert.equal(textarea.value, 'Ask your agent')
+  assert.deepEqual(
+    calls.map(([name]) => name),
+    ['attribute', 'append', 'select', 'execCommand', 'remove'],
+  )
+})
+
+test('copy helper reports the manual fallback when both browser paths fail', async () => {
+  const textarea = {
+    value: '',
+    style: {},
+    setAttribute: () => {},
+    select: () => {},
+    remove: () => {},
+  }
+  const copied = await copyText(
+    'Ask your agent',
+    {
+      writeText: async () => {
+        throw new Error('denied')
+      },
+    },
+    {
+      body: { append: () => {} },
+      createElement: () => textarea,
+      execCommand: () => false,
+    },
+  )
+  assert.equal(copied, false)
 })
 
 test('websocket drops back off with jitter and retain SSE resume semantics', () => {

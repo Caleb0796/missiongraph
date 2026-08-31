@@ -10,6 +10,70 @@ export interface ProjectCursor {
   cursor: string
 }
 
+type ProjectStorage = Pick<Storage, 'getItem' | 'setItem'>
+type ClipboardDocument = Pick<Document, 'body' | 'createElement' | 'execCommand'>
+
+const FIRST_RUN_PREFIX = 'missiongraph.first-run.'
+
+function firstRunKey(projectId: string) {
+  return `${FIRST_RUN_PREFIX}${projectId}`
+}
+
+export function claimFirstRunPrompts(
+  projectId: string,
+  storage: ProjectStorage = localStorage,
+) {
+  try {
+    const key = firstRunKey(projectId)
+    if (storage.getItem(key) !== null) return false
+    storage.setItem(key, 'seen')
+    return true
+  } catch {
+    return true
+  }
+}
+
+export function dismissFirstRunPrompts(
+  projectId: string,
+  storage: ProjectStorage = localStorage,
+) {
+  try {
+    storage.setItem(firstRunKey(projectId), 'dismissed')
+  } catch {
+    // The panel still closes when browser storage is unavailable.
+  }
+}
+
+export async function copyText(
+  text: string,
+  clipboard: Pick<Clipboard, 'writeText'> | undefined = navigator.clipboard,
+  documentRef: ClipboardDocument = document,
+) {
+  try {
+    if (clipboard?.writeText) {
+      await clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // Try the synchronous browser fallback below.
+  }
+  let textarea: HTMLTextAreaElement | null = null
+  try {
+    textarea = documentRef.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    documentRef.body.append(textarea)
+    textarea.select()
+    return documentRef.execCommand('copy')
+  } catch {
+    return false
+  } finally {
+    textarea?.remove()
+  }
+}
+
 export function parseStoredIdentity(value: string | null): ClientIdentity | null {
   if (!value) return null
   try {

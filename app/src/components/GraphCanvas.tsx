@@ -30,7 +30,13 @@ import {
   resetMissionDemo,
   startFreshMissionCopy,
 } from '../transport/client'
-import { skewCorrectedNow } from '../transport/client-logic'
+import {
+  claimFirstRunPrompts,
+  copyText,
+  dismissFirstRunPrompts,
+  skewCorrectedNow,
+} from '../transport/client-logic'
+import { getWebMcpRuntime } from '../webmcp/registry'
 import { FlightPanel } from './FlightPanel'
 import { Inspector } from './Inspector'
 import { PulseBar } from './PulseBar'
@@ -39,6 +45,11 @@ import { Timeline } from './Timeline'
 
 const elk = new ELK()
 const nodeTypes = { missionTask: TaskNodeCard }
+const AGENT_PROMPTS = [
+  'Ask your agent to catch you up on this mission',
+  'Ask it to clear the approval queue under a policy you state',
+  'Ask it to find idle work and staff it',
+] as const
 
 async function createLayout(nodeIds: string[], edges: Edge[]) {
   const graph = await elk.layout({
@@ -112,6 +123,9 @@ function MissionBoard() {
   const [relayouting, setRelayouting] = useState(false)
   const [layoutRetry, setLayoutRetry] = useState(0)
   const [now, setNow] = useState(() => Date.now())
+  const [firstRunOpen, setFirstRunOpen] = useState(false)
+  const [firstRunMenuOpen, setFirstRunMenuOpen] = useState(false)
+  const initializedFirstRunProject = useRef<string | null>(null)
   const hasLaidOut = useRef(false)
   const layoutRequest = useRef<{
     projectId: string | null
@@ -241,6 +255,14 @@ function MissionBoard() {
     const timer = window.setInterval(() => setNow(Date.now()), 30_000)
     return () => window.clearInterval(timer)
   }, [])
+
+  useEffect(() => {
+    if (!projectId || connectionMode !== 'live') return
+    if (initializedFirstRunProject.current === projectId) return
+    initializedFirstRunProject.current = projectId
+    setFirstRunOpen(claimFirstRunPrompts(projectId))
+    setFirstRunMenuOpen(false)
+  }, [connectionMode, projectId])
 
   useEffect(() => {
     hasLaidOut.current = false
@@ -478,6 +500,28 @@ function MissionBoard() {
     }
   }
 
+  async function copyAgentPrompt(prompt: string) {
+    const copied = await copyText(prompt)
+    useMissionStore
+      .getState()
+      .showToast(
+        copied ? 'Agent prompt copied' : 'Copy this agent prompt manually',
+        'info',
+        copied ? 'Paste it into your browser agent' : prompt,
+      )
+  }
+
+  function dismissAgentPrompts() {
+    if (projectId) dismissFirstRunPrompts(projectId)
+    setFirstRunOpen(false)
+    setFirstRunMenuOpen(false)
+  }
+
+  function openAgentPrompts() {
+    setFirstRunOpen(true)
+    setFirstRunMenuOpen(true)
+  }
+
   const counts = useMemo(() => {
     const base: Record<DisplayState, number> = {
       queued: 0,
@@ -504,6 +548,7 @@ function MissionBoard() {
         onCatchUp={() => void replayCatchUp()}
         onReset={() => void resetMissionDemo()}
         onCopyMissionLink={() => void copyMissionLink()}
+        onOpenFirstRun={openAgentPrompts}
         onReconnect={() => void reconnectMission()}
         onStartFreshMission={() => void startFreshMissionCopy()}
         onOpenStoredMission={() => void openStoredMission()}
@@ -513,6 +558,46 @@ function MissionBoard() {
         linkErrorHasStoredIdentity={linkErrorHasStoredIdentity}
         contextualToolsDegraded={contextualToolsDegraded}
       />
+      <div className="canvas-notices">
+        {!getWebMcpRuntime() && (
+          <aside className="webmcp-banner" role="status">
+            <strong>Enable WebMCP to work with your agent.</strong>
+            <span>
+              ChatGPT&apos;s built-in browser works natively. In Chrome, enable{' '}
+              <code>chrome://flags/#enable-webmcp-testing</code>, then relaunch.
+            </span>
+            <a href="/compat">Check compatibility</a>
+          </aside>
+        )}
+        {firstRunOpen && (
+          <section
+            className={`first-run-prompts${firstRunMenuOpen ? ' first-run-prompts--menu-open' : ''}`}
+            aria-label="Prompts to try with your agent"
+          >
+            <span>Try with your agent</span>
+            <div>
+              {AGENT_PROMPTS.map((prompt) => (
+                <button
+                  key={prompt}
+                  type="button"
+                  className="agent-prompt-chip"
+                  onClick={() => void copyAgentPrompt(prompt)}
+                >
+                  {prompt}
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="first-run-dismiss"
+              onClick={dismissAgentPrompts}
+              aria-label="Dismiss agent prompt suggestions"
+            >
+              Dismiss
+            </button>
+          </section>
+        )}
+      </div>
       <div className="canvas-stage">
         <ReactFlow<TaskFlowNode, Edge>
           nodes={flowNodes}

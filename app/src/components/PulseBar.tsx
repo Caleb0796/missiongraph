@@ -7,6 +7,7 @@ interface PulseBarProps {
   onCatchUp: () => void
   onReset: () => void
   onCopyMissionLink: () => void
+  onOpenFirstRun: () => void
   onReconnect: () => void
   onStartFreshMission: () => void
   onOpenStoredMission: () => void
@@ -33,6 +34,7 @@ export function PulseBar({
   onCatchUp,
   onReset,
   onCopyMissionLink,
+  onOpenFirstRun,
   onReconnect,
   onStartFreshMission,
   onOpenStoredMission,
@@ -135,6 +137,15 @@ export function PulseBar({
             Reconnect
           </button>
         )}
+        <button
+          type="button"
+          className="first-run-help"
+          onClick={onOpenFirstRun}
+          aria-label="Show agent prompt suggestions"
+          title="Show agent prompt suggestions"
+        >
+          ?
+        </button>
         <button
           type="button"
           className="compat-link"

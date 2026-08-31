@@ -17,6 +17,7 @@ import {
   clockSampleIsFresh,
   connectionProvedStable,
   configuredServer,
+  copyText,
   digestRetryDelay,
   estimateClockSkew,
   identityFailureDisposition,
@@ -1269,32 +1270,6 @@ export function reconnectMission() {
     .getState()
     .setConnectionMode('loading', 'Reconnecting to the live server…')
   return initializeMissionClient()
-}
-
-async function copyText(text: string) {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text)
-      return true
-    }
-  } catch {
-    // Try the synchronous browser fallback below.
-  }
-  let textarea: HTMLTextAreaElement | null = null
-  try {
-    textarea = document.createElement('textarea')
-    textarea.value = text
-    textarea.setAttribute('readonly', '')
-    textarea.style.position = 'fixed'
-    textarea.style.opacity = '0'
-    document.body.append(textarea)
-    textarea.select()
-    return document.execCommand('copy')
-  } catch {
-    return false
-  } finally {
-    textarea?.remove()
-  }
 }
 
 export async function copyCurrentMissionLink() {

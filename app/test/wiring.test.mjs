@@ -213,13 +213,14 @@ test('tool console keeps unknown tools and malformed JSON as inline errors', asy
 
 test('capability links and fixture labeling stay explicit', async () => {
   const client = await source('../src/transport/client.ts')
+  const clientLogic = await source('../src/transport/client-logic.ts')
   const pulse = await source('../src/components/PulseBar.tsx')
   assert.match(client, /searchParams\.set\('mg_project', candidate\.client\.project\)/)
   assert.match(client, /searchParams\.set\('mg_token', candidate\.client\.token\)/)
-  assert.match(client, /document\.execCommand\('copy'\)/)
-  const copyText = client.slice(
-    client.indexOf('async function copyText'),
-    client.indexOf('export async function copyCurrentMissionLink'),
+  assert.match(clientLogic, /documentRef\.execCommand\('copy'\)/)
+  const copyText = clientLogic.slice(
+    clientLogic.indexOf('export async function copyText'),
+    clientLogic.indexOf('export function parseStoredIdentity'),
   )
   assert.match(copyText, /catch \{\s*return false/)
   assert.match(pulse, /disabled=\{connectionMode !== 'live'\}/)
@@ -228,6 +229,26 @@ test('capability links and fixture labeling stay explicit', async () => {
   assert.match(pulse, /connectionMode === 'fixture'/)
   assert.match(pulse, /Dev fixture projection/)
   assert.doesNotMatch(pulse, /connectionMessage\.includes\('fixture projection'\)/)
+})
+
+test('judge first-run prompts and WebMCP guidance are wired into the canvas', async () => {
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  const pulse = await source('../src/components/PulseBar.tsx')
+  const styles = await source('../src/index.css')
+  assert.match(canvas, /Ask your agent to catch you up on this mission/)
+  assert.match(canvas, /Ask it to clear the approval queue under a policy you state/)
+  assert.match(canvas, /Ask it to find idle work and staff it/)
+  assert.match(canvas, /claimFirstRunPrompts\(projectId\)/)
+  assert.match(canvas, /dismissFirstRunPrompts\(projectId\)/)
+  assert.match(canvas, /copyText\(prompt\)/)
+  assert.match(pulse, /aria-label="Show agent prompt suggestions"/)
+  assert.match(
+    styles,
+    /first-run-prompts:not\(\.first-run-prompts--menu-open\) \{ display: none; \}/,
+  )
+  assert.match(canvas, /ChatGPT&apos;s built-in browser works natively/)
+  assert.match(canvas, /chrome:\/\/flags\/#enable-webmcp-testing/)
+  assert.match(canvas, /href="\/compat"/)
 })
 
 test('automatic identity recovery clears inherited transport penalties', async () => {
