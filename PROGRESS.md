@@ -50,6 +50,14 @@ Ratification record: the human approved this addendum as the implementation basi
 - Audits: `pnpm audit` and `pnpm audit --prod` in app, server, and bridge each returned `No known vulnerabilities found`.
 - Production containment is unchanged: repository configuration remains `BRIDGE_ENABLED="0"`; no deployment or live capability change occurred.
 
+### S2 — Server-derived identity and human-presence grants (COMPLETE 2026-08-31)
+
+- Consequential browser-agent actions now use the dedicated `/agent-mutations` route and ignore any client-supplied actor claim. Policy creation only stages a pending server draft; it returns no public policy reference or capability. The visible native dialog renders the exact policy/action text, SHA-256 binding, project, server-issued browser session, allowed actions, use limit, and expiry before confirmation.
+- Browser sessions are server-issued as a public id plus a random proof. The client keeps the proof only in module memory, the database stores only its SHA-256 hash, and every draft, confirmation, denial, and capability use verifies the project-bound session proof. Confirmed grants are random, hashed at rest, bound to project/session/kind/policy or exact action subject/expiry/use budget, and consumed transactionally with a unique nonce and the accepted event append.
+- Human approval/rejection, dispatch, pause/resume, and structural mutations use visible action confirmations. Accepted consequential events record the server-derived actor plus capability reference, confirmation time, request origin, and nonce without persisting the raw grant. Denied drafts cannot be confirmed; wrong project/session/action/text, expired, exhausted, replayed, and multi-action attempts fail before any event write. Structural confirmation staleness recomputes and re-renders the proposal instead of applying an obsolete grant.
+- Gate 2026-08-31: `cd app && pnpm test` PASS **51/51** (including a real-server stale-split/confirmation path), `pnpm build` PASS (`tsc -b && vite build`, 194 modules; existing non-failing >500 kB warning), and `pnpm lint` PASS. `cd server && pnpm test -- --run` PASS **36/36** (including browser-session proof hashing/project binding, policy self-sign prevention, actor spoofing, cross-project/session use, tampering, expiry, exhaustion, replay, denial, exact dispatch subject binding, and audited acceptance); `pnpm build` PASS. Loopback tests were run in the permitted local environment after the restricted sandbox correctly refused local listeners with `EPERM`.
+- Production containment is unchanged: no deploy, credential rotation, live capability mutation, or bridge enablement occurred; `BRIDGE_ENABLED="0"` remains pinned.
+
 ## M0 human browser verification (Chrome ✅ 2026-08-30 · ChatGPT browser ⏳ pre-submission requirement)
 
 ### ChatGPT built-in browser

@@ -67,6 +67,18 @@ interface StructuralPreview {
   proposal?: StructuralOperationProposal
 }
 
+export interface HumanConfirmation {
+  id: string
+  kind: 'policy' | 'action'
+  title: string
+  text: string
+  details: string[]
+  expiresAt: string
+  busy?: boolean
+  confirm: () => Promise<void>
+  deny?: () => Promise<void>
+}
+
 export interface StructuralPlanInput {
   title: string
   ids: string[]
@@ -92,6 +104,7 @@ export interface MutationOptions {
   actor?: 'human' | 'browser_agent'
   debounceKey?: string
   staleMode?: 'error' | 'silent'
+  capability?: { ref: string; token: string; nonce: string }
 }
 
 export type MutationSender = <T extends EvType>(
@@ -130,6 +143,7 @@ interface MissionState {
   cameraRequest: CameraRequest | null
   toast: Toast | null
   structuralPreview: StructuralPreview | null
+  humanConfirmation: HumanConfirmation | null
   contextualToolsDegraded: boolean
   topologyRevision: number
   readySince: Record<string, string>
@@ -174,6 +188,9 @@ interface MissionState {
   ) => Promise<StructuralConfirmationResult>
   confirmStructural: () => void
   cancelStructural: () => void
+  stageHumanConfirmation: (confirmation: HumanConfirmation) => void
+  confirmHumanConfirmation: () => void
+  denyHumanConfirmation: () => void
   select: (id: string | null) => void
   approve: (nodeId: string, policyRef?: string) => void
   reject: (nodeId: string, policyRef?: string) => void
@@ -251,6 +268,11 @@ function reportMutationError(error: unknown, state: MissionState) {
     error instanceof Error ? error.message : String(error),
     'error',
   )
+}
+
+function denyWithoutBlocking(confirmation: HumanConfirmation | null) {
+  const denial = confirmation?.deny?.()
+  if (denial) void denial.catch(() => undefined)
 }
 
 function fixtureState() {
@@ -490,6 +512,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   cameraRequest: null,
   toast: null,
   structuralPreview: null,
+  humanConfirmation: null,
   contextualToolsDegraded: false,
   topologyRevision: 0,
   readySince: shortyReadySince,
@@ -523,6 +546,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       if (projectChanged) {
         structuralConfirmation.cancel()
         clearExplainOverlays()
+        denyWithoutBlocking(state.humanConfirmation)
       }
       const firstLiveSnapshot =
         projectChanged || state.connectionMode === 'fixture'
@@ -551,6 +575,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           ? false
           : state.approvalRankingStale,
         structuralPreview: projectChanged ? null : state.structuralPreview,
+        humanConfirmation: projectChanged ? null : state.humanConfirmation,
         explainOverlays: projectChanged ? {} : state.explainOverlays,
         selectedId:
           projectChanged || !selectedExists ? null : state.selectedId,
@@ -907,6 +932,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   useFixture(message) {
     structuralConfirmation.cancel()
     clearExplainOverlays()
+    denyWithoutBlocking(get().humanConfirmation)
     set({
       ...fixtureState(),
       events: shortyEvents,
@@ -919,6 +945,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       clockSkewMs: 0,
       linkErrorHasStoredIdentity: false,
       structuralPreview: null,
+      humanConfirmation: null,
       explainOverlays: {},
       selectedId: null,
       topologyRevision: get().topologyRevision + 1,
@@ -1144,6 +1171,60 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   cancelStructural() {
     structuralConfirmation.cancel()
     set({ structuralPreview: null })
+  },
+  stageHumanConfirmation(humanConfirmation) {
+    denyWithoutBlocking(get().humanConfirmation)
+    set({ humanConfirmation: { ...humanConfirmation, busy: false } })
+  },
+  confirmHumanConfirmation() {
+    const pending = get().humanConfirmation
+    if (!pending || pending.busy) return
+    set({ humanConfirmation: { ...pending, busy: true } })
+    void pending.confirm().then(
+      () => {
+        if (get().humanConfirmation?.id === pending.id) {
+          set({ humanConfirmation: null })
+        }
+        get().showToast(
+          pending.kind === 'policy'
+            ? 'Policy confirmed for this browser session'
+            : 'Confirmed action completed',
+        )
+      },
+      (error: unknown) => {
+        if (get().humanConfirmation?.id === pending.id) {
+          set({
+            humanConfirmation:
+              typeof error === 'object' &&
+              error !== null &&
+              'code' in error &&
+              error.code === 'confirmation_stale'
+                ? null
+                : { ...pending, busy: false },
+          })
+        }
+        reportMutationError(error, get())
+      },
+    )
+  },
+  denyHumanConfirmation() {
+    const pending = get().humanConfirmation
+    if (!pending || pending.busy) return
+    set({ humanConfirmation: { ...pending, busy: true } })
+    void (pending.deny?.() ?? Promise.resolve()).then(
+      () => {
+        if (get().humanConfirmation?.id === pending.id) {
+          set({ humanConfirmation: null })
+        }
+        get().showToast('Confirmation denied; nothing changed.')
+      },
+      (error: unknown) => {
+        if (get().humanConfirmation?.id === pending.id) {
+          set({ humanConfirmation: { ...pending, busy: false } })
+        }
+        reportMutationError(error, get())
+      },
+    )
   },
   select(id) {
     set({ selectedId: id })

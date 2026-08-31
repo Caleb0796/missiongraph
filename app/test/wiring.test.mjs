@@ -61,11 +61,11 @@ test('queued and preview mutations retain context while debounce captures it at 
   )
   assert.match(
     mutateBlock,
-    /\(\) => \{\s*const context = captureMutationContext\(options\.staleMode\)\s*return enqueueMutation/,
+    /\(\) => \{\s*const context = captureMutationContext\(options\.staleMode\)\s*return executeSingleWithPresence/,
   )
   assert.match(
     mutateBlock,
-    /enqueueMutation\(type, payload, actor, context\)/,
+    /executeSingleWithPresence\(type, payload, actor, context\)/,
   )
   assert.doesNotMatch(
     mutateBlock,
@@ -97,8 +97,9 @@ test('plan_seed uses one batch and native edits stage a visible confirmation', a
   assert.match(inspector, /annotations\[node\.id\]/)
 })
 
-test('all M4 tools emit their contract events and require policy attribution', async () => {
+test('all M4 tools stage policy confirmation and require policy attribution', async () => {
   const tools = await source('../src/webmcp/tools.ts')
+  const client = await source('../src/transport/client.ts')
   const statePolicy = tools.slice(
     tools.indexOf("name: 'state_policy'"),
     tools.indexOf("const approve"),
@@ -111,8 +112,21 @@ test('all M4 tools emit their contract events and require policy attribution', a
     tools.indexOf("name: 'retry_with_guidance'"),
     tools.indexOf("const getNode"),
   )
-  assert.match(statePolicy, /'POLICY_STATED'/)
-  assert.match(statePolicy, /session_id: sessionId/)
+  const policyStaging = client.slice(
+    client.indexOf('export async function stagePolicyDraft'),
+    client.indexOf('function sharedIdentityFromUrl'),
+  )
+  assert.match(statePolicy, /await stagePolicyDraft\(text\)/)
+  assert.match(statePolicy, /status: 'pending_human_confirmation'/)
+  assert.doesNotMatch(statePolicy, /'POLICY_STATED'/)
+  assert.doesNotMatch(statePolicy, /policy_ref:/)
+  assert.doesNotMatch(statePolicy, /capability:/)
+  assert.match(policyStaging, /kind: 'policy'/)
+  assert.match(policyStaging, /Policy SHA-256:/)
+  assert.match(policyStaging, /Project:/)
+  assert.match(policyStaging, /Session:/)
+  assert.match(policyStaging, /'POLICY_STATED'/)
+  assert.match(policyStaging, /denyHumanDraft/)
   assert.match(dispatch, /brief_override/)
   assert.match(dispatch, /bypass_cap: bypassCap/)
   assert.match(dispatch, /'DISPATCHED'/)
@@ -120,6 +134,38 @@ test('all M4 tools emit their contract events and require policy attribution', a
   assert.match(retry, /'RETRY_REQUESTED'/)
   assert.match(tools, /required: \['id', 'policy_ref'\]/)
   assert.match(tools, /statePolicy,[\s\S]*dispatch,[\s\S]*retryWithGuidance/)
+})
+
+test('consequential actions use a visible project-bound human confirmation', async () => {
+  const client = await source('../src/transport/client.ts')
+  const store = await source('../src/store/mission-store.ts')
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  assert.match(client, /function requiredHumanAction/)
+  for (const action of [
+    "actions.add('approve')",
+    "actions.add('reject')",
+    "actions.add('dispatch')",
+    "actions.add('pause')",
+    "actions.add('resume')",
+    "actions.add('structural')",
+  ]) {
+    assert.ok(client.includes(action), `missing human-presence gate: ${action}`)
+  }
+  assert.match(client, /\/action-drafts/)
+  assert.match(client, /\/browser-sessions/)
+  assert.match(client, /x-mg-capability-ref/)
+  assert.match(client, /x-mg-nonce/)
+  assert.match(client, /x-mg-session-proof/)
+  assert.doesNotMatch(client, /sessionStorage/)
+  assert.match(client, /Bound request SHA-256:/)
+  assert.match(store, /humanConfirmation: HumanConfirmation \| null/)
+  assert.match(store, /pending\.deny\?\.\(\)/)
+  assert.match(canvas, /Human policy confirmation/)
+  assert.match(canvas, /humanConfirmation\.text/)
+  assert.match(canvas, /humanConfirmation\.details\.map/)
+  assert.match(canvas, /humanConfirmation\.expiresAt/)
+  assert.match(canvas, /onClick=\{denyHumanConfirmation\}/)
+  assert.match(canvas, /onClick=\{confirmHumanConfirmation\}/)
 })
 
 test('identity recovery is source-aware and realtime resumes with fenced backoff', async () => {
