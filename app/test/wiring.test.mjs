@@ -59,7 +59,10 @@ test('queued, debounced, batch, and preview mutations retain initiation context'
     client.indexOf('async function postMutationBatch'),
     client.indexOf('function sharedIdentityFromUrl'),
   )
-  assert.match(mutateBlock, /const context = captureMutationContext\(\)/)
+  assert.match(
+    mutateBlock,
+    /const context = captureMutationContext\(options\.staleMode\)/,
+  )
   assert.match(
     mutateBlock,
     /enqueueMutation\(type, payload, actor, context\)/,
@@ -70,7 +73,7 @@ test('queued, debounced, batch, and preview mutations retain initiation context'
   )
   assert.match(batchBlock, /postMutationBatch\(batch, actor, context\)/)
   assert.match(tools, /const applyMutation = prepareMutation\(/)
-  assert.match(store, /const prepare = \(\) => prepareStoreMutation\(/)
+  assert.match(store, /prepareStoreMutation\('EDGE_ADDED', payload/)
 })
 
 test('plan_seed uses one batch and native edits stage a visible confirmation', async () => {
@@ -85,8 +88,9 @@ test('plan_seed uses one batch and native edits stage a visible confirmation', a
   assert.match(planSeed, /await mutateBatch\(batch/)
   assert.doesNotMatch(planSeed, /await mutate\(/)
   assert.match(store, /structuralPreview:/)
-  assert.match(confirmation, /pending\.baseCursor !== cursor/)
-  assert.match(confirmation, /pending\.apply = apply/)
+  assert.match(confirmation, /pending\.baseCursor !== context\.cursor/)
+  assert.match(confirmation, /const plan = pending\.recompute\(\)/)
+  assert.match(confirmation, /pending\.apply = plan\.apply/)
   assert.match(inspector, /annotations\[node\.id\]/)
 })
 
@@ -237,21 +241,23 @@ test('automatic identity recovery clears inherited transport penalties', async (
   )
 })
 
-test('M5 split shares cursor-bound UI confirmation and a frozen atomic batch', async () => {
+test('M5 split shares cursor-bound UI confirmation and recomputes its atomic batch', async () => {
   const tools = await source('../src/webmcp/tools.ts')
   const store = await source('../src/store/mission-store.ts')
   const client = await source('../src/transport/client.ts')
   const split = await source('../src/webmcp/split.ts')
   const confirmation = await source('../src/store/structural-confirmation.ts')
   assert.match(tools, /name: 'split_task'/)
-  assert.match(tools, /prepareBatchMutation\(batch/)
-  assert.match(tools, /stageStructural\(key, title, ids, prepare\)/)
+  assert.match(tools, /prepareBatchMutation\(plan\.batch/)
+  assert.match(tools, /stageStructural\(key, recompute\)/)
   assert.match(tools, /error:\s*\{\s*code: 'preview_stale'/)
   assert.match(store, /confirmStructuralToken\(key, opToken\)/)
   assert.match(store, /structuralConfirmation\.confirm\(/)
   assert.match(store, /blastRadius: getBlastRadius/)
   assert.match(confirmation, /pending\.opToken = this\.makeToken\(\)/)
-  assert.match(confirmation, /pending\.apply = apply/)
+  assert.match(confirmation, /pending\.apply = plan\.apply/)
+  assert.match(confirmation, /const value = await pending\.apply\(\)/)
+  assert.doesNotMatch(tools, /pausing\.map\([\s\S]*?'PAUSE_REQUESTED'/)
   assert.match(client, /export function prepareBatchMutation\(/)
   assert.match(split, /type: 'TASK_SPLIT'/)
   assert.match(split, /type: 'EDGE_REMOVED'/)
@@ -264,12 +270,18 @@ test('M5 contextual registry updates all three tiers idempotently', async () => 
   const tools = await source('../src/webmcp/tools.ts')
   assert.match(registry, /new DynamicToolController\(/)
   assert.match(registry, /useMissionStore\.subscribe/)
-  assert.match(registry, /void refreshContextualTools\(\)/)
-  assert.match(dynamic, /this\.dynamicController\?\.abort\(\)/)
+  assert.match(
+    registry,
+    /refreshContextualTools\(state\.selectedId !== previous\.selectedId\)/,
+  )
+  assert.match(dynamic, /this\.dynamicControllers\.delete\(name\)/)
   assert.match(dynamic, /this\.target\.provideContext/)
   assert.match(dynamic, /if \(this\.tier === 'none'\) return/)
-  assert.match(dynamic, /new Map\(tools\.map/)
+  assert.match(dynamic, /const nextByName = new Map\(tools\.map/)
+  assert.match(dynamic, /attempt <= this\.maxAttempts/)
+  assert.match(registry, /contextual WebMCP tools degraded after 3/)
   assert.match(tools, /label: 'not_applicable'/)
+  assert.match(tools, /contextualToolNamesForState\(/)
   assert.match(tools, /dispatchSelected,[\s\S]*explainSelected,[\s\S]*annotateSelected,[\s\S]*splitSelected,[\s\S]*reviewFailures/)
 })
 
@@ -278,6 +290,7 @@ test('M5 visual wiring exposes blast radius, relayout, split ancestry, and pause
   const card = await source('../src/components/TaskNodeCard.tsx')
   const inspector = await source('../src/components/Inspector.tsx')
   const store = await source('../src/store/mission-store.ts')
+  const graph = await source('../src/model/graph.ts')
   assert.match(canvas, /mission-flow-node--relayouting/)
   assert.match(canvas, /structuralPreview\?\.blastRadius\.stale/)
   assert.match(card, /mission-node--preview-pausing/)
@@ -286,4 +299,41 @@ test('M5 visual wiring exposes blast radius, relayout, split ancestry, and pause
   assert.match(inspector, /previewNativeSplit/)
   assert.match(store, /case 'TASK_SPLIT'/)
   assert.match(store, /pause_requested: true/)
+  assert.match(store, /pause_requested: false/)
+  assert.match(graph, /parent_id: payload\.parent_id/)
+  assert.match(canvas, /topologyRevision === scheduledRevision/)
+  assert.match(canvas, /projectId === scheduledProjectId/)
+})
+
+test('selection settling, project clearing, and cosmetic 409 handling preserve local intent', async () => {
+  const store = await source('../src/store/mission-store.ts')
+  const client = await source('../src/transport/client.ts')
+  const selectionCase = store.slice(
+    store.indexOf("case 'SELECTION_CHANGED':", store.indexOf('applyEvent(event)')),
+    store.indexOf('\n    }', store.indexOf("case 'SELECTION_CHANGED':", store.indexOf('applyEvent(event)'))),
+  )
+  assert.match(store, /debounceKey: 'selection', staleMode: 'silent'/)
+  assert.match(store, /if \(!mutationWasStale\(error\)\) reportMutationError/)
+  assert.doesNotMatch(selectionCase, /selectedId\s*=/)
+  assert.match(
+    store,
+    /selectedId:\s*projectChanged \|\| !selectedExists \? null : state\.selectedId/,
+  )
+  assert.match(client, /300,/)
+  assert.match(client, /if \(context\.staleMode === 'error'\)/)
+  assert.match(client, /await refreshSnapshot\(candidate\)/)
+})
+
+test('lineage and remap annotation dossiers do not depend on bounded event history', async () => {
+  const store = await source('../src/store/mission-store.ts')
+  const tools = await source('../src/webmcp/tools.ts')
+  const inspector = await source('../src/components/Inspector.tsx')
+  assert.match(store, /parentByChild/)
+  assert.match(store, /foldTaskSplit\(nodes, edges, event\.payload\)/)
+  assert.match(tools, /const splitParent = task\.parent_id/)
+  assert.match(tools, /annotationsForTarget\(/)
+  assert.match(tools, /\{ target_id: targetId, note \}/)
+  assert.match(inspector, /runtimeNode\?\.parent_id/)
+  assert.match(inspector, /annotationsForTarget\(/)
+  assert.doesNotMatch(tools, /event\.payload\.children\.some\(\(child\) => child\.id === id\)/)
 })

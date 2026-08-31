@@ -86,8 +86,12 @@ function MissionBoard() {
     (state) => state.linkErrorHasStoredIdentity,
   )
   const projectId = useMissionStore((state) => state.projectId)
+  const topologyRevision = useMissionStore((state) => state.topologyRevision)
   const toast = useMissionStore((state) => state.toast)
   const structuralPreview = useMissionStore((state) => state.structuralPreview)
+  const contextualToolsDegraded = useMissionStore(
+    (state) => state.contextualToolsDegraded,
+  )
   const hydratePositions = useMissionStore((state) => state.hydratePositions)
   const relayoutPositions = useMissionStore((state) => state.relayoutPositions)
   const moveNode = useMissionStore((state) => state.moveNode)
@@ -236,10 +240,16 @@ function MissionBoard() {
   useEffect(() => {
     hasLaidOut.current = false
     topologySignature.current = ''
+    const resetRelayouting = window.setTimeout(() => setRelayouting(false), 0)
+    if (relayoutTimer.current !== null) {
+      window.clearTimeout(relayoutTimer.current)
+      relayoutTimer.current = null
+    }
     if (layoutDebounce.current !== null) {
       window.clearTimeout(layoutDebounce.current)
       layoutDebounce.current = null
     }
+    return () => window.clearTimeout(resetRelayouting)
   }, [projectId])
 
   useEffect(() => {
@@ -254,22 +264,33 @@ function MissionBoard() {
     if (!firstLayout && topologySignature.current === signature) return
     hasLaidOut.current = true
     topologySignature.current = signature
+    const scheduledRevision = topologyRevision
+    const scheduledProjectId = projectId
+    const isCurrentLayout = () =>
+      useMissionStore.getState().topologyRevision === scheduledRevision &&
+      useMissionStore.getState().projectId === scheduledProjectId
     const layout = () => {
       if (!firstLayout) setRelayouting(true)
       void createLayout(
         nodes.map((node) => node.id),
         flowEdges,
       ).then((positions) => {
+        if (!isCurrentLayout()) return
         if (firstLayout) hydratePositions(positions)
         else relayoutPositions(positions)
-        window.setTimeout(
-          () => void fitView({ padding: 0.16, duration: firstLayout ? 280 : 520 }),
-          0,
-        )
+        window.setTimeout(() => {
+          if (isCurrentLayout()) {
+            void fitView({
+              padding: 0.16,
+              duration: firstLayout ? 280 : 520,
+            })
+          }
+        }, 0)
         if (relayoutTimer.current !== null) {
           window.clearTimeout(relayoutTimer.current)
         }
         relayoutTimer.current = window.setTimeout(() => {
+          if (!isCurrentLayout()) return
           setRelayouting(false)
           relayoutTimer.current = null
         }, 560)
@@ -285,7 +306,17 @@ function MissionBoard() {
         layout()
       }, 80)
     }
-  }, [connectionMode, edges, fitView, flowEdges, hydratePositions, nodes, relayoutPositions])
+  }, [
+    connectionMode,
+    edges,
+    fitView,
+    flowEdges,
+    hydratePositions,
+    nodes,
+    projectId,
+    relayoutPositions,
+    topologyRevision,
+  ])
 
   useEffect(
     () => () => {
@@ -454,6 +485,7 @@ function MissionBoard() {
         connectionMode={connectionMode}
         connectionMessage={connectionMessage}
         linkErrorHasStoredIdentity={linkErrorHasStoredIdentity}
+        contextualToolsDegraded={contextualToolsDegraded}
       />
       <div className="canvas-stage">
         <ReactFlow<TaskFlowNode, Edge>
@@ -498,6 +530,7 @@ function MissionBoard() {
           <section className="structural-confirm" role="dialog" aria-modal="true">
             <p className="structural-confirm-kicker">Blast-radius preview</p>
             <h2>{structuralPreview.title}</h2>
+            {structuralPreview.notice && <p>{structuralPreview.notice}.</p>}
             {structuralPreview.blastRadius.stale.length > 0 ? (
               <p>
                 Context may become stale for{' '}
