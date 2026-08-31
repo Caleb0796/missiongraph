@@ -8,15 +8,28 @@ describe("bridge launcher arguments", () => {
     expect(argumentsFrom(["--", "--dry-run"])).toEqual({ dryRun: true });
   });
 
-  it("refuses dry-run state that contains resumable workers", () => {
+  it.each(["spawning", "live", "idle", "dead"] as const)("refuses dry-run state that contains a %s worker", (status) => {
     expect(() => assertDryRunState("/tmp/persistent-state.json", {
       v: 1,
       project_id: "project",
       cursor: "0",
       pending_actions: [],
+      dead_letters: [],
       workers: {
-        a: { status: "idle", thread_id: "worker-a", worktree: "/tmp/a", branch: "work/a" },
+        a: { status, thread_id: "worker-a", worktree: "/tmp/a", branch: "work/a" },
       },
+    })).toThrow(/--dry-run refuses bridge state \/tmp\/persistent-state\.json/);
+  });
+
+  it("refuses dry-run state that records a supervisor process", () => {
+    expect(() => assertDryRunState("/tmp/persistent-state.json", {
+      v: 1,
+      project_id: "project",
+      cursor: "0",
+      supervisor_pid: 12_345,
+      pending_actions: [],
+      dead_letters: [],
+      workers: {},
     })).toThrow(/--dry-run refuses bridge state \/tmp\/persistent-state\.json/);
   });
 });

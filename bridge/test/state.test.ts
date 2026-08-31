@@ -49,6 +49,32 @@ describe("StateStore", () => {
     }
   });
 
+  it("removes an orphaned takeover claim and retries lock recovery once", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-orphan-takeover-"));
+    const path = join(root, "state.json");
+    await writeFile(`${path}.lock`, JSON.stringify({
+      pid: 41_001,
+      starttime: "stale-lock-start",
+      hostname: hostname(),
+      owner_id: "stale-lock-owner",
+    }));
+    await writeFile(`${path}.lock.takeover`, JSON.stringify({
+      pid: 41_002,
+      starttime: "orphan-takeover-start",
+      hostname: hostname(),
+      owner_id: "orphan-takeover-owner",
+    }));
+    let state: StateStore | undefined;
+    try {
+      state = await StateStore.open(path, "project", processStartTime);
+      expect(await readFile(`${path}.lock`, "utf8")).toContain(`"pid":${process.pid}`);
+      await expect(readFile(`${path}.lock.takeover`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await state?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("backs up corrupt state, removes crash temporaries, and writes durable mode-0600 state", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-state-"));
     const path = join(root, "state.json");

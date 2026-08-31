@@ -102,6 +102,11 @@ describe("ActionExecutor", () => {
         reporter_credential: "worker-token-1",
       });
       await executor.execute({ actions: [{ act: "spawn_worker", node_id: "node-a", brief: "Build A twice." }] });
+      completeInitial();
+      for (let attempt = 0; attempt < 50 && state.state.workers["node-a"]?.status !== "idle"; attempt += 1) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+      }
+      expect(state.state.workers["node-a"]?.status).toBe("idle");
       state.state.workers["node-a"]!.reporter_expires = new Date(Date.now() + 4 * 60_000).toISOString();
       await executor.execute({
         actions: [
@@ -124,6 +129,56 @@ describe("ActionExecutor", () => {
       expect(state.state.pending_actions).toEqual([]);
     } finally {
       completeInitial();
+      await executor?.stop();
+      await state?.close();
+      vi.unstubAllGlobals();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects controls for a live worker with journaled notes instead of launching resumes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-live-control-"));
+    const reports: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return Response.json({ seq: reports.length });
+    }));
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    try {
+      const bridgeConfig = config(root);
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, lockProcessStartTime);
+      state.state.workers.a = {
+        status: "live",
+        thread_id: "worker-thread-a",
+        worktree: join(root, "worker-a"),
+        branch: "work/a",
+        pid: 20_001,
+        process_start_time: "worker-start",
+      };
+      await state.save();
+      let resumes = 0;
+      const codex = {
+        startWorker: () => { throw new Error("not used"); },
+        resumeWorker: () => {
+          resumes += 1;
+          return running("worker-thread-a");
+        },
+      };
+      executor = new ActionExecutor(bridgeConfig, state, codex, new TestLogger());
+      await executor.execute({ actions: [
+        { act: "rebrief_worker", node_id: "a", message: "New guidance." },
+        { act: "resume_worker", node_id: "a" },
+      ] });
+
+      expect(resumes).toBe(0);
+      expect(reports).toHaveLength(2);
+      expect(reports).toEqual([
+        expect.objectContaining({ payload: { text: expect.stringContaining("rebrief_worker for node a was rejected") } }),
+        expect.objectContaining({ payload: { text: expect.stringContaining("resume_worker for node a was rejected") } }),
+      ]);
+      expect(state.state.pending_actions).toEqual([]);
+    } finally {
       await executor?.stop();
       await state?.close();
       vi.unstubAllGlobals();
@@ -260,6 +315,112 @@ describe("ActionExecutor", () => {
     } finally {
       await executor?.stop();
       await state?.close();
+      vi.unstubAllGlobals();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("dead-letters an action when permanent-failure journaling fails and continues draining", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-dead-letter-"));
+    const reports: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      const text = (body.payload as { text?: string } | undefined)?.text ?? "";
+      if (text.includes("Mechanical action permanently failed")) return new Response("journal unavailable", { status: 503 });
+      reports.push(body);
+      return Response.json({ seq: reports.length });
+    }));
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    let resumes = 0;
+    try {
+      const bridgeConfig = config(root);
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, lockProcessStartTime);
+      state.state.workers.a = {
+        status: "idle",
+        thread_id: "worker-a",
+        worktree: join(root, "worker-a"),
+        branch: "work/a",
+        reporter_credential: "worker-token",
+        reporter_expires: "2099-08-30T10:15:00.000Z",
+        reporter_config_path: join(root, "worker-a.reporter.conf"),
+      };
+      await state.save();
+      const codex = {
+        startWorker: () => { throw new Error("not used"); },
+        resumeWorker: () => {
+          resumes += 1;
+          return running("worker-a", Promise.reject(new Error("resume crashed")));
+        },
+      };
+      executor = new ActionExecutor(bridgeConfig, state, codex, new TestLogger());
+      await executor.execute({ actions: [
+        { act: "rebrief_worker", node_id: "a", message: "Continue." },
+        { act: "note", text: "Drain continued." },
+      ] }, "envelope seq 12-12");
+      for (let attempt = 0; attempt < 100 && state.state.pending_actions.length > 0; attempt += 1) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+      }
+
+      expect(resumes).toBe(3);
+      expect(state.state.pending_actions).toEqual([]);
+      expect(state.state.dead_letters).toEqual([
+        expect.objectContaining({
+          attempts: 3,
+          permanent_failure: "resume crashed",
+          failure_journal_error: expect.stringContaining("503"),
+          action: { act: "rebrief_worker", node_id: "a", message: "Continue." },
+        }),
+      ]);
+      expect(reports).toEqual([
+        expect.objectContaining({ payload: { text: "Drain continued." } }),
+      ]);
+    } finally {
+      await executor?.stop();
+      await state?.close();
+      vi.unstubAllGlobals();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("terminates a spawned child when persisting its process identity fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-partial-spawn-"));
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).endsWith("/reporter-credentials")) return Response.json({ seq: 1 });
+      const body = JSON.parse(String(init?.body)) as { actor: string };
+      return Response.json({ token: "worker-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+    }));
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    let terminations = 0;
+    try {
+      const bridgeConfig = config(root);
+      await initializeRepo(bridgeConfig.targetRepoPath);
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, lockProcessStartTime);
+      const save = state.save.bind(state);
+      let saves = 0;
+      vi.spyOn(state, "save").mockImplementation(async () => {
+        saves += 1;
+        if (saves === 3) throw new Error("identity save failed");
+        await save();
+      });
+      const codex = {
+        startWorker: () => running("worker-a", undefined, async () => { terminations += 1; }),
+        resumeWorker: () => { throw new Error("not used"); },
+      };
+      executor = new ActionExecutor(bridgeConfig, state, codex, new TestLogger());
+      await executor.execute({ actions: [{ act: "spawn_worker", node_id: "a", brief: "Build A." }] });
+      executor.beginShutdown();
+
+      expect(terminations).toBe(1);
+      expect(state.state.workers.a?.status).toBe("dead");
+      expect(state.state.pending_actions).toEqual([
+        expect.objectContaining({ attempts: 1, action: { act: "spawn_worker", node_id: "a", brief: "Build A." } }),
+      ]);
+    } finally {
+      await executor?.stop();
+      await state?.close();
+      vi.restoreAllMocks();
       vi.unstubAllGlobals();
       await rm(root, { recursive: true, force: true });
     }

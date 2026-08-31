@@ -235,7 +235,7 @@ export class MissionGraphBridge {
 }
 
 export function assertDryRunState(path: string, state: BridgeState): void {
-  if (Object.values(state.workers).some((worker) => worker.status === "live" || worker.status === "idle")) {
-    throw new Error(`--dry-run refuses bridge state ${path} because it records live or idle workers`);
+  if (Object.keys(state.workers).length > 0 || state.supervisor_pid !== undefined) {
+    throw new Error(`--dry-run refuses bridge state ${path} because it records workers or a supervisor process`);
   }
 }

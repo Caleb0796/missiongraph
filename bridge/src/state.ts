@@ -22,6 +22,12 @@ export interface PendingAction {
   permanent_failure?: string;
 }
 
+export interface DeadLetter extends PendingAction {
+  permanent_failure: string;
+  failure_journal_error: string;
+  dead_lettered_at: string;
+}
+
 export interface WorkerState {
   status: "spawning" | "live" | "idle" | "dead";
   thread_id?: string;
@@ -43,6 +49,7 @@ export interface BridgeState {
   supervisor_process_start_time?: string;
   recovery_note?: string;
   pending_actions: PendingAction[];
+  dead_letters: DeadLetter[];
   workers: Record<string, WorkerState>;
 }
 
@@ -77,6 +84,40 @@ async function writeExclusive(path: string, contents: string): Promise<void> {
   }
 }
 
+async function claimTakeover(
+  path: string,
+  contents: string,
+  record: LockRecord,
+  lookup: ProcessStartTimeLookup,
+): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await writeExclusive(path, contents);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (attempt > 0) throw new Error(`bridge state lock ${path} has a stale-lock takeover in progress`);
+    }
+
+    const observed = await readFile(path, "utf8").catch(() => "");
+    const owner = lockRecord(observed);
+    if (owner?.hostname !== hostname()) {
+      throw new Error(`bridge state lock ${path} has a stale-lock takeover in progress`);
+    }
+    if (await processMatches(owner, lookup)) {
+      throw new Error(`bridge state lock ${path} has a stale-lock takeover in progress`);
+    }
+    const orphanPath = `${path}.orphan-${Date.now()}-${record.owner_id}`;
+    try {
+      await rename(path, orphanPath);
+      await unlink(orphanPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  throw new Error(`bridge state lock ${path} has a stale-lock takeover in progress`);
+}
+
 async function acquireLock(path: string, lookup: ProcessStartTimeLookup): Promise<string> {
   const identity = await identifyProcess(process.pid, lookup);
   const record: LockRecord = { ...identity, hostname: hostname(), owner_id: randomUUID() };
@@ -100,14 +141,7 @@ async function acquireLock(path: string, lookup: ProcessStartTimeLookup): Promis
   }
 
   const takeoverPath = `${path}.takeover`;
-  try {
-    await writeExclusive(takeoverPath, contents);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error(`bridge state lock ${path} has a stale-lock takeover in progress`);
-    }
-    throw error;
-  }
+  await claimTakeover(takeoverPath, contents, record, lookup);
   const stalePath = `${path}.stale-${Date.now()}-${record.owner_id}`;
   try {
     if (await readFile(path, "utf8").catch(() => "") !== observed) {
@@ -184,6 +218,22 @@ function stateValue(value: unknown, projectId: string): BridgeState {
       (pending.permanent_failure !== undefined && typeof pending.permanent_failure !== "string")
     ) throw new Error("pending action ledger entry is invalid");
   }
+  if (parsed.dead_letters === undefined) parsed.dead_letters = [];
+  if (!Array.isArray(parsed.dead_letters)) throw new Error("dead letter ledger is invalid");
+  for (const deadLetter of parsed.dead_letters) {
+    if (
+      typeof deadLetter !== "object" ||
+      deadLetter === null ||
+      typeof deadLetter.id !== "string" ||
+      typeof deadLetter.source !== "string" ||
+      !Number.isSafeInteger(deadLetter.attempts) ||
+      deadLetter.attempts < 0 ||
+      !supervisorAction(deadLetter.action) ||
+      typeof deadLetter.permanent_failure !== "string" ||
+      typeof deadLetter.failure_journal_error !== "string" ||
+      !Number.isFinite(Date.parse(deadLetter.dead_lettered_at))
+    ) throw new Error("dead letter ledger entry is invalid");
+  }
   return parsed as BridgeState;
 }
 
@@ -226,7 +276,7 @@ export class StateStore {
             path,
             lockPath,
             lockContents,
-            { v: 1, project_id: projectId, cursor: "0", pending_actions: [], workers: {} },
+            { v: 1, project_id: projectId, cursor: "0", pending_actions: [], dead_letters: [], workers: {} },
             false,
           );
         }
@@ -239,6 +289,7 @@ export class StateStore {
           cursor: "0",
           recovery_note: recoveryMessage,
           pending_actions: [],
+          dead_letters: [],
           workers: {},
         };
         return new StateStore(

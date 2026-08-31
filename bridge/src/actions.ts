@@ -47,6 +47,7 @@ const reporterRenewalLeadMs = 5 * 60_000;
 const reporterRenewalRetryMs = 5_000;
 const maximumTimerDelayMs = 2_147_483_647;
 const actionRetryDelaysMs = [100, 500];
+const maximumDeadLetters = 50;
 
 interface WorkerCodexClient {
   startWorker(nodeId: string, brief: string, worktree: string, reporterConfigPath: string): RunningCodex;
@@ -216,15 +217,10 @@ export class ActionExecutor {
           await this.removePending(pending.id);
           continue;
         } catch (error) {
-          this.logger.error(`failed to journal permanent action failure: ${error instanceof Error ? error.message : String(error)}`);
-          const delay = actionRetryDelaysMs.at(-1)!;
-          pending.next_attempt_at = new Date(Date.now() + delay).toISOString();
-          try {
-            await this.stateStore.save();
-          } finally {
-            this.schedulePendingDrain(delay);
-          }
-          return;
+          const message = error instanceof Error ? error.message : String(error);
+          this.logger.error(`failed to journal permanent action failure: ${message}`);
+          await this.moveToDeadLetters(pending, message);
+          continue;
         }
       }
       try {
@@ -275,6 +271,22 @@ export class ActionExecutor {
     await this.stateStore.save();
   }
 
+  private async moveToDeadLetters(pending: PendingAction, journalError: string): Promise<void> {
+    const index = this.stateStore.state.pending_actions.findIndex((entry) => entry.id === pending.id);
+    if (index < 0 || !pending.permanent_failure) return;
+    this.stateStore.state.pending_actions.splice(index, 1);
+    this.stateStore.state.dead_letters.push({
+      ...pending,
+      permanent_failure: pending.permanent_failure,
+      failure_journal_error: journalError,
+      dead_lettered_at: new Date().toISOString(),
+    });
+    if (this.stateStore.state.dead_letters.length > maximumDeadLetters) {
+      this.stateStore.state.dead_letters.splice(0, this.stateStore.state.dead_letters.length - maximumDeadLetters);
+    }
+    await this.stateStore.save();
+  }
+
   private async executeOne(pending: PendingAction): Promise<void> {
     const action = pending.action;
     switch (action.act) {
@@ -282,13 +294,23 @@ export class ActionExecutor {
         await this.spawnWorker(action.node_id, action.brief, pending.id);
         return;
       case "rebrief_worker":
-        await this.resumeWorker(action.node_id, action.message);
+        await this.resumeWorker(action.node_id, action.message, pending.id, action.act);
         return;
       case "pause_worker":
-        await this.resumeWorker(action.node_id, "Pause cooperatively at the next safe point and report PAUSE_ACKED.");
+        await this.resumeWorker(
+          action.node_id,
+          "Pause cooperatively at the next safe point and report PAUSE_ACKED.",
+          pending.id,
+          action.act,
+        );
         return;
       case "resume_worker":
-        await this.resumeWorker(action.node_id, "Resume the assigned MissionGraph task and continue required reporting.");
+        await this.resumeWorker(
+          action.node_id,
+          "Resume the assigned MissionGraph task and continue required reporting.",
+          pending.id,
+          action.act,
+        );
         return;
       case "kill_worker":
         await this.killWorker(action.node_id);
@@ -330,7 +352,7 @@ export class ActionExecutor {
     this.stateStore.state.workers[nodeId] = state;
     await this.stateStore.save();
 
-    let running: RunningCodex;
+    let running: RunningCodex | undefined;
     try {
       running = this.codex.startWorker(
         nodeId,
@@ -347,6 +369,7 @@ export class ActionExecutor {
       state.status = "live";
       await this.stateStore.save();
     } catch (error) {
+      if (running) await this.terminateFailedLaunch(nodeId, running);
       state.status = "dead";
       delete state.pid;
       delete state.process_start_time;
@@ -383,10 +406,21 @@ export class ActionExecutor {
     void cleanup.finally(() => this.cleanupTasks.delete(cleanup));
   }
 
-  private async resumeWorker(nodeId: string, message: string): Promise<void> {
+  private async resumeWorker(
+    nodeId: string,
+    message: string,
+    pendingId: string,
+    action: "rebrief_worker" | "pause_worker" | "resume_worker",
+  ): Promise<void> {
     const worker = this.stateStore.state.workers[nodeId];
     if (!worker || !worker.thread_id || worker.status === "spawning") {
       this.logger.warn(`worker action ignored because node ${nodeId} has no resumable tracked thread`);
+      return;
+    }
+    if (worker.status === "live") {
+      const note = `${action} for node ${nodeId} was rejected because its tracked worker process is still live.`;
+      this.logger.warn(note);
+      await this.journal(note, `${pendingId}:live-control-rejected`);
       return;
     }
     await this.ensureCredential(nodeId, worker);
@@ -408,6 +442,9 @@ export class ActionExecutor {
       await this.stateStore.save();
       await running.threadId;
       await running.completed;
+    } catch (error) {
+      await this.terminateFailedLaunch(nodeId, running);
+      throw error;
     } finally {
       if (this.running.get(nodeId) === running) {
         this.running.delete(nodeId);
@@ -417,6 +454,16 @@ export class ActionExecutor {
         this.clearRenewal(nodeId);
         await this.stateStore.save();
       }
+    }
+  }
+
+  private async terminateFailedLaunch(nodeId: string, running: RunningCodex): Promise<void> {
+    try {
+      await running.terminate();
+    } catch (error) {
+      this.logger.error(
+        `failed to terminate worker ${nodeId} after launch failure: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
