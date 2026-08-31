@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MG raw WebMCP probe</title>
+<style>
+  body { font-family: ui-monospace, Menlo, monospace; background: #0b1220; color: #e2e8f0; margin: 0; padding: 24px; }
+  #status { font-size: 28px; font-weight: 700; padding: 20px; border-radius: 12px; }
+  .absent { background: #7f1d1d; }
+  .present { background: #14532d; }
+  #meta { margin-top: 16px; font-size: 13px; line-height: 1.7; color: #94a3b8; word-break: break-all; }
+  #log { margin-top: 16px; font-size: 13px; line-height: 1.7; }
+</style>
+</head>
+<body>
+<h1 style="font-size:16px;margin:0 0 12px">MissionGraph raw probe — no framework, no app code, just polling</h1>
+<div id="status" class="absent">modelContext: ABSENT (0s)</div>
+<div id="meta"></div>
+<div id="log"></div>
+<script>
+  var t0 = Date.now();
+  var statusEl = document.getElementById('status');
+  var logEl = document.getElementById('log');
+  var metaEl = document.getElementById('meta');
+  metaEl.textContent = 'UA: ' + navigator.userAgent;
+  function line(msg) {
+    var d = document.createElement('div');
+    d.textContent = '[' + ((Date.now() - t0) / 1000).toFixed(1) + 's] ' + msg;
+    logEl.appendChild(d);
+  }
+  line('probe started on ' + location.href);
+  var found = false;
+  function check() {
+    var elapsed = ((Date.now() - t0) / 1000).toFixed(0);
+    var mc = document.modelContext ? 'document' : (navigator.modelContext ? 'navigator' : null);
+    if (mc && !found) {
+      found = true;
+      var obj = document.modelContext || navigator.modelContext;
+      var caps = ['registerTool', 'provideContext', 'getTools'].filter(function (k) {
+        return typeof obj[k] === 'function';
+      });
+      statusEl.className = 'present';
+      statusEl.textContent = 'modelContext: PRESENT on ' + mc + ' after ' + elapsed + 's — caps: ' + caps.join(', ');
+      line('INJECTED: namespace=' + mc + ' caps=' + caps.join(','));
+      try {
+        obj.registerTool && obj.registerTool({
+          name: 'probe_ping',
+          description: 'Raw probe liveness tool. Returns a static JSON string.',
+          inputSchema: { type: 'object', properties: {} },
+          annotations: { readOnlyHint: true },
+          execute: function () { return JSON.stringify({ ok: true, probe: 'raw', at: Date.now() - t0 }); }
+        });
+        line('probe_ping registered');
+      } catch (e) {
+        line('registerTool threw: ' + e);
+      }
+    } else if (!found) {
+      statusEl.textContent = 'modelContext: ABSENT (' + elapsed + 's)';
+    }
+  }
+  check();
+  setInterval(check, 500);
+</script>
+</body>
+</html>

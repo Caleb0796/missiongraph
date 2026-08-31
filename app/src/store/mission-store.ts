@@ -1208,17 +1208,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         }
       },
       (error: unknown) => {
+        // A failed confirmation is not retryable from this dialog: the draft
+        // may already be consumed server-side, so retaining it strands the UI.
         const current = get().humanConfirmation
         if (confirmationMatches(current, pending.id, pending.textHash)) {
-          set({
-            humanConfirmation:
-              typeof error === 'object' &&
-              error !== null &&
-              'code' in error &&
-              error.code === 'confirmation_stale'
-                ? null
-                : { ...pending, busy: false },
-          })
+          set({ humanConfirmation: null })
         }
         reportMutationError(error, get())
       },
@@ -1244,9 +1238,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         }
       },
       (error: unknown) => {
+        // The human's intent to dismiss always wins client-side, even when the
+        // server-side deny fails (e.g. the draft was already confirmed).
         const current = get().humanConfirmation
         if (confirmationMatches(current, pending.id, pending.textHash)) {
-          set({ humanConfirmation: { ...pending, busy: false } })
+          set({ humanConfirmation: null })
         }
         reportMutationError(error, get())
       },

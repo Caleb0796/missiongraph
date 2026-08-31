@@ -1080,6 +1080,27 @@ const dispatch: ToolDefinition = {
   async execute(inputs) {
     const id = string(inputs.id, 'id')
     const target = node(id)
+    // Refuse before staging a human confirmation: the server enforces the same
+    // ready+unassigned rule, and failing after the human clicks wastes a grant.
+    const state = useMissionStore.getState()
+    const displayState = getDisplayState(target, state.nodes, state.edges)
+    const assigned = (target as TaskNode & { assigned?: boolean }).assigned
+    if (displayState !== 'ready' || assigned) {
+      const candidates = state.nodes
+        .filter(
+          (current) =>
+            getDisplayState(current, state.nodes, state.edges) === 'ready' &&
+            !(current as TaskNode & { assigned?: boolean }).assigned,
+        )
+        .slice(0, 3)
+        .map((current) => `“${current.title}” (${current.id})`)
+      throw new Error(
+        `“${target.title}” is ${assigned ? 'already assigned' : displayState}, not ready+unassigned, so it cannot be dispatched.` +
+          (candidates.length
+            ? ` Ready now: ${candidates.join(', ')}.`
+            : ' No task is ready right now.'),
+      )
+    }
     const briefOverride = optionalString(inputs.brief_override, 'brief_override')
     const bypassCap = optionalBoolean(inputs.bypass_cap, 'bypass_cap') ?? true
     await mutate(

@@ -58,7 +58,7 @@ const nodeTypes = { missionTask: TaskNodeCard }
 const AGENT_PROMPTS = [
   'Ask your agent to catch you up on this mission',
   'Ask it to clear the approval queue under a policy you state',
-  'Split the running task into build and deploy halves — show me the blast radius first.',
+  'Split the rate-limit task into config and enforcement halves — show me the blast radius first.',
 ] as const
 
 async function createLayout(nodeIds: string[], edges: Edge[]) {
