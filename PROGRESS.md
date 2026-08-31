@@ -43,6 +43,13 @@ Status: **CONTAINED / RATIFIED BY THE HUMAN ON 2026-08-30.** This addendum is th
 
 Ratification record: the human approved this addendum as the implementation basis on 2026-08-30. The frozen-contract maintainer still owns any later `docs/CONTRACTS.md` v1.6 amendment.
 
+### S1 — Patched vulnerable dependencies (COMPLETE 2026-08-30)
+
+- Updated exact versions: server `fastify` 5.6.2→5.8.5, `ws` 8.18.3→8.21.0, `vitest` 3.2.4→3.2.6; bridge `vitest` 3.2.4→3.2.6. Only the server and bridge lockfiles were regenerated with pnpm.
+- Gates: app test **50/50**, build PASS, lint PASS; server test **30/30**, build PASS; bridge test **41/41**, build PASS. Loopback integration tests were rerun outside the filesystem/network sandbox after the sandbox-only `listen EPERM` failures; all assertions then passed.
+- Audits: `pnpm audit` and `pnpm audit --prod` in app, server, and bridge each returned `No known vulnerabilities found`.
+- Production containment is unchanged: repository configuration remains `BRIDGE_ENABLED="0"`; no deployment or live capability change occurred.
+
 ## M0 human browser verification (Chrome ✅ 2026-08-30 · ChatGPT browser ⏳ pre-submission requirement)
 
 ### ChatGPT built-in browser
