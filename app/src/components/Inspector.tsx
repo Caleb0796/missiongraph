@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { describeEvent, eventTargetsNode, getDisplayState } from '../model/graph'
 import type { GraphEdge, MissionEvent, TaskNode } from '../model/types'
 import { useMissionStore } from '../store/mission-store'
+import { previewNativeSplit } from '../webmcp/tools'
 
 const tabs = ['Brief', 'Handoff', 'Deviations', 'Decisions', 'Log'] as const
 type Tab = (typeof tabs)[number]
@@ -25,14 +26,25 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
   const approve = useMissionStore((state) => state.approve)
   const reject = useMissionStore((state) => state.reject)
   const dispatch = useMissionStore((state) => state.dispatch)
+  const setNodeRunState = useMissionStore((state) => state.setNodeRunState)
+  const select = useMissionStore((state) => state.select)
+  const showToast = useMissionStore((state) => state.showToast)
   const approvals = useMissionStore((state) => state.approvals)
   const annotations = useMissionStore((state) => state.annotations)
   const handoffs = useMissionStore((state) => state.handoffs)
   const storedDeviations = useMissionStore((state) => state.deviations)
   const workerLogs = useMissionStore((state) => state.workerLogs)
   const [activeTab, setActiveTab] = useState<Tab>('Brief')
+  const [splitDraft, setSplitDraft] = useState<{
+    nodeId: string
+    first: string
+    second: string
+  } | null>(null)
   const node = nodes.find((candidate) => candidate.id === selectedId)
   const edge = edges.find((candidate) => candidate.edge_id === selectedId)
+  const activeSplitDraft = splitDraft?.nodeId === node?.id ? splitDraft : null
+  const firstChildTitle = activeSplitDraft?.first ?? ''
+  const secondChildTitle = activeSplitDraft?.second ?? ''
 
   const relevantEvents = useMemo(
     () =>
@@ -90,6 +102,48 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
       )
     : undefined
   const displayState = node ? getDisplayState(node, nodes, edges) : undefined
+  const splitOrigin = node
+    ? events.find(
+        (event): event is Extract<MissionEvent, { type: 'TASK_SPLIT' }> =>
+          event.type === 'TASK_SPLIT' &&
+          event.payload.children.some((child) => child.id === node.id),
+      )
+    : undefined
+  const splitParent = splitOrigin
+    ? nodes.find((candidate) => candidate.id === splitOrigin.payload.parent_id)
+    : undefined
+  const runtimeNode = node as
+    | (TaskNode & {
+        record_type?: 'task' | 'group'
+        child_ids?: string[]
+        pause_requested?: boolean
+      })
+    | undefined
+
+  function previewSplit() {
+    if (!node) return
+    const estimate = Math.max(1, Math.round(node.estimate_min / 2))
+    void previewNativeSplit(node.id, [
+      {
+        temp_id: 'first',
+        title: firstChildTitle,
+        brief: `Deliver the first bounded part of “${node.title}”: ${firstChildTitle}.`,
+        estimate,
+        tags: node.tags,
+        deps: [],
+      },
+      {
+        temp_id: 'second',
+        title: secondChildTitle,
+        brief: `Complete “${node.title}” by integrating ${secondChildTitle}.`,
+        estimate,
+        tags: node.tags,
+        deps: ['first'],
+      },
+    ]).catch((error: unknown) =>
+      showToast(error instanceof Error ? error.message : String(error), 'error'),
+    )
+  }
 
   return (
     <aside className="inspector-panel">
@@ -161,6 +215,31 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
                 {annotation.note}
               </ProseRecord>
             ))}
+            {splitParent && (
+              <ProseRecord>
+                <p>
+                  This child was created when “{splitParent.title}” was split. Its
+                  parent keeps the partial handoff and earlier decision history.
+                </p>
+                <button
+                  type="button"
+                  className="inspector-history-link"
+                  onClick={() => select(splitParent.id)}
+                >
+                  Open parent history
+                </button>
+              </ProseRecord>
+            )}
+            {runtimeNode?.record_type === 'group' && (
+              <ProseRecord>
+                This retired parent remains as the historical record for{' '}
+                {(runtimeNode.child_ids ?? [])
+                  .map(
+                    (id) => nodes.find((candidate) => candidate.id === id)?.title ?? id,
+                  )
+                  .join(', ')}.
+              </ProseRecord>
+            )}
           </>
         )}
         {activeTab === 'Brief' && edge && (
@@ -248,7 +327,7 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
           <button
             type="button"
             className="action-primary"
-            disabled={node.state !== 'review'}
+            disabled={node.state !== 'review' || runtimeNode?.record_type === 'group'}
             onClick={() => approve(node.id)}
           >
             Approve
@@ -256,7 +335,7 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
           <button
             type="button"
             className="action-secondary"
-            disabled={node.state !== 'review'}
+            disabled={node.state !== 'review' || runtimeNode?.record_type === 'group'}
             onClick={() => reject(node.id)}
           >
             Reject
@@ -264,11 +343,86 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
           <button
             type="button"
             className="action-secondary"
-            disabled={displayState !== 'ready'}
+            disabled={displayState !== 'ready' || runtimeNode?.record_type === 'group'}
             onClick={() => dispatch(node.id)}
           >
             Dispatch
           </button>
+          {node.state === 'running' && runtimeNode?.record_type !== 'group' && (
+            <button
+              type="button"
+              className="action-secondary"
+              disabled={runtimeNode?.pause_requested}
+              onClick={() => setNodeRunState(node.id, 'pause')}
+            >
+              {runtimeNode?.pause_requested ? 'Pausing…' : 'Pause safely'}
+            </button>
+          )}
+          {node.state === 'paused' && runtimeNode?.record_type !== 'group' && (
+            <button
+              type="button"
+              className="action-secondary"
+              onClick={() => setNodeRunState(node.id, 'resume')}
+            >
+              Resume
+            </button>
+          )}
+          {runtimeNode?.record_type !== 'group' && (
+            <button
+              type="button"
+              className="action-secondary"
+              onClick={() =>
+                setSplitDraft(
+                  activeSplitDraft
+                    ? null
+                    : {
+                        nodeId: node.id,
+                        first: `${node.title} · foundation`,
+                        second: `${node.title} · integration`,
+                      },
+                )
+              }
+            >
+              Split task
+            </button>
+          )}
+          {activeSplitDraft && runtimeNode?.record_type !== 'group' && (
+            <div className="inspector-split-form">
+              <p>Define two sequential child tasks. You will review the shared blast-radius dialog before anything changes.</p>
+              <label>
+                First child
+                <input
+                  value={firstChildTitle}
+                  onChange={(event) =>
+                    setSplitDraft({
+                      ...activeSplitDraft,
+                      first: event.target.value,
+                    })
+                  }
+                />
+              </label>
+              <label>
+                Second child
+                <input
+                  value={secondChildTitle}
+                  onChange={(event) =>
+                    setSplitDraft({
+                      ...activeSplitDraft,
+                      second: event.target.value,
+                    })
+                  }
+                />
+              </label>
+              <button
+                type="button"
+                className="action-primary"
+                disabled={!firstChildTitle.trim() || !secondChildTitle.trim()}
+                onClick={previewSplit}
+              >
+                Preview split
+              </button>
+            </div>
+          )}
         </div>
       )}
     </aside>

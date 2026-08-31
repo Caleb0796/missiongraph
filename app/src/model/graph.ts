@@ -24,6 +24,10 @@ export interface CriticalPath {
 
 export const IDLE_THRESHOLD_MS = 10 * 60_000
 
+export function isSplitParent(node: TaskNode) {
+  return (node as TaskNode & { record_type?: string }).record_type === 'group'
+}
+
 export function getDisplayState(
   node: TaskNode,
   nodes: TaskNode[],
@@ -48,7 +52,8 @@ export function getCriticalPath(
   nodes: TaskNode[],
   edges: GraphEdge[],
 ): CriticalPath {
-  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  const activeNodes = nodes.filter((node) => !isSplitParent(node))
+  const nodeById = new Map(activeNodes.map((node) => [node.id, node]))
   const outgoing = new Map<string, GraphEdge[]>()
 
   for (const edge of edges) {
@@ -97,7 +102,7 @@ export function getCriticalPath(
   }
 
   let best = { eta: 0, path: [] as string[] }
-  for (const node of [...nodes].sort((left, right) => left.id.localeCompare(right.id))) {
+  for (const node of [...activeNodes].sort((left, right) => left.id.localeCompare(right.id))) {
     const candidate = longestFrom(node.id)
     const candidateKey = candidate.path.join('/')
     const bestKey = best.path.join('/')
@@ -190,7 +195,15 @@ export function getBlastRadius(
       }
     }
   }
-  const stale = [...reached]
+  const stale = [...reached].filter((id) => {
+    const target = nodes.find((node) => node.id === id) as
+      | (TaskNode & { assigned?: boolean; ever_started?: boolean })
+      | undefined
+    return Boolean(
+      target &&
+        (target.assigned || target.ever_started || target.state !== 'queued'),
+    )
+  })
   return {
     stale,
     pausing: stale.filter(

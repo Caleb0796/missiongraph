@@ -11,7 +11,6 @@ import {
   getBlastRadius,
   getCriticalPath,
   isNonIdle,
-  isPreviewStale,
   refreshReadySince,
   wouldCreateCycle,
 } from '../model/graph'
@@ -32,6 +31,7 @@ import {
   shouldApplyDigest,
   shouldApplySnapshot,
 } from '../transport/client-logic'
+import { StructuralConfirmationController } from './structural-confirmation'
 
 interface Point {
   x: number
@@ -52,8 +52,21 @@ interface CameraRequest {
 
 interface StructuralPreview {
   title: string
+  key: string
+  opToken: string
   baseCursor: string
   blastRadius: { stale: string[]; pausing: string[] }
+}
+
+interface ExplainOverlay {
+  text: string
+  expiresAt: number
+}
+
+export interface StructuralConfirmationResult {
+  applied: boolean
+  preview?: StructuralPreview
+  value?: unknown
 }
 
 export type ConnectionMode = 'loading' | 'live' | 'fixture' | 'link-error'
@@ -91,8 +104,10 @@ interface MissionState {
   handoffs: Record<string, Handoff>
   deviations: GraphSnapshotState['deviations']
   workerLogs: Record<string, string[]>
+  journal: GraphSnapshotState['journal']
   selectedId: string | null
   highlightedIds: string[]
+  explainOverlays: Record<string, ExplainOverlay>
   cameraRequest: CameraRequest | null
   toast: Toast | null
   structuralPreview: StructuralPreview | null
@@ -105,6 +120,7 @@ interface MissionState {
   clockSkewMs: number
   linkErrorHasStoredIdentity: boolean
   hydratePositions: (positions: Record<string, Point>) => void
+  relayoutPositions: (positions: Record<string, Point>) => void
   applySnapshot: (
     snapshot: GraphSnapshotState,
     cursor: string,
@@ -127,26 +143,39 @@ interface MissionState {
   moveNode: (nodeId: string, point: Point) => void
   connectNodes: (upstream: string, downstream: string) => boolean
   removeSelected: () => void
+  stageStructural: (
+    key: string,
+    title: string,
+    ids: string[],
+    prepare: () => () => Promise<unknown>,
+  ) => StructuralPreview
+  confirmStructuralToken: (
+    key: string,
+    opToken: string,
+  ) => Promise<StructuralConfirmationResult>
   confirmStructural: () => void
   cancelStructural: () => void
   select: (id: string | null) => void
   approve: (nodeId: string, policyRef?: string) => void
   reject: (nodeId: string, policyRef?: string) => void
   dispatch: (nodeId: string) => void
+  setNodeRunState: (nodeId: string, state: 'pause' | 'resume') => void
   setHighlights: (ids: string[]) => void
   requestCamera: (ids: string[]) => void
+  showExplainOverlay: (id: string, text: string, ttlSeconds: number) => void
   showToast: (message: string, tone?: Toast['tone'], caption?: string) => void
   clearToast: () => void
 }
 
 let mutationSender: MutationSender | null = null
 let mutationPreparer: MutationPreparer | null = null
-let pendingStructuralOperation: {
-  title: string
-  ids: string[]
-  baseCursor: string
-  apply: () => Promise<number>
-} | null = null
+const structuralConfirmation = new StructuralConfirmationController()
+const overlayTimers = new Map<string, number>()
+
+function clearExplainOverlays() {
+  overlayTimers.forEach((timer) => window.clearTimeout(timer))
+  overlayTimers.clear()
+}
 
 export function configureMutationSender(
   sender: MutationSender,
@@ -203,6 +232,7 @@ function fixtureState() {
   const handoffs: Record<string, Handoff> = {}
   const deviations: GraphSnapshotState['deviations'] = {}
   const workerLogs: Record<string, string[]> = {}
+  const journal: GraphSnapshotState['journal'] = []
   const annotations: GraphSnapshotState['annotations'] = {}
   const policies: GraphSnapshotState['policies'] = {}
 
@@ -215,6 +245,18 @@ function fixtureState() {
         nodeById.delete(event.payload.node_id)
         tombstones.push(event.payload.node_id)
         break
+      case 'TASK_SPLIT': {
+        const parent = nodeById.get(event.payload.parent_id)
+        if (parent) {
+          nodeById.set(parent.id, {
+            ...parent,
+            record_type: 'group',
+            child_ids: event.payload.children.map((child) => child.id),
+          } as TaskNode)
+        }
+        event.payload.children.forEach((child) => nodeById.set(child.id, child))
+        break
+      }
       case 'EDGE_ADDED':
         edgeById.set(event.payload.edge_id, event.payload)
         break
@@ -264,6 +306,14 @@ function fixtureState() {
           ...(workerLogs[event.payload.node_id] ?? []),
           ...event.payload.lines,
         ]
+        break
+      case 'JOURNAL_NOTE':
+        journal.push({
+          actor: event.actor,
+          text: event.payload.text,
+          ts: event.ts,
+          seq: event.seq,
+        })
         break
       case 'NODE_MOVED':
         positions[event.payload.node_id] = {
@@ -318,6 +368,7 @@ function fixtureState() {
     handoffs,
     deviations,
     workerLogs,
+    journal,
   }
 }
 
@@ -325,9 +376,7 @@ const initial = fixtureState()
 
 function snapshotToView(snapshot: GraphSnapshotState) {
   return {
-    nodes: Object.values(snapshot.nodes).filter(
-      (node) => node.record_type === 'task',
-    ),
+    nodes: Object.values(snapshot.nodes),
     edges: Object.values(snapshot.edges).map((edge) => ({
       edge_id: edge.id,
       upstream: edge.upstream,
@@ -342,6 +391,7 @@ function snapshotToView(snapshot: GraphSnapshotState) {
     handoffs: snapshot.handoffs,
     deviations: snapshot.deviations,
     workerLogs: snapshot.worker_logs,
+    journal: snapshot.journal,
     readySince: Object.fromEntries(
       Object.values(snapshot.nodes)
         .filter((node) => node.ready_since)
@@ -377,6 +427,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   changes: [],
   selectedId: null,
   highlightedIds: [],
+  explainOverlays: {},
   cameraRequest: null,
   toast: null,
   structuralPreview: null,
@@ -390,6 +441,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   linkErrorHasStoredIdentity: false,
   hydratePositions(positions) {
     set((state) => ({ positions: { ...positions, ...state.positions } }))
+  },
+  relayoutPositions(positions) {
+    set((state) => ({ positions: { ...state.positions, ...positions } }))
   },
   applySnapshot(snapshot, cursor, projectId) {
     set((state) => {
@@ -405,6 +459,10 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       }
       const view = snapshotToView(snapshot)
       const projectChanged = state.projectId !== projectId
+      if (projectChanged) {
+        structuralConfirmation.cancel()
+        clearExplainOverlays()
+      }
       const firstLiveSnapshot =
         projectChanged || state.connectionMode === 'fixture'
       const selectedExists =
@@ -423,6 +481,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         approvalRankingStale: projectChanged
           ? false
           : state.approvalRankingStale,
+        structuralPreview: projectChanged ? null : state.structuralPreview,
+        explainOverlays: projectChanged ? {} : state.explainOverlays,
         selectedId: selectedExists ? state.selectedId : null,
         connectionMode: 'live',
         connectionMessage: 'Live server',
@@ -447,6 +507,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     let handoffs = state.handoffs
     let deviations = state.deviations
     let workerLogs = state.workerLogs
+    let journal = state.journal
     let selectedId = state.selectedId
     let readySince = state.readySince
 
@@ -471,6 +532,32 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         tombstones = [...tombstones, event.payload.node_id]
         if (selectedId === event.payload.node_id) selectedId = null
         break
+      case 'TASK_SPLIT':
+        nodes = [
+          ...nodes.map((node) =>
+            node.id === event.payload.parent_id
+              ? ({
+                  ...node,
+                  record_type: 'group',
+                  child_ids: event.payload.children.map((child) => child.id),
+                  assigned: true,
+                  pause_requested: false,
+                } as TaskNode)
+              : node,
+          ),
+          ...event.payload.children.map(
+            (child) =>
+              ({
+                ...child,
+                record_type: 'task',
+                child_ids: [],
+                assigned: false,
+                ever_started: false,
+                pause_requested: false,
+              }) as TaskNode,
+          ),
+        ]
+        break
       case 'EDGE_ADDED':
         edges = [...edges, event.payload]
         break
@@ -484,6 +571,20 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         )
         readySince = Object.fromEntries(
           Object.entries(readySince).filter(([id]) => id !== event.payload.node_id),
+        )
+        break
+      case 'PAUSE_REQUESTED':
+        nodes = nodes.map((node) =>
+          node.id === event.payload.node_id
+            ? { ...node, pause_requested: true }
+            : node,
+        )
+        break
+      case 'RESUME_REQUESTED':
+        nodes = nodes.map((node) =>
+          node.id === event.payload.node_id
+            ? { ...node, pause_requested: false }
+            : node,
         )
         break
       case 'APPROVED':
@@ -555,7 +656,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         break
       case 'PAUSE_ACKED':
         nodes = nodes.map((node) =>
-          node.id === event.payload.node_id ? { ...node, state: 'paused' } : node,
+          node.id === event.payload.node_id
+            ? { ...node, state: 'paused', pause_requested: false }
+            : node,
         )
         break
       case 'WORKER_LOG':
@@ -603,6 +706,17 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           [event.payload.node_id]: { x: event.payload.x, y: event.payload.y },
         }
         break
+      case 'JOURNAL_NOTE':
+        journal = [
+          ...journal,
+          {
+            actor: event.actor,
+            text: event.payload.text,
+            ts: event.ts,
+            seq: event.seq,
+          },
+        ].slice(-200)
+        break
       case 'SELECTION_CHANGED':
         if (event.payload.client_id === state.sessionId) {
           selectedId = event.payload.selected[0] ?? null
@@ -645,6 +759,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       handoffs,
       deviations,
       workerLogs,
+      journal,
       selectedId,
       readySince,
       cursor: String(event.seq),
@@ -724,6 +839,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     )
   },
   useFixture(message) {
+    structuralConfirmation.cancel()
+    clearExplainOverlays()
     set({
       ...fixtureState(),
       events: shortyEvents,
@@ -735,6 +852,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       connectionMessage: message,
       clockSkewMs: 0,
       linkErrorHasStoredIdentity: false,
+      structuralPreview: null,
+      explainOverlays: {},
     })
   },
   setConnectionMode(connectionMode, connectionMessage) {
@@ -793,28 +912,32 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       downstream,
       kind: 'depends',
     } as const
-    const apply = prepareStoreMutation('EDGE_ADDED', payload)
+    const prepare = () => prepareStoreMutation('EDGE_ADDED', payload)
     const touched = state.nodes.filter(
       (node) => node.id === upstream || node.id === downstream,
     )
     if (touched.some(isNonIdle)) {
       const ids = [upstream, downstream]
-      pendingStructuralOperation = {
+      const operation = structuralConfirmation.stage({
+        key: `link:${upstream}:${downstream}`,
         title: 'Add dependency',
         ids,
-        baseCursor: state.cursor,
-        apply,
-      }
+        cursor: state.cursor,
+        projectId: state.projectId,
+        prepare,
+      })
       set({
         structuralPreview: {
-          title: 'Add dependency',
-          baseCursor: state.cursor,
+          title: operation.title,
+          key: operation.key,
+          opToken: operation.opToken,
+          baseCursor: operation.baseCursor,
           blastRadius: getBlastRadius(ids, state.nodes, state.edges),
         },
       })
       return true
     }
-    void apply().catch((error: unknown) => reportMutationError(error, get()))
+    void prepare()().catch((error: unknown) => reportMutationError(error, get()))
     return true
   },
   removeSelected() {
@@ -824,15 +947,16 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     const edge = state.edges.find(
       (candidate) => candidate.edge_id === state.selectedId,
     )
-    const apply = node
-      ? prepareStoreMutation('TASK_REMOVED', {
-          node_id: node.id,
-          tombstone: true,
-        })
+    const prepare = node
+      ? () =>
+          prepareStoreMutation('TASK_REMOVED', {
+            node_id: node.id,
+            tombstone: true,
+          })
       : edge
-        ? prepareStoreMutation('EDGE_REMOVED', { edge_id: edge.edge_id })
+        ? () => prepareStoreMutation('EDGE_REMOVED', { edge_id: edge.edge_id })
         : null
-    if (!apply) return
+    if (!prepare) return
     const ids = node ? [node.id] : [edge!.upstream, edge!.downstream]
     const needsPreview = node
       ? isNonIdle(node) ||
@@ -846,50 +970,87 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         })
     if (needsPreview) {
       const title = node ? `Remove ${node.title}` : 'Remove relationship'
-      pendingStructuralOperation = {
+      const operation = structuralConfirmation.stage({
+        key: node ? `remove:${node.id}` : `unlink:${edge!.edge_id}`,
         title,
         ids,
-        baseCursor: state.cursor,
-        apply,
-      }
+        cursor: state.cursor,
+        projectId: state.projectId,
+        prepare,
+      })
       set({
         structuralPreview: {
-          title,
-          baseCursor: state.cursor,
+          title: operation.title,
+          key: operation.key,
+          opToken: operation.opToken,
+          baseCursor: operation.baseCursor,
           blastRadius: getBlastRadius(ids, state.nodes, state.edges),
         },
       })
       return
     }
-    void apply().catch((error: unknown) => reportMutationError(error, get()))
+    void prepare()().catch((error: unknown) => reportMutationError(error, get()))
+  },
+  stageStructural(key, title, ids, prepare) {
+    const state = get()
+    const operation = structuralConfirmation.stage({
+      key,
+      title,
+      ids,
+      cursor: state.cursor,
+      projectId: state.projectId,
+      prepare,
+    })
+    const structuralPreview = {
+      title: operation.title,
+      key: operation.key,
+      opToken: operation.opToken,
+      baseCursor: operation.baseCursor,
+      blastRadius: getBlastRadius(ids, state.nodes, state.edges),
+    }
+    set({ structuralPreview })
+    return structuralPreview
+  },
+  async confirmStructuralToken(key, opToken) {
+    const state = get()
+    const result = await structuralConfirmation.confirm(
+      key,
+      opToken,
+      state.cursor,
+      state.projectId,
+    )
+    if (!result.applied) {
+      const pending = result.operation
+      const structuralPreview = {
+        title: pending.title,
+        key: pending.key,
+        opToken: pending.opToken,
+        baseCursor: state.cursor,
+        blastRadius: getBlastRadius(pending.ids, state.nodes, state.edges),
+      }
+      set({ structuralPreview })
+      return { applied: false, preview: structuralPreview }
+    }
+    set({ structuralPreview: null })
+    return result
   },
   confirmStructural() {
-    const pending = pendingStructuralOperation
-    if (!pending) return
-    const state = get()
-    if (isPreviewStale(pending.baseCursor, state.cursor)) {
-      pending.baseCursor = state.cursor
-      set({
-        structuralPreview: {
-          title: pending.title,
-          baseCursor: state.cursor,
-          blastRadius: getBlastRadius(pending.ids, state.nodes, state.edges),
-        },
+    const preview = get().structuralPreview
+    if (!preview) return
+    void get()
+      .confirmStructuralToken(preview.key, preview.opToken)
+      .then((result) => {
+        if (!result.applied) {
+          get().showToast(
+            'The graph changed. Review the refreshed blast radius before confirming again.',
+            'error',
+          )
+        }
       })
-      state.showToast(
-        'The graph changed. Review the refreshed blast radius before confirming again.',
-        'error',
-      )
-      return
-    }
-    pendingStructuralOperation = null
-    set({ structuralPreview: null })
-    void pending.apply().catch((error: unknown) =>
-      reportMutationError(error, get()),
-    )
+      .catch((error: unknown) => reportMutationError(error, get()))
   },
   cancelStructural() {
-    pendingStructuralOperation = null
+    structuralConfirmation.cancel()
     set({ structuralPreview: null })
   },
   select(id) {
@@ -931,11 +1092,36 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       bypass_cap: true,
     }).catch((error: unknown) => reportMutationError(error, get()))
   },
+  setNodeRunState(nodeId, state) {
+    void sendMutation(
+      state === 'pause' ? 'PAUSE_REQUESTED' : 'RESUME_REQUESTED',
+      { node_id: nodeId },
+    ).catch((error: unknown) => reportMutationError(error, get()))
+  },
   setHighlights(highlightedIds) {
     set({ highlightedIds })
   },
   requestCamera(nodeIds) {
     set({ cameraRequest: { id: crypto.randomUUID(), nodeIds } })
+  },
+  showExplainOverlay(id, text, ttlSeconds) {
+    const previous = overlayTimers.get(id)
+    if (previous !== undefined) window.clearTimeout(previous)
+    set((state) => ({
+      explainOverlays: {
+        ...state.explainOverlays,
+        [id]: { text, expiresAt: Date.now() + ttlSeconds * 1_000 },
+      },
+    }))
+    const timer = window.setTimeout(() => {
+      overlayTimers.delete(id)
+      set((state) => ({
+        explainOverlays: Object.fromEntries(
+          Object.entries(state.explainOverlays).filter(([nodeId]) => nodeId !== id),
+        ),
+      }))
+    }, ttlSeconds * 1_000)
+    overlayTimers.set(id, timer)
   },
   showToast(message, tone = 'info', caption) {
     set({

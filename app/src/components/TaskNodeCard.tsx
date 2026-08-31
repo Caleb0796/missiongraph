@@ -11,6 +11,11 @@ export interface TaskNodeData extends Record<string, unknown> {
   idleFor?: string
   critical: boolean
   highlighted: boolean
+  previewStale: boolean
+  previewPausing: boolean
+  recordType: 'task' | 'group'
+  pauseRequested: boolean
+  overlayText?: string
 }
 
 export type TaskFlowNode = Node<TaskNodeData, 'missionTask'>
@@ -33,8 +38,15 @@ export function TaskNodeCard({ data, selected }: NodeProps<TaskFlowNode>) {
         data.critical ? 'mission-node--critical' : ''
       } ${selected ? 'mission-node--selected' : ''} ${
         data.highlighted ? 'mission-node--highlighted' : ''
-      }`}
+      } ${data.previewStale ? 'mission-node--preview-stale' : ''} ${
+        data.previewPausing ? 'mission-node--preview-pausing' : ''
+      } ${data.recordType === 'group' ? 'mission-node--split-parent' : ''}`}
     >
+      {data.overlayText && (
+        <aside className="mission-node-overlay" role="note">
+          {data.overlayText}
+        </aside>
+      )}
       <Handle
         type="target"
         position={Position.Left}
@@ -43,7 +55,11 @@ export function TaskNodeCard({ data, selected }: NodeProps<TaskFlowNode>) {
       <div className="flex items-center justify-between gap-3">
         <span className="mission-state">
           <span className="mission-state-dot" />
-          {stateLabels[data.displayState]}
+          {data.recordType === 'group'
+            ? 'Split parent'
+            : data.pauseRequested
+              ? 'Pausing…'
+              : stateLabels[data.displayState]}
         </span>
         <span className="font-mono text-[10px] tracking-[0.08em] text-slate-500">
           {data.estimate} min

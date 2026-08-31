@@ -1048,6 +1048,24 @@ export function mutateBatch(
   return queued
 }
 
+export function prepareBatchMutation(
+  batch: MutationBatchItem[],
+  options: Pick<MutationOptions, 'actor'> = {},
+) {
+  const actor = options.actor ?? 'human'
+  const context = captureMutationContext()
+  return () => {
+    const queued = mutationQueue.then(() =>
+      postMutationBatch(batch, actor, context),
+    )
+    mutationQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    )
+    return queued
+  }
+}
+
 function sharedIdentityFromUrl(): ClientIdentity | null {
   const params = new URLSearchParams(window.location.search)
   const project = params.get('mg_project')
