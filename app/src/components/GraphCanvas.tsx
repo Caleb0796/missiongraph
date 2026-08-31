@@ -11,7 +11,14 @@ import {
   type NodeChange,
 } from '@xyflow/react'
 import ELK from 'elkjs/lib/elk.bundled.js'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import '@xyflow/react/dist/style.css'
 import {
   getCriticalPath,
@@ -36,7 +43,10 @@ import {
   dismissFirstRunPrompts,
   skewCorrectedNow,
 } from '../transport/client-logic'
-import { getWebMcpRuntime } from '../webmcp/registry'
+import {
+  getWebMcpRegistryStatus,
+  subscribeWebMcpRegistryStatus,
+} from '../webmcp/registry'
 import { FlightPanel } from './FlightPanel'
 import { Inspector } from './Inspector'
 import { PulseBar } from './PulseBar'
@@ -80,6 +90,11 @@ async function createLayout(nodeIds: string[], edges: Edge[]) {
 }
 
 function MissionBoard() {
+  const webMcpStatus = useSyncExternalStore(
+    subscribeWebMcpRegistryStatus,
+    getWebMcpRegistryStatus,
+    getWebMcpRegistryStatus,
+  )
   const nodes = useMissionStore((state) => state.nodes)
   const edges = useMissionStore((state) => state.edges)
   const events = useMissionStore((state) => state.events)
@@ -559,7 +574,7 @@ function MissionBoard() {
         contextualToolsDegraded={contextualToolsDegraded}
       />
       <div className="canvas-notices">
-        {!getWebMcpRuntime() && (
+        {webMcpStatus.state !== 'active' && (
           <aside className="webmcp-banner" role="status">
             <strong>Enable WebMCP to work with your agent.</strong>
             <span>

@@ -203,6 +203,30 @@ test('WebMCP cursor and bootstrap retries are project-scoped', async () => {
   assert.match(pulse, />\s*Reconnect\s*</)
 })
 
+test('WebMCP discovery starts in parallel with mission-client initialization', async () => {
+  const app = await source('../src/App.tsx')
+  const registry = await source('../src/webmcp/registry.ts')
+  assert.match(
+    app,
+    /const missionClientInitialization = initializeMissionClient\(\)/,
+  )
+  assert.match(app, /\{ executionReady: missionClientInitialization \}/)
+  assert.doesNotMatch(app, /initializeMissionClient\(\)\.then/)
+  assert.match(registry, /await missionClientReadiness\(executionReady\)/)
+  assert.match(registry, /'mission_connecting'/)
+  assert.match(registry, /'mission_connection_failed'/)
+})
+
+test('late WebMCP activation updates the canvas and compatibility page reactively', async () => {
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  const compat = await source('../src/pages/CompatPage.tsx')
+  assert.match(canvas, /useSyncExternalStore\(/)
+  assert.match(canvas, /webMcpStatus\.state !== 'active'/)
+  assert.match(compat, /useSyncExternalStore\(/)
+  assert.match(compat, /await recheckWebMcp\(\)/)
+  assert.match(compat, /status\.state === 'active' \? status\.namespace/)
+})
+
 test('tool console keeps unknown tools and malformed JSON as inline errors', async () => {
   const consolePage = await source('../src/pages/ToolsPage.tsx')
   assert.match(consolePage, /This tool is unknown or was removed/)

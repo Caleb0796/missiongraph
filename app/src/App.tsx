@@ -13,12 +13,17 @@ import {
 function App() {
   useEffect(() => {
     if (window.location.pathname !== '/compat') {
-      void initializeMissionClient().then(() =>
-        initializeWebMcp(missionTools, {
+      const missionClientInitialization = initializeMissionClient()
+      void initializeWebMcp(
+        missionTools,
+        {
           all: contextualMissionTools,
           current: contextualToolsForCurrentState,
-        }),
-      )
+        },
+        { executionReady: missionClientInitialization },
+      ).catch((error) => {
+        console.error('[MissionGraph] WebMCP initialization failed.', error)
+      })
     }
   }, [])
 
