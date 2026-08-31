@@ -3,17 +3,22 @@ import test from 'node:test'
 
 import {
   bootstrapRetryDelay,
+  clockSampleIsFresh,
   connectionProvedStable,
   configuredServer,
+  digestRetryDelay,
   estimateClockSkew,
   eventBelongsToProject,
   identityFailureDisposition,
+  mutationEpochMatches,
   parseStoredIdentity,
   reconnectDelay,
   realtimeTransport,
   sequenceDisposition,
+  shouldApplyDigest,
   shouldApplySnapshot,
   skewCorrectedNow,
+  toolCursorForProject,
 } from '../src/transport/client-logic.ts'
 
 test('production uses only an absolute configured API URL', () => {
@@ -50,6 +55,22 @@ test('cross-project events and stale same-project snapshots are rejected', () =>
   assert.equal(shouldApplySnapshot('project-a', '42', 'project-b', '1'), true)
 })
 
+test('digest folds and mutation epochs reject foreign project context', () => {
+  assert.equal(shouldApplyDigest('project-b', '48', 'project-a', '100'), false)
+  assert.equal(shouldApplyDigest('project-b', '48', 'project-b', '47'), false)
+  assert.equal(shouldApplyDigest('project-b', '48', 'project-b', '49'), true)
+  assert.equal(mutationEpochMatches(7, 'project-a', 8, 'project-b'), false)
+  assert.equal(mutationEpochMatches(7, 'project-a', 7, 'project-b'), false)
+  assert.equal(mutationEpochMatches(7, 'project-a', 7, 'project-a'), true)
+})
+
+test('WebMCP cursor restarts history at zero after a project switch', () => {
+  const previous = { projectId: 'project-a', cursor: '100' }
+  assert.equal(toolCursorForProject(previous, 'project-b', '48'), '0')
+  assert.equal(toolCursorForProject(previous, 'project-a', '101'), '100')
+  assert.equal(toolCursorForProject(null, 'project-b', '48'), '48')
+})
+
 test('websocket drops back off with jitter and retain SSE resume semantics', () => {
   assert.equal(realtimeTransport(2), 'websocket')
   assert.equal(realtimeTransport(3), 'sse')
@@ -75,5 +96,12 @@ test('bootstrap retry and server-clock correction follow the recovery schedule',
   assert.equal(
     skewCorrectedNow(localReceipt, skew),
     Date.parse('2026-08-30T10:00:00.000Z'),
+  )
+  assert.equal(estimateClockSkew('2026-09-01T10:00:00.000Z', localReceipt), 0)
+  assert.equal(clockSampleIsFresh(localReceipt, localReceipt + 60_000), true)
+  assert.equal(clockSampleIsFresh(localReceipt, localReceipt + 6 * 60_000), false)
+  assert.deepEqual(
+    [0, 1, 2, 3, 4].map(digestRetryDelay),
+    [500, 1_500, 5_000, 15_000, null],
   )
 })
