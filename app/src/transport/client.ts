@@ -25,6 +25,7 @@ import {
   parseStoredIdentity,
   reconnectDelay,
   realtimeTransport,
+  recoverSequenceAfterSnapshot,
   sequenceDisposition,
   type ClientIdentity,
   type IdentitySource,
@@ -903,6 +904,7 @@ function openRealtime(candidate = identity) {
 async function waitForSequence(seq: number, context: MutationContext) {
   const candidate = context.candidate
   if (!candidate) return
+  const preMutationCursor = context.cursor
   const deadline = Date.now() + 1_500
   while (
     mutationContextIsActive(context) &&
@@ -915,7 +917,11 @@ async function waitForSequence(seq: number, context: MutationContext) {
     mutationContextIsActive(context) &&
     Number(useMissionStore.getState().cursor) < seq
   ) {
-    await refreshSnapshot(candidate)
+    await recoverSequenceAfterSnapshot(
+      preMutationCursor,
+      () => refreshSnapshot(candidate),
+      (since) => loadChangesSince(since, candidate),
+    )
   }
   assertMutationContextActive(context, 'mutation completion')
 }
@@ -1278,6 +1284,7 @@ async function stageActionConfirmation(
     const subjectHash = await valueHash(mutation)
     state.stageHumanConfirmation({
       id: draftId,
+      textHash: subjectHash,
       kind: 'action',
       title: 'Human confirmation required',
       text: actionSummary(action, batch),
@@ -1324,6 +1331,7 @@ async function stageActionConfirmation(
   let confirmedCapability: ActionConfirmationResponse | null = null
   state.stageHumanConfirmation({
     id: draft.draft_id,
+    textHash: draft.subject_hash,
     kind: 'action',
     title: 'Human confirmation required',
     text: draft.summary,
@@ -1541,6 +1549,7 @@ export async function stagePolicyDraft(text: string) {
     }
     state.stageHumanConfirmation({
       id: draft.draft_id,
+      textHash: draft.policy_hash,
       kind: 'policy',
       title: 'Confirm session approval policy',
       text: draft.text,
@@ -1602,6 +1611,7 @@ export async function stagePolicyDraft(text: string) {
   let confirmedPolicy: PolicyConfirmationResponse | null = null
   state.stageHumanConfirmation({
     id: draft.draft_id,
+    textHash: draft.policy_hash,
     kind: 'policy',
     title: 'Confirm session approval policy',
     text: draft.text,

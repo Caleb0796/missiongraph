@@ -17,6 +17,8 @@ import {
   parseStoredIdentity,
   reconnectDelay,
   realtimeTransport,
+  recoverSequenceAfterSnapshot,
+  safeDigestMetadata,
   sequenceDisposition,
   shouldApplyDigest,
   shouldApplySnapshot,
@@ -56,6 +58,94 @@ test('foreign-link 404 preserves the stored identity and uses HTTP status', () =
   assert.equal(identityFailureDisposition('url', undefined), 'retry')
   assert.equal(identityFailureDisposition('stored', 404), 'replace-stored')
   assert.equal(identityFailureDisposition('stored', undefined), 'retry')
+})
+
+test('tool envelope changes expose safe policy authorization metadata only', () => {
+  const policyEvent = {
+    seq: 5,
+    project_id: 'project',
+    ts: '2026-08-30T10:05:00.000Z',
+    actor: 'human',
+    type: 'POLICY_STATED',
+    payload: {
+      policy_ref: 'policy-a',
+      text: 'Approve green diffs.',
+      scope: 'session',
+      session_id: 'session-a',
+      capability: 'must-not-escape',
+    },
+    idem_key: 'policy-a',
+  }
+  const policyChange = {
+    seq: policyEvent.seq,
+    actor: policyEvent.actor,
+    type: policyEvent.type,
+    one_liner: 'Human stated an approval policy: Approve green diffs.',
+    ...safeDigestMetadata(policyEvent),
+  }
+  const policyRefReadByAgent = policyChange.policy_ref
+  const approvedEvent = {
+    seq: 6,
+    project_id: 'project',
+    ts: '2026-08-30T10:05:01.000Z',
+    actor: 'browser_agent',
+    type: 'APPROVED',
+    payload: {
+      approval_id: 'approval-a',
+      node_id: 'a',
+      policy_ref: policyRefReadByAgent,
+      authorization: {
+        capability_ref: 'policy-a',
+        confirmed_at: policyEvent.ts,
+        request_origin: 'https://missiongraph.vercel.app',
+        use_nonce: 'approval-use-a',
+        capability: 'must-not-escape',
+      },
+    },
+    idem_key: 'approved-a',
+  }
+  const approvedChange = {
+    seq: approvedEvent.seq,
+    actor: approvedEvent.actor,
+    type: approvedEvent.type,
+    one_liner: 'Browser agent approved Task a.',
+    ...safeDigestMetadata(approvedEvent),
+  }
+  const envelope = {
+    ok: true,
+    cursor: '6',
+    changes_since: [policyChange, approvedChange],
+  }
+
+  assert.equal(policyRefReadByAgent, 'policy-a')
+  assert.deepEqual(envelope.changes_since[1].authorization, {
+    capability_ref: 'policy-a',
+    use_nonce: 'approval-use-a',
+  })
+  assert.doesNotMatch(JSON.stringify(envelope), /must-not-escape/)
+})
+
+test('snapshot fallback replays the mutation event from its captured cursor once', async () => {
+  let cursor = '5'
+  const changes = []
+  const record = (event) => {
+    if (!changes.some((change) => change.seq === event.seq)) changes.push(event)
+  }
+
+  await recoverSequenceAfterSnapshot(
+    '5',
+    async () => {
+      cursor = '6'
+    },
+    async (since) => {
+      assert.equal(since, '5')
+      assert.equal(cursor, '6')
+      record({ seq: 6, type: 'APPROVED' })
+      record({ seq: 6, type: 'APPROVED' })
+    },
+  )
+
+  assert.deepEqual(changes, [{ seq: 6, type: 'APPROVED' }])
 })
 
 test('cross-project events and stale same-project snapshots are rejected', () => {

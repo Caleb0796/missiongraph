@@ -164,8 +164,10 @@ test('consequential actions use a visible project-bound human confirmation', asy
   assert.match(canvas, /humanConfirmation\.text/)
   assert.match(canvas, /humanConfirmation\.details\.map/)
   assert.match(canvas, /humanConfirmation\.expiresAt/)
-  assert.match(canvas, /onClick=\{denyHumanConfirmation\}/)
-  assert.match(canvas, /onClick=\{confirmHumanConfirmation\}/)
+  assert.match(canvas, /denyHumanConfirmation\(\s*humanConfirmation\.id,\s*humanConfirmation\.textHash/)
+  assert.match(canvas, /confirmHumanConfirmation\(\s*humanConfirmation\.id,\s*humanConfirmation\.textHash/)
+  assert.match(store, /requireConfirmationSlot\(get\(\)\.humanConfirmation\)/)
+  assert.match(store, /Confirmation changed; review the visible draft/)
 })
 
 test('identity recovery is source-aware and realtime resumes with fenced backoff', async () => {
@@ -307,7 +309,10 @@ test('judge first-run prompts and WebMCP guidance are wired into the canvas', as
   const styles = await source('../src/index.css')
   assert.match(canvas, /Ask your agent to catch you up on this mission/)
   assert.match(canvas, /Ask it to clear the approval queue under a policy you state/)
-  assert.match(canvas, /Ask it to find idle work and staff it/)
+  assert.match(
+    canvas,
+    /Split the running task into build and deploy halves — show me the blast radius first\./,
+  )
   assert.match(canvas, /claimFirstRunPrompts\(projectId\)/)
   assert.match(canvas, /dismissFirstRunPrompts\(projectId\)/)
   assert.match(canvas, /copyText\(prompt\)/)

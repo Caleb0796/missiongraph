@@ -1,3 +1,5 @@
+import type { DigestChange, MissionEvent } from '../model/types'
+
 export interface ClientIdentity {
   project: string
   token: string
@@ -222,4 +224,33 @@ export function sequenceDisposition(cursor: string, incoming: number) {
   if (incoming <= current) return 'duplicate' as const
   if (incoming === current + 1) return 'next' as const
   return 'gap' as const
+}
+
+export function safeDigestMetadata(
+  event: MissionEvent,
+): Partial<Pick<DigestChange, 'policy_ref' | 'authorization'>> {
+  if (event.type === 'POLICY_STATED') {
+    return { policy_ref: event.payload.policy_ref }
+  }
+  if (
+    (event.type === 'APPROVED' || event.type === 'REJECTED') &&
+    event.payload.authorization
+  ) {
+    return {
+      authorization: {
+        capability_ref: event.payload.authorization.capability_ref,
+        use_nonce: event.payload.authorization.use_nonce,
+      },
+    }
+  }
+  return {}
+}
+
+export async function recoverSequenceAfterSnapshot(
+  preMutationCursor: string,
+  refreshSnapshot: () => Promise<void>,
+  replayChanges: (since: string) => Promise<void>,
+) {
+  await refreshSnapshot()
+  await replayChanges(preMutationCursor)
 }

@@ -58,7 +58,7 @@ const nodeTypes = { missionTask: TaskNodeCard }
 const AGENT_PROMPTS = [
   'Ask your agent to catch you up on this mission',
   'Ask it to clear the approval queue under a policy you state',
-  'Ask it to find idle work and staff it',
+  'Split the running task into build and deploy halves — show me the blast radius first.',
 ] as const
 
 async function createLayout(nodeIds: string[], edges: Edge[]) {
@@ -684,7 +684,12 @@ function MissionBoard() {
               <button
                 type="button"
                 className="action-secondary"
-                onClick={denyHumanConfirmation}
+                onClick={() =>
+                  denyHumanConfirmation(
+                    humanConfirmation.id,
+                    humanConfirmation.textHash,
+                  )
+                }
                 disabled={humanConfirmation.busy}
               >
                 Deny
@@ -692,7 +697,12 @@ function MissionBoard() {
               <button
                 type="button"
                 className="action-primary"
-                onClick={confirmHumanConfirmation}
+                onClick={() =>
+                  confirmHumanConfirmation(
+                    humanConfirmation.id,
+                    humanConfirmation.textHash,
+                  )
+                }
                 disabled={humanConfirmation.busy}
               >
                 {humanConfirmation.busy ? 'Confirming…' : 'Confirm'}

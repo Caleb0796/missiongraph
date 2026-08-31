@@ -234,6 +234,11 @@ export interface DigestChange {
   actor: Actor
   type: EvType
   one_liner: string
+  policy_ref?: string
+  authorization?: {
+    capability_ref: string
+    use_nonce: string
+  }
 }
 
 export interface GraphDigest {

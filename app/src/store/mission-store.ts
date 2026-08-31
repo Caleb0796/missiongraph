@@ -32,6 +32,7 @@ import type {
 } from '../model/types'
 import {
   eventBelongsToProject,
+  safeDigestMetadata,
   shouldApplyDigest,
   shouldApplySnapshot,
 } from '../transport/client-logic'
@@ -39,6 +40,10 @@ import {
   StructuralConfirmationController,
   type StructuralOperationProposal,
 } from './structural-confirmation'
+import {
+  confirmationMatches,
+  requireConfirmationSlot,
+} from './human-confirmation'
 
 interface Point {
   x: number
@@ -69,6 +74,7 @@ interface StructuralPreview {
 
 export interface HumanConfirmation {
   id: string
+  textHash?: string
   kind: 'policy' | 'action'
   title: string
   text: string
@@ -189,8 +195,8 @@ interface MissionState {
   confirmStructural: () => void
   cancelStructural: () => void
   stageHumanConfirmation: (confirmation: HumanConfirmation) => void
-  confirmHumanConfirmation: () => void
-  denyHumanConfirmation: () => void
+  confirmHumanConfirmation: (id: string, textHash?: string) => void
+  denyHumanConfirmation: (id: string, textHash?: string) => void
   select: (id: string | null) => void
   approve: (nodeId: string, policyRef?: string) => void
   reject: (nodeId: string, policyRef?: string) => void
@@ -484,12 +490,14 @@ function eventChange(
         : event.actor === 'supervisor'
           ? 'Supervisor'
           : `Worker ${event.actor.slice('worker:'.length)}`
-  return {
+  const change: DigestChange = {
     seq: event.seq,
     actor: event.actor,
     type: event.type,
     one_liner: `${actor}: ${describeEvent(event, nodes, edges)}`,
+    ...safeDigestMetadata(event),
   }
+  return change
 }
 
 function topologyKey(nodes: TaskNode[], edges: GraphEdge[]) {
@@ -1173,26 +1181,35 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     set({ structuralPreview: null })
   },
   stageHumanConfirmation(humanConfirmation) {
-    denyWithoutBlocking(get().humanConfirmation)
+    requireConfirmationSlot(get().humanConfirmation)
     set({ humanConfirmation: { ...humanConfirmation, busy: false } })
   },
-  confirmHumanConfirmation() {
+  confirmHumanConfirmation(id, textHash) {
     const pending = get().humanConfirmation
     if (!pending || pending.busy) return
+    if (!confirmationMatches(pending, id, textHash)) {
+      get().showToast(
+        'Confirmation changed; review the visible draft before confirming.',
+        'error',
+      )
+      return
+    }
     set({ humanConfirmation: { ...pending, busy: true } })
     void pending.confirm().then(
       () => {
-        if (get().humanConfirmation?.id === pending.id) {
+        const current = get().humanConfirmation
+        if (confirmationMatches(current, pending.id, pending.textHash)) {
           set({ humanConfirmation: null })
+          get().showToast(
+            pending.kind === 'policy'
+              ? 'Policy confirmed for this browser session'
+              : 'Confirmed action completed',
+          )
         }
-        get().showToast(
-          pending.kind === 'policy'
-            ? 'Policy confirmed for this browser session'
-            : 'Confirmed action completed',
-        )
       },
       (error: unknown) => {
-        if (get().humanConfirmation?.id === pending.id) {
+        const current = get().humanConfirmation
+        if (confirmationMatches(current, pending.id, pending.textHash)) {
           set({
             humanConfirmation:
               typeof error === 'object' &&
@@ -1207,19 +1224,28 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       },
     )
   },
-  denyHumanConfirmation() {
+  denyHumanConfirmation(id, textHash) {
     const pending = get().humanConfirmation
     if (!pending || pending.busy) return
+    if (!confirmationMatches(pending, id, textHash)) {
+      get().showToast(
+        'Confirmation changed; review the visible draft before denying.',
+        'error',
+      )
+      return
+    }
     set({ humanConfirmation: { ...pending, busy: true } })
     void (pending.deny?.() ?? Promise.resolve()).then(
       () => {
-        if (get().humanConfirmation?.id === pending.id) {
+        const current = get().humanConfirmation
+        if (confirmationMatches(current, pending.id, pending.textHash)) {
           set({ humanConfirmation: null })
+          get().showToast('Confirmation denied; nothing changed.')
         }
-        get().showToast('Confirmation denied; nothing changed.')
       },
       (error: unknown) => {
-        if (get().humanConfirmation?.id === pending.id) {
+        const current = get().humanConfirmation
+        if (confirmationMatches(current, pending.id, pending.textHash)) {
           set({ humanConfirmation: { ...pending, busy: false } })
         }
         reportMutationError(error, get())
