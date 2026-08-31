@@ -26,9 +26,10 @@ jobs:
       - name: Install
         working-directory: ${{ matrix.package }}
         run: pnpm install --frozen-lockfile
-      # app's real-server regression spins up the actual server package in-process
+      # app's real-server regression and bridge's dry-run integration both spawn
+      # the actual server package (tsx), so its dependencies must be present
       - name: Install server deps for cross-package tests
-        if: matrix.package == 'app'
+        if: matrix.package != 'server'
         working-directory: server
         run: pnpm install --frozen-lockfile
       - name: Test
