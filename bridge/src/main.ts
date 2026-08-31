@@ -60,6 +60,16 @@ async function main(): Promise<void> {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // The daemon must outlive a failed supervisor/worker turn: durable state and the
+  // action ledger make continuing safe, so stray async failures are logged, not fatal.
+  process.on("unhandledRejection", (reason) => {
+    consoleLogger.error(
+      `unhandled rejection (daemon continues): ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
+    );
+  });
+  process.on("uncaughtException", (error) => {
+    consoleLogger.error(`uncaught exception (daemon continues): ${error.stack ?? error.message}`);
+  });
   main().catch((error: unknown) => {
     process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
     process.exitCode = 1;

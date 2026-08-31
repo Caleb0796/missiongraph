@@ -100,4 +100,25 @@ describe("CodexClient", () => {
     expect(Buffer.byteLength(retained)).toBe(2 * 1024 * 1024);
     expect(retained.endsWith("tail")).toBe(true);
   });
+
+  it("resume invocations never pass -s: codex exec resume only accepts sandbox_mode via -c", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-codex-args-"));
+    try {
+      const bridgeConfig = config(root);
+      const client = new CodexClient(bridgeConfig, new TestLogger(), true) as unknown as {
+        supervisorResumeArgs(threadId: string, message: string): string[];
+        workerResumeArgs(threadId: string, message: string): string[];
+      };
+      for (const args of [
+        client.supervisorResumeArgs("thread-1", "envelope"),
+        client.workerResumeArgs("thread-2", "message"),
+      ]) {
+        expect(args.slice(0, 2)).toEqual(["exec", "resume"]);
+        expect(args).not.toContain("-s");
+        expect(args.some((argument) => argument.startsWith("sandbox_mode="))).toBe(true);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

@@ -23,7 +23,8 @@ if (args[1] === "resume") {
   const threadId = args[2];
   const message = args[3] ?? "";
   const supervisor = threadId?.startsWith("mock-supervisor");
-  if (!includesPair("-s", supervisor ? "read-only" : "workspace-write")) process.exit(4);
+  if (args.includes("-s")) process.exit(9);
+  if (!includesPair("-c", supervisor ? 'sandbox_mode="read-only"' : 'sandbox_mode="workspace-write"')) process.exit(4);
   if (supervisor && args.includes("sandbox_workspace_write.network_access=true")) process.exit(5);
   if (!supervisor && !args.includes("sandbox_workspace_write.network_access=true")) process.exit(6);
   emit({ type: "thread.started", thread_id: threadId });
