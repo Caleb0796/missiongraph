@@ -217,6 +217,12 @@ Required tests:
 
 Suggested commit: `fix(security): bind agent approvals to human presence`
 
+#### Post-S2 known limitation
+
+The human-presence dialog binds a grant to an explicit interaction with the exact draft visibly rendered on the page, but it does not establish an independent human identity. A browser agent that can drive the page UI—or any holder of the visitor bearer that calls the same HTTP session, staging, and confirmation routes—can still complete that interaction. True human/agent separation requires platform-backed, out-of-band user verification; that is the product path described by proposed v1.6 security-contract addendum item 1.
+
+The current boundary still has concrete value: no WebMCP tool can invoke confirmation, every grant and use is recorded with a unique nonce, and a displayed draft cannot be substituted by a second staged request before the user acts. Actor stamping has the same limitation: the server chooses `human` for `/mutations` and `browser_agent` for `/agent-mutations` instead of trusting a header, but a visitor-bearer holder can choose either route. Those labels therefore prove which authenticated route accepted the request, not that a natural person—as distinct from an agent controlling the page or bearer—originated it.
+
 ### S3 — Put a deterministic authorization boundary after the supervisor model
 
 1. Replace model-authored `spawn_worker.brief` with a non-authoritative action such as `{act:"spawn_worker", node_id}`. The bridge, not the model, must fetch the canonical node/execution profile.
