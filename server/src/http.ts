@@ -406,6 +406,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     }
   });
 
+  app.get("/api/health", async (_request, reply) => {
+    return reply.send({ ok: true });
+  });
+
   app.get("/api/p/:project/snapshot", async (request, reply) => {
     const project = (request.params as { project: string }).project;
     if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
