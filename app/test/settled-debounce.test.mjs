@@ -17,18 +17,21 @@ test('rapid cosmetic selection posts debounce to the settled local value', async
     },
   }
   const posted = []
+  let cursor = 8
   const debouncer = new SettledDebouncer(scheduler)
   const first = debouncer.schedule('selection', 300, 8, async () => {
-    posted.push('task-a')
+    posted.push({ id: 'task-a', cursor })
     return 9
   })
+  cursor = 9
   const second = debouncer.schedule('selection', 300, 8, async () => {
-    posted.push('task-b')
-    return 9
+    posted.push({ id: 'task-b', cursor })
+    return cursor
   })
   assert.equal(await first, 8)
   assert.equal(timers.size, 1)
+  cursor = 10
   timers.values().next().value()
-  assert.equal(await second, 9)
-  assert.deepEqual(posted, ['task-b'])
+  assert.equal(await second, 10)
+  assert.deepEqual(posted, [{ id: 'task-b', cursor: 10 }])
 })

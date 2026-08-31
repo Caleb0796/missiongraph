@@ -1020,15 +1020,18 @@ export function mutate<T extends EvType>(
   options: MutationOptions = {},
 ): Promise<number> {
   const actor = options.actor ?? 'human'
-  const context = captureMutationContext(options.staleMode)
   if (options.debounceKey) {
     return mutationDebouncer.schedule(
       options.debounceKey,
       300,
-      Number(context.cursor),
-      () => enqueueMutation(type, payload, actor, context),
+      Number(useMissionStore.getState().cursor),
+      () => {
+        const context = captureMutationContext(options.staleMode)
+        return enqueueMutation(type, payload, actor, context)
+      },
     )
   }
+  const context = captureMutationContext(options.staleMode)
   return enqueueMutation(type, payload, actor, context)
 }
 
