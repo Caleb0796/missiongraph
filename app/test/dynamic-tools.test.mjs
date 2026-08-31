@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { DynamicToolController } from '../src/webmcp/dynamic-tools.ts'
+import {
+  detectDynamicRegistrationTier,
+  DynamicToolController,
+  executeRegisteredTool,
+} from '../src/webmcp/dynamic-tools.ts'
 
 const tool = (name) => ({ name })
 
@@ -33,6 +37,148 @@ function modelContext() {
     },
   }
 }
+
+test('tier detection uses a live signal and tolerates opaque aborted-signal errors', async () => {
+  const active = new Set()
+  let receivedPreAbortedSignal = false
+  const context = {
+    async getTools() {
+      return [...active].map((name) => ({ name }))
+    },
+    registerTool(item, options) {
+      if (options?.signal?.aborted) {
+        receivedPreAbortedSignal = true
+        throw {}
+      }
+      active.add(item.name)
+      options?.signal?.addEventListener(
+        'abort',
+        () => active.delete(item.name),
+        { once: true },
+      )
+    },
+  }
+
+  assert.equal(
+    await detectDynamicRegistrationTier(
+      context,
+      tool('hello_missiongraph'),
+      async () => undefined,
+    ),
+    'abort-controller',
+  )
+  assert.equal(receivedPreAbortedSignal, false)
+  assert.deepEqual([...active], [])
+})
+
+test('tier detection falls back to full context replacement when abort is ignored', async () => {
+  const active = new Set()
+  const context = {
+    async getTools() {
+      return [...active].map((name) => ({ name }))
+    },
+    registerTool(item) {
+      active.add(item.name)
+    },
+    provideContext() {},
+  }
+
+  assert.equal(
+    await detectDynamicRegistrationTier(
+      context,
+      tool('hello_missiongraph'),
+      async () => undefined,
+    ),
+    'provide-context',
+  )
+  assert.deepEqual([...active], ['hello_missiongraph'])
+})
+
+test('tier detection keeps the probe as a core tool in the static fallback', async () => {
+  const active = new Set()
+  const context = {
+    async getTools() {
+      return [...active].map((name) => ({ name }))
+    },
+    registerTool(item) {
+      active.add(item.name)
+    },
+  }
+
+  assert.equal(
+    await detectDynamicRegistrationTier(
+      context,
+      tool('hello_missiongraph'),
+      async () => undefined,
+    ),
+    'none',
+  )
+  assert.deepEqual([...active], ['hello_missiongraph'])
+})
+
+test('tool execution uses the documented JSON string input when supported', async () => {
+  const inputs = []
+  const runtime = {
+    namespace: 'document',
+    modelContext: {
+      async executeTool(_registered, input) {
+        inputs.push(input)
+        return '{"ok":true}'
+      },
+    },
+  }
+
+  assert.equal(
+    await executeRegisteredTool(runtime, tool('hello_missiongraph'), {
+      greeting: 'hello',
+    }),
+    '{"ok":true}',
+  )
+  assert.deepEqual(inputs, ['{"greeting":"hello"}'])
+})
+
+test('tool execution retries with an object for the current in-app runtime', async () => {
+  const inputs = []
+  const runtime = {
+    namespace: 'document',
+    modelContext: {
+      async executeTool(_registered, input) {
+        inputs.push(input)
+        if (typeof input === 'string') {
+          throw new Error('WebMCP executeTool requires an object input.')
+        }
+        return '"{\\"ok\\":true}"'
+      },
+    },
+  }
+
+  assert.equal(
+    await executeRegisteredTool(runtime, tool('hello_missiongraph'), {
+      greeting: 'hello',
+    }),
+    '{"ok":true}',
+  )
+  assert.deepEqual(inputs, ['{"greeting":"hello"}', { greeting: 'hello' }])
+})
+
+test('tool execution does not retry application failures', async () => {
+  let attempts = 0
+  const runtime = {
+    namespace: 'document',
+    modelContext: {
+      async executeTool() {
+        attempts++
+        throw new Error('tool failed')
+      },
+    },
+  }
+
+  await assert.rejects(
+    executeRegisteredTool(runtime, tool('hello_missiongraph'), {}),
+    /tool failed/,
+  )
+  assert.equal(attempts, 1)
+})
 
 test('abort-controller tier unregisters contextual tools without leaks or duplicates', async () => {
   const context = modelContext()

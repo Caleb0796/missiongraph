@@ -1,7 +1,6 @@
 export type RegistryLifecycleStatus<T extends object> =
   | ({ state: 'active' } & T)
-  | { state: 'waiting' }
-  | { state: 'unsupported' }
+  | { state: 'waiting'; error?: string }
 
 type Cleanup = () => Promise<void> | void
 
@@ -53,6 +52,7 @@ interface RegistryLifecycleOptions<Runtime, Active extends object> {
     runtime: Runtime,
     scope: RegistrationScope,
   ) => Promise<Active>
+  errorMessage?: (error: unknown) => string
   onBackgroundError?: (error: unknown) => void
 }
 
@@ -66,6 +66,7 @@ export class RegistryLifecycle<Runtime, Active extends object> {
     runtime: Runtime,
     scope: RegistrationScope,
   ) => Promise<Active>
+  private readonly errorMessage: (error: unknown) => string
   private readonly onBackgroundError: (error: unknown) => void
   private readonly listeners = new Set<() => void>()
   private status: RegistryLifecycleStatus<Active> = { state: 'waiting' }
@@ -80,6 +81,7 @@ export class RegistryLifecycle<Runtime, Active extends object> {
   constructor(options: RegistryLifecycleOptions<Runtime, Active>) {
     this.getRuntime = options.getRuntime
     this.bootstrap = options.bootstrap
+    this.errorMessage = options.errorMessage ?? String
     this.onBackgroundError = options.onBackgroundError ?? (() => undefined)
   }
 
@@ -181,7 +183,9 @@ export class RegistryLifecycle<Runtime, Active extends object> {
         this.onBackgroundError(cleanupError)
       }
       if (this.pendingScope === scope) this.pendingScope = null
-      if (generation === this.generation) this.setStatus({ state: 'waiting' })
+      if (generation === this.generation) {
+        this.setStatus({ state: 'waiting', error: this.errorMessage(error) })
+      }
       throw error
     }
   }
@@ -218,7 +222,14 @@ export class RegistryLifecycle<Runtime, Active extends object> {
   }
 
   private setStatus(status: RegistryLifecycleStatus<Active>) {
-    if (this.status.state === status.state) return
+    if (
+      this.status.state === status.state &&
+      (status.state !== 'waiting' ||
+        (this.status.state === 'waiting' &&
+          this.status.error === status.error))
+    ) {
+      return
+    }
     this.status = status
     this.listeners.forEach((listener) => listener())
   }

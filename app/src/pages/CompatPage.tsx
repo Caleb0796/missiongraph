@@ -1,5 +1,6 @@
 import { useEffect, useState, useSyncExternalStore } from 'react'
 import {
+  executeRegisteredTool,
   getWebMcpRegistryStatus,
   getWebMcpRuntime,
   initializeWebMcp,
@@ -37,10 +38,10 @@ export function CompatPage() {
   )
   const [rawResult, setRawResult] = useState('No self-test run yet.')
   const [running, setRunning] = useState(false)
+  const runtimeAvailable = getWebMcpRuntime() !== null
 
   useEffect(() => {
-    void initializeWebMcp()
-      .catch((error) => setRawResult(formatRaw(error)))
+    void initializeWebMcp().catch((error) => setRawResult(formatRaw(error)))
   }, [])
 
   async function recheckRuntime() {
@@ -82,7 +83,7 @@ export function CompatPage() {
       const tools = await runtime.modelContext.getTools()
       const helloTool = tools.find((tool) => tool.name === 'hello_missiongraph')
       if (!helloTool) throw new Error('hello_missiongraph was not found by getTools().')
-      setRawResult(formatRaw(await runtime.modelContext.executeTool(helloTool, '{}')))
+      setRawResult(formatRaw(await executeRegisteredTool(runtime, helloTool, {})))
     } catch (error) {
       setRawResult(formatRaw(error))
     } finally {
@@ -109,11 +110,16 @@ export function CompatPage() {
 
         {status.state !== 'active' && (
           <section className="mt-8 rounded-xl border border-amber-400/40 bg-amber-400/10 p-5 text-amber-100">
-            <h2 className="font-semibold">WebMCP is not enabled</h2>
+            <h2 className="font-semibold">
+              {runtimeAvailable
+                ? 'WebMCP registration is retrying'
+                : 'WebMCP is not enabled'}
+            </h2>
             <p className="mt-1 text-sm leading-6">
-              In ChatGPT: Settings → Browser → Permissions → Enable site tools, with
-              model GPT-5.6 Sol or Terra (Luna has WebMCP off). In Chrome: enable
-              chrome://flags/#enable-webmcp-testing, then relaunch.
+              {runtimeAvailable
+                ? status.error ??
+                  'MissionGraph detected the API and is waiting for tool registration.'
+                : 'In ChatGPT: Settings → Browser → Permissions → Enable site tools, with model GPT-5.6 Sol or Terra (Luna has WebMCP off). In Chrome: enable chrome://flags/#enable-webmcp-testing, then relaunch.'}
             </p>
           </section>
         )}

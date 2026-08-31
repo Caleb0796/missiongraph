@@ -18,6 +18,114 @@ afterEach(async () => {
   while (openServers.length > 0) await openServers.pop()?.app.close();
 });
 
+function seedPendingApproval(
+  store: MissionGraphServer["store"],
+  project: string,
+  nodeId: string,
+  approvalId = `approval-${nodeId}`,
+) {
+  store.append(project, {
+    actor: "human",
+    type: "TASK_ADDED",
+    payload: {
+      node: {
+        id: nodeId,
+        title: `Task ${nodeId}`,
+        brief: `Build ${nodeId}.`,
+        estimate_min: 10,
+        tags: [],
+        state: "queued",
+      },
+    },
+    idem_key: `add-${nodeId}`,
+  });
+  store.append(project, {
+    actor: `worker:${nodeId}`,
+    type: "NODE_STATE_CHANGED",
+    payload: { node_id: nodeId, from: "queued", to: "running" },
+    idem_key: `running-${nodeId}`,
+  });
+  store.append(project, {
+    actor: `worker:${nodeId}`,
+    type: "HANDOFF_FILED",
+    payload: { node_id: nodeId, handoff: baseHandoff },
+    idem_key: `handoff-${nodeId}`,
+  });
+  store.append(project, {
+    actor: "supervisor",
+    type: "APPROVAL_CREATED",
+    payload: { approval_id: approvalId, node_id: nodeId, summary: `Review task ${nodeId}.` },
+    idem_key: approvalId,
+  });
+}
+
+function registerBrowserSession(
+  store: MissionGraphServer["store"],
+  project: string,
+  session: string,
+  proof: string,
+) {
+  store.issueBrowserSession({
+    id: session,
+    token: proof,
+    project_id: project,
+    created_at: "2026-08-30T10:00:00.000Z",
+    expires_at: "2026-09-01T10:00:00.000Z",
+  });
+}
+
+async function issuePolicy(
+  app: MissionGraphServer["app"],
+  input: {
+    project: string;
+    token: string;
+    session: string;
+    proof: string;
+    text?: string;
+    maxUses?: number;
+    origin?: string;
+  },
+) {
+  const staged = await app.inject({
+    method: "POST",
+    url: `/api/p/${input.project}/policy-drafts`,
+    headers: {
+      "x-mg-token": input.token,
+      "x-mg-session": input.session,
+      "x-mg-session-proof": input.proof,
+    },
+    payload: {
+      text: input.text ?? "Approve green diffs.",
+      ...(input.maxUses === undefined ? {} : { max_uses: input.maxUses }),
+    },
+  });
+  const draft = staged.json<{ draft_id: string }>();
+  const confirmed = await app.inject({
+    method: "POST",
+    url: `/api/p/${input.project}/policy-drafts/${draft.draft_id}/confirm`,
+    headers: {
+      "x-mg-token": input.token,
+      "x-mg-session": input.session,
+      "x-mg-session-proof": input.proof,
+      ...(input.origin ? { origin: input.origin } : {}),
+    },
+  });
+  return {
+    staged,
+    confirmed,
+    draft,
+    grant: confirmed.json<{
+      policy_ref: string;
+      capability: string;
+      allowed_actions: string[];
+      max_uses: number;
+      expires_at: string;
+      confirmed_at: string;
+      seq: number;
+    }>(),
+  };
+}
+
 describe("HTTP and streaming contract", () => {
   it("answers CORS preflights only for configured origins", async () => {
     const { app } = server({ allowedOrigins: ["https://missiongraph.vercel.app"] });
@@ -40,7 +148,35 @@ describe("HTTP and streaming contract", () => {
     expect(allowed.headers["access-control-allow-origin"]).toBe("https://missiongraph.vercel.app");
     expect(allowed.headers["access-control-allow-headers"]).toContain("x-mg-token");
     expect(allowed.headers["access-control-allow-headers"]).toContain("x-mg-session");
+    expect(allowed.headers["access-control-allow-headers"]).toContain("x-mg-session-proof");
     expect(denied.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("issues project-bound browser sessions without storing their raw proof", async () => {
+    const issuedAt = "2026-08-30T10:05:00.000Z";
+    const { app, store } = server({ now: () => new Date(issuedAt) });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/p/project/browser-sessions",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+    const session = response.json<{
+      session_id: string;
+      session_proof: string;
+      expires_at: string;
+    }>();
+    const stored = store.database
+      .prepare("SELECT token_hash, project_id FROM browser_sessions WHERE id = ?")
+      .get(session.session_id) as { token_hash: string; project_id: string };
+
+    expect(response.statusCode).toBe(200);
+    expect(session.expires_at).toBe("2026-08-30T22:05:00.000Z");
+    expect(stored).toMatchObject({ project_id: "project" });
+    expect(stored.token_hash).not.toBe(session.session_proof);
+    expect(JSON.stringify(stored)).not.toContain(session.session_proof);
+    expect(store.browserSessionMatches("project", session.session_id, session.session_proof, issuedAt)).toBe(true);
+    expect(store.browserSessionMatches("project", session.session_id, "wrong", issuedAt)).toBe(false);
   });
 
   it("applies mutation batches atomically with server-assigned ids", async () => {
@@ -49,8 +185,8 @@ describe("HTTP and streaming contract", () => {
     store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
     const invalid = await app.inject({
       method: "POST",
-      url: "/api/p/project/mutations",
-      headers: { "x-mg-token": "visitor-token", "x-mg-actor": "browser_agent" },
+      url: "/api/p/project/agent-mutations",
+      headers: { "x-mg-token": "visitor-token" },
       payload: {
         batch: [
           {
@@ -97,23 +233,24 @@ describe("HTTP and streaming contract", () => {
     };
     const valid = await app.inject({
       method: "POST",
-      url: "/api/p/project/mutations",
-      headers: { "x-mg-token": "visitor-token", "x-mg-actor": "browser_agent" },
+      url: "/api/p/project/agent-mutations",
+      headers: { "x-mg-token": "visitor-token" },
       payload: validPayload,
     });
     const duplicate = await app.inject({
       method: "POST",
-      url: "/api/p/project/mutations",
-      headers: { "x-mg-token": "visitor-token", "x-mg-actor": "browser_agent" },
+      url: "/api/p/project/agent-mutations",
+      headers: { "x-mg-token": "visitor-token" },
       payload: validPayload,
     });
 
     expect(valid.json()).toEqual({ seqs: [1, 2, 3] });
     expect(duplicate.json()).toEqual({ seqs: [1, 2, 3] });
     expect(store.listEvents("project")).toMatchObject([
-      { type: "TASK_ADDED", payload: { node: { id: "node-a" } } },
-      { type: "TASK_ADDED", payload: { node: { id: "node-b" } } },
+      { actor: "browser_agent", type: "TASK_ADDED", payload: { node: { id: "node-a" } } },
+      { actor: "browser_agent", type: "TASK_ADDED", payload: { node: { id: "node-b" } } },
       {
+        actor: "browser_agent",
         type: "EDGE_ADDED",
         payload: { edge_id: "edge-a-b", upstream: "node-a", downstream: "node-b" },
       },
@@ -494,85 +631,509 @@ describe("HTTP and streaming contract", () => {
     expect(clonedEvents.every((event) => Date.parse(event.ts) <= cloneTime.getTime())).toBe(true);
   });
 
-  it("binds approval policies to the browser session that stated them", async () => {
-    const { app, store } = server();
+  it("stages policies without minting grants and derives accepted approval actors", async () => {
+    const confirmedAt = "2026-08-30T10:05:00.000Z";
+    const { app, store } = server({ now: () => new Date(confirmedAt) });
     store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
-    store.append("project", {
-      actor: "human",
-      type: "TASK_ADDED",
-      payload: {
-        node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
-      },
-      idem_key: "add-a",
-    });
-    store.append("project", {
-      actor: "worker:a",
-      type: "NODE_STATE_CHANGED",
-      payload: { node_id: "a", from: "queued", to: "running" },
-      idem_key: "running-a",
-    });
-    store.append("project", {
-      actor: "worker:a",
-      type: "HANDOFF_FILED",
-      payload: { node_id: "a", handoff: baseHandoff },
-      idem_key: "handoff-a",
-    });
-    store.append("project", {
-      actor: "supervisor",
-      type: "APPROVAL_CREATED",
-      payload: { approval_id: "approval-a", node_id: "a", summary: "Review task A." },
-      idem_key: "approval-a",
-    });
-    const policy = await app.inject({
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    seedPendingApproval(store, "project", "a");
+
+    const selfMint = await app.inject({
       method: "POST",
-      url: "/api/p/project/mutations",
-      headers: { "x-mg-token": "visitor-token", "x-mg-session": "session-a" },
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-actor": "human",
+      },
       payload: {
         type: "POLICY_STATED",
         payload: {
-          policy_ref: "policy-a",
-          text: "Approve green diffs.",
+          policy_ref: "self-minted",
+          text: "Approve everything.",
           scope: "session",
           session_id: "session-a",
         },
-        idem_key: "policy-a",
+        idem_key: "self-minted",
       },
     });
-    const foreignSession = await app.inject({
+    const staged = await app.inject({
       method: "POST",
-      url: "/api/p/project/mutations",
+      url: "/api/p/project/policy-drafts",
       headers: {
         "x-mg-token": "visitor-token",
-        "x-mg-actor": "browser_agent",
-        "x-mg-session": "session-b",
-      },
-      payload: {
-        type: "APPROVED",
-        payload: { approval_id: "approval-a", node_id: "a", policy_ref: "policy-a" },
-        idem_key: "foreign-approval",
-      },
-    });
-    const owningSession = await app.inject({
-      method: "POST",
-      url: "/api/p/project/mutations",
-      headers: {
-        "x-mg-token": "visitor-token",
-        "x-mg-actor": "browser_agent",
         "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+      },
+      payload: { text: "Approve green diffs.", max_uses: 4 },
+    });
+    const stagedBody = staged.json<{
+      draft_id: string;
+      allowed_actions: string[];
+      max_uses: number;
+      expires_at: string;
+    }>();
+    const spoofedHuman = await app.inject({
+      method: "POST",
+      url: "/api/p/project/mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-actor": "human",
       },
       payload: {
         type: "APPROVED",
-        payload: { approval_id: "approval-a", node_id: "a", policy_ref: "policy-a" },
-        idem_key: "owning-approval",
+        payload: { approval_id: "approval-a", node_id: "a" },
+        idem_key: "spoofed-human",
       },
     });
 
-    expect(policy.json()).toEqual({ seq: 5 });
-    expect(foreignSession.statusCode).toBe(400);
-    expect(foreignSession.json()).toMatchObject({
-      error: { message: "policy policy-a belongs to another browser session" },
+    expect(selfMint.statusCode).toBe(403);
+    expect(staged.statusCode).toBe(200);
+    expect(stagedBody).toMatchObject({
+      allowed_actions: ["approve", "reject"],
+      max_uses: 4,
     });
-    expect(owningSession.json()).toEqual({ seq: 6 });
+    expect(stagedBody).not.toHaveProperty("policy_ref");
+    expect(stagedBody).not.toHaveProperty("capability");
+    expect(spoofedHuman).toMatchObject({ statusCode: 403 });
+    expect(spoofedHuman.json()).toMatchObject({ error: { code: "capability_required" } });
+    expect(store.listEvents("project")).toHaveLength(4);
+
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/p/project/policy-drafts/${stagedBody.draft_id}/confirm`,
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        origin: "https://missiongraph.vercel.app",
+      },
+    });
+    const grant = confirmed.json<{ policy_ref: string; capability: string; seq: number }>();
+    const storedGrant = store.database
+      .prepare("SELECT token_hash FROM human_capabilities WHERE ref = ?")
+      .get(grant.policy_ref) as { token_hash: string };
+    const approved = await app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-actor": "human",
+        "x-mg-capability-ref": grant.policy_ref,
+        "x-mg-capability": grant.capability,
+        "x-mg-nonce": "approval-use-a",
+      },
+      payload: {
+        type: "APPROVED",
+        payload: { approval_id: "approval-a", node_id: "a", policy_ref: grant.policy_ref },
+        idem_key: "approved-a",
+      },
+    });
+
+    expect(confirmed.statusCode).toBe(200);
+    expect(grant.seq).toBe(5);
+    expect(storedGrant.token_hash).not.toBe(grant.capability);
+    expect(JSON.stringify(storedGrant)).not.toContain(grant.capability);
+    expect(approved.json()).toEqual({ seq: 6 });
+    expect(store.listEvents("project").slice(-2)).toMatchObject([
+      {
+        actor: "human",
+        type: "POLICY_STATED",
+        payload: {
+          policy_ref: grant.policy_ref,
+          text: "Approve green diffs.",
+          confirmed_at: confirmedAt,
+          request_origin: "https://missiongraph.vercel.app",
+        },
+      },
+      {
+        actor: "browser_agent",
+        type: "APPROVED",
+        payload: {
+          policy_ref: grant.policy_ref,
+          authorization: {
+            policy_text: "Approve green diffs.",
+            confirmed_at: confirmedAt,
+            request_origin: "https://missiongraph.vercel.app",
+            use_nonce: "approval-use-a",
+          },
+        },
+      },
+    ]);
+  });
+
+  it("rejects foreign-session and foreign-project human capabilities without writes", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    for (const { project, token } of [
+      { project: "project-a", token: "visitor-a" },
+      { project: "project-b", token: "visitor-b" },
+    ]) {
+      store.createProject(project, token, "2026-08-30T10:00:00.000Z");
+      seedPendingApproval(store, project, "task");
+    }
+    registerBrowserSession(store, "project-a", "session-a", "proof-a");
+    registerBrowserSession(store, "project-a", "session-b", "proof-b");
+    registerBrowserSession(store, "project-b", "session-project-b", "proof-project-b");
+    const { grant } = await issuePolicy(app, {
+      project: "project-a",
+      token: "visitor-a",
+      session: "session-a",
+      proof: "proof-a",
+    });
+    const request = (project: string, session: string, proof: string, idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: `/api/p/${project}/agent-mutations`,
+        headers: {
+          "x-mg-token": project === "project-a" ? "visitor-a" : "visitor-b",
+          "x-mg-session": session,
+          "x-mg-session-proof": proof,
+          "x-mg-capability-ref": grant.policy_ref,
+          "x-mg-capability": grant.capability,
+          "x-mg-nonce": idemKey,
+        },
+        payload: {
+          type: "APPROVED",
+          payload: { approval_id: "approval-task", node_id: "task", policy_ref: grant.policy_ref },
+          idem_key: idemKey,
+        },
+      });
+    const projectACount = store.listEvents("project-a").length;
+    const projectBCount = store.listEvents("project-b").length;
+    const foreignSession = await request("project-a", "session-b", "proof-b", "foreign-session");
+    const foreignProject = await request(
+      "project-b",
+      "session-project-b",
+      "proof-project-b",
+      "foreign-project",
+    );
+
+    expect(foreignSession.json()).toMatchObject({ error: { code: "capability_invalid" } });
+    expect(foreignProject.json()).toMatchObject({ error: { code: "capability_invalid" } });
+    expect(store.listEvents("project-a")).toHaveLength(projectACount);
+    expect(store.listEvents("project-b")).toHaveLength(projectBCount);
+  });
+
+  it("rejects modified, replayed, and exhausted policy grants without writes", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    for (const nodeId of ["a", "b", "c"]) seedPendingApproval(store, "project", nodeId);
+    const { grant } = await issuePolicy(app, {
+      project: "project",
+      token: "visitor-token",
+      session: "session-a",
+      proof: "proof-a",
+      maxUses: 2,
+    });
+    const approve = (nodeId: string, nonce: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/p/project/agent-mutations",
+        headers: {
+          "x-mg-token": "visitor-token",
+          "x-mg-session": "session-a",
+          "x-mg-session-proof": "proof-a",
+          "x-mg-capability-ref": grant.policy_ref,
+          "x-mg-capability": grant.capability,
+          "x-mg-nonce": nonce,
+        },
+        payload: {
+          type: "APPROVED",
+          payload: {
+            approval_id: `approval-${nodeId}`,
+            node_id: nodeId,
+            policy_ref: grant.policy_ref,
+          },
+          idem_key: `approve-${nodeId}-${nonce}`,
+        },
+      });
+
+    const multiApproval = await app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": grant.policy_ref,
+        "x-mg-capability": grant.capability,
+        "x-mg-nonce": "batch-nonce",
+      },
+      payload: {
+        batch: ["a", "b"].map((nodeId) => ({
+          type: "APPROVED",
+          payload: {
+            approval_id: `approval-${nodeId}`,
+            node_id: nodeId,
+            policy_ref: grant.policy_ref,
+          },
+        })),
+        idem_key: "multi-approval",
+      },
+    });
+    expect(multiApproval.json()).toMatchObject({ error: { code: "invalid_event" } });
+    expect((await approve("a", "batch-nonce")).statusCode).toBe(200);
+    const afterFirst = store.listEvents("project").length;
+    const replayed = await approve("b", "batch-nonce");
+    expect(replayed.json()).toMatchObject({ error: { code: "capability_replayed" } });
+    expect(store.listEvents("project")).toHaveLength(afterFirst);
+    expect((await approve("b", "nonce-b")).statusCode).toBe(200);
+    const afterSecond = store.listEvents("project").length;
+    const exhausted = await approve("c", "nonce-c");
+    expect(exhausted.json()).toMatchObject({ error: { code: "capability_exhausted" } });
+    expect(store.listEvents("project")).toHaveLength(afterSecond);
+
+    store.createProject("modified", "modified-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "modified", "session-m", "proof-m");
+    seedPendingApproval(store, "modified", "d");
+    const { grant: modifiedGrant } = await issuePolicy(app, {
+      project: "modified",
+      token: "modified-token",
+      session: "session-m",
+      proof: "proof-m",
+      maxUses: 1,
+    });
+    const policyRow = store.database
+      .prepare("SELECT seq, payload_json FROM events WHERE project_id = ? AND type = 'POLICY_STATED'")
+      .get("modified") as { seq: number; payload_json: string };
+    const storedPayload = JSON.parse(policyRow.payload_json) as { v: number; data: { text: string } };
+    storedPayload.data.text = "Modified after confirmation.";
+    store.database
+      .prepare("UPDATE events SET payload_json = ? WHERE seq = ?")
+      .run(JSON.stringify(storedPayload), policyRow.seq);
+    const beforeModified = store.listEvents("modified").length;
+    const modified = await app.inject({
+      method: "POST",
+      url: "/api/p/modified/agent-mutations",
+      headers: {
+        "x-mg-token": "modified-token",
+        "x-mg-session": "session-m",
+        "x-mg-session-proof": "proof-m",
+        "x-mg-capability-ref": modifiedGrant.policy_ref,
+        "x-mg-capability": modifiedGrant.capability,
+        "x-mg-nonce": "modified-use",
+      },
+      payload: {
+        type: "APPROVED",
+        payload: {
+          approval_id: "approval-d",
+          node_id: "d",
+          policy_ref: modifiedGrant.policy_ref,
+        },
+        idem_key: "modified-approval",
+      },
+    });
+    expect(modified.json()).toMatchObject({ error: { code: "capability_invalid" } });
+    expect(store.listEvents("modified")).toHaveLength(beforeModified);
+  });
+
+  it("rejects an expired policy grant without appending an event", async () => {
+    let clock = new Date("2026-08-30T10:05:00.000Z");
+    const { app, store } = server({ now: () => clock });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    seedPendingApproval(store, "project", "a");
+    const { grant } = await issuePolicy(app, {
+      project: "project",
+      token: "visitor-token",
+      session: "session-a",
+      proof: "proof-a",
+    });
+    const before = store.listEvents("project").length;
+    clock = new Date("2026-08-30T10:21:00.000Z");
+    const expired = await app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": grant.policy_ref,
+        "x-mg-capability": grant.capability,
+        "x-mg-nonce": "expired-use",
+      },
+      payload: {
+        type: "APPROVED",
+        payload: { approval_id: "approval-a", node_id: "a", policy_ref: grant.policy_ref },
+        idem_key: "expired-approval",
+      },
+    });
+
+    expect(expired.json()).toMatchObject({ error: { code: "capability_expired" } });
+    expect(store.listEvents("project")).toHaveLength(before);
+  });
+
+  it("binds dispatch confirmation to one exact action and records its audit", async () => {
+    const confirmedAt = "2026-08-30T10:05:00.000Z";
+    const { app, store } = server({ now: () => new Date(confirmedAt) });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    for (const nodeId of ["a", "b"]) {
+      store.append("project", {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: {
+            id: nodeId,
+            title: `Task ${nodeId}`,
+            brief: `Build ${nodeId}.`,
+            estimate_min: 10,
+            tags: [],
+            state: "queued",
+          },
+        },
+        idem_key: `add-${nodeId}`,
+      });
+    }
+    const mutation = {
+      type: "DISPATCHED",
+      payload: { node_id: "a", bypass_cap: true },
+    };
+    const unconfirmed = await app.inject({
+      method: "POST",
+      url: "/api/p/project/mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-actor": "human",
+      },
+      payload: { ...mutation, idem_key: "unconfirmed-dispatch" },
+    });
+    const staged = await app.inject({
+      method: "POST",
+      url: "/api/p/project/action-drafts",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+      },
+      payload: { mutation, summary: "Dispatch Task a to a real worker." },
+    });
+    const draft = staged.json<{
+      draft_id: string;
+      action: string;
+      subject_hash: string;
+      max_uses: number;
+    }>();
+    const beforeConfirm = store.listEvents("project").length;
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/p/project/action-drafts/${draft.draft_id}/confirm`,
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        origin: "https://missiongraph.vercel.app",
+      },
+    });
+    const capability = confirmed.json<{ capability_ref: string; capability: string }>();
+    const modified = await app.inject({
+      method: "POST",
+      url: "/api/p/project/mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": capability.capability_ref,
+        "x-mg-capability": capability.capability,
+        "x-mg-nonce": "modified-dispatch",
+      },
+      payload: {
+        type: "DISPATCHED",
+        payload: { node_id: "b", bypass_cap: true },
+        idem_key: "modified-dispatch",
+      },
+    });
+    const accepted = await app.inject({
+      method: "POST",
+      url: "/api/p/project/mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-actor": "browser_agent",
+        "x-mg-capability-ref": capability.capability_ref,
+        "x-mg-capability": capability.capability,
+        "x-mg-nonce": "accepted-dispatch",
+      },
+      payload: { ...mutation, idem_key: "accepted-dispatch" },
+    });
+
+    expect(unconfirmed.json()).toMatchObject({ error: { code: "capability_required" } });
+    expect(staged.statusCode).toBe(200);
+    expect(draft).toMatchObject({ action: "dispatch", max_uses: 1 });
+    expect(store.listEvents("project").length).toBe(beforeConfirm + 1);
+    expect(modified.json()).toMatchObject({ error: { code: "capability_invalid" } });
+    expect(accepted.json()).toEqual({ seq: beforeConfirm + 1 });
+    expect(store.listEvents("project").at(-1)).toMatchObject({
+      actor: "human",
+      type: "DISPATCHED",
+      payload: {
+        node_id: "a",
+        authorization: {
+          capability_ref: capability.capability_ref,
+          confirmed_at: confirmedAt,
+          request_origin: "https://missiongraph.vercel.app",
+          use_nonce: "accepted-dispatch",
+        },
+      },
+    });
+  });
+
+  it("persists denial so a rejected draft cannot mint a capability", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    const staged = await app.inject({
+      method: "POST",
+      url: "/api/p/project/policy-drafts",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+      },
+      payload: { text: "Approve green diffs." },
+    });
+    const { draft_id: draftId } = staged.json<{ draft_id: string }>();
+    const wrongKind = await app.inject({
+      method: "POST",
+      url: `/api/p/project/action-drafts/${draftId}/confirm`,
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+      },
+    });
+    const denied = await app.inject({
+      method: "POST",
+      url: `/api/p/project/human-drafts/${draftId}/deny`,
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+      },
+    });
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/p/project/policy-drafts/${draftId}/confirm`,
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+      },
+    });
+
+    expect(wrongKind.json()).toMatchObject({ error: { code: "capability_invalid" } });
+    expect(denied.statusCode).toBe(204);
+    expect(confirmed.json()).toMatchObject({ error: { code: "capability_denied" } });
+    expect(store.listEvents("project")).toEqual([]);
   });
 
   it("excludes session policies from visitor clone imports", async () => {

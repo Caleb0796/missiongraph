@@ -179,16 +179,25 @@ test(
     const server = await startServer()
     try {
       const { project, token } = server.identity
+      const sessionResponse = await fetch(
+        `${server.baseUrl}/api/p/${project}/browser-sessions`,
+        {
+          method: 'POST',
+          headers: { 'x-mg-token': token },
+        },
+      )
+      const session = await sessionResponse.json()
+      assert.equal(sessionResponse.status, 200, JSON.stringify(session))
       const headers = {
         'content-type': 'application/json',
         'x-mg-token': token,
-        'x-mg-session': 'app-real-server-test',
-        'x-mg-actor': 'browser_agent',
+        'x-mg-session': session.session_id,
+        'x-mg-session-proof': session.session_proof,
       }
       let cursor = 0
       const mutate = async (type, payload, idemKey) => {
         const response = await fetch(
-          `${server.baseUrl}/api/p/${project}/mutations`,
+          `${server.baseUrl}/api/p/${project}/agent-mutations`,
           {
             method: 'POST',
             headers,
@@ -274,11 +283,42 @@ test(
             })),
           },
           apply: async () => {
-            const response = await fetch(
-              `${server.baseUrl}/api/p/${project}/mutations`,
+            const staged = await fetch(
+              `${server.baseUrl}/api/p/${project}/action-drafts`,
               {
                 method: 'POST',
                 headers,
+                body: JSON.stringify({
+                  mutation: { batch: plan.batch },
+                  summary: 'Apply the reviewed split blast radius.',
+                }),
+              },
+            )
+            const draft = await staged.json()
+            assert.equal(staged.status, 200, JSON.stringify(draft))
+            const confirmed = await fetch(
+              `${server.baseUrl}/api/p/${project}/action-drafts/${draft.draft_id}/confirm`,
+              {
+                method: 'POST',
+                headers: {
+                  'x-mg-token': token,
+                  'x-mg-session': session.session_id,
+                  'x-mg-session-proof': session.session_proof,
+                },
+              },
+            )
+            const capability = await confirmed.json()
+            assert.equal(confirmed.status, 200, JSON.stringify(capability))
+            const response = await fetch(
+              `${server.baseUrl}/api/p/${project}/agent-mutations`,
+              {
+                method: 'POST',
+                headers: {
+                  ...headers,
+                  'x-mg-capability-ref': capability.capability_ref,
+                  'x-mg-capability': capability.capability,
+                  'x-mg-nonce': `split-${planCursor}`,
+                },
                 body: JSON.stringify({
                   batch: plan.batch,
                   idem_key: `split-${planCursor}`,
@@ -397,7 +437,12 @@ test(
         if (event.type === 'TASK_SPLIT') {
           folded = foldTaskSplit(folded.nodes, folded.edges, event.payload)
         } else if (event.type === 'EDGE_ADDED') {
-          folded.edges.push(event.payload)
+          folded.edges.push({
+            edge_id: event.payload.edge_id,
+            upstream: event.payload.upstream,
+            downstream: event.payload.downstream,
+            kind: event.payload.kind,
+          })
         }
       }
       assert.deepEqual(

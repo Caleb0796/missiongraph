@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
@@ -7,6 +7,7 @@ import { buildDigest } from "./digest.js";
 import {
   EventStore,
   EventValidationError,
+  CapabilityError,
   StaleSequenceError,
   UnknownProjectError,
   parseActor,
@@ -15,6 +16,7 @@ import {
   type Actor,
   type Event,
   type EventInput,
+  type HumanAction,
   type ImportedEvent,
   type ReporterActor,
 } from "./events.js";
@@ -51,17 +53,112 @@ function visitorAuthorized(store: EventStore, request: FastifyRequest, project: 
   return store.tokenMatches(project, textHeader(request.headers["x-mg-token"]) ?? "");
 }
 
-function mutationActor(request: FastifyRequest): Actor {
-  const raw = textHeader(request.headers["x-mg-actor"]);
-  if (raw === undefined || raw === "human") return "human";
-  if (raw === "browser_agent") return "browser_agent";
-  throw new EventValidationError("x-mg-actor must be human or browser_agent");
-}
-
 function mutationSession(request: FastifyRequest): string | undefined {
   const sessionId = textHeader(request.headers["x-mg-session"]);
   if (sessionId === "") throw new EventValidationError("x-mg-session must not be empty");
   return sessionId;
+}
+
+function requiredMutationSession(request: FastifyRequest): string {
+  const sessionId = mutationSession(request);
+  if (!sessionId) throw new EventValidationError("x-mg-session is required");
+  return sessionId;
+}
+
+function requiredBrowserSession(
+  store: EventStore,
+  request: FastifyRequest,
+  project: string,
+  at: string,
+): string {
+  const sessionId = requiredMutationSession(request);
+  const proof = textHeader(request.headers["x-mg-session-proof"]);
+  if (!proof || !store.browserSessionMatches(project, sessionId, proof, at)) {
+    throw new CapabilityError("session_invalid", "The server-issued browser session is invalid or expired.");
+  }
+  return sessionId;
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, stableValue(child)]),
+  );
+}
+
+function valueHash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(stableValue(value))).digest("hex");
+}
+
+function mutationSubject(body: Record<string, unknown>): string {
+  return valueHash(body.batch === undefined
+    ? { type: body.type, payload: body.payload }
+    : { batch: body.batch });
+}
+
+function actionForTypes(types: readonly string[]): HumanAction | undefined {
+  const actions = new Set(
+    types.flatMap((type): HumanAction[] => {
+      switch (type) {
+        case "APPROVED": return ["approve"];
+        case "REJECTED": return ["reject"];
+        case "DISPATCHED": return ["dispatch"];
+        case "PAUSE_REQUESTED": return ["pause"];
+        case "RESUME_REQUESTED": return ["resume"];
+        case "TASK_REMOVED":
+        case "TASK_SPLIT":
+        case "EDGE_REMOVED":
+          return ["structural"];
+        default:
+          return [];
+      }
+    }),
+  );
+  if (actions.size > 1) throw new EventValidationError("one capability cannot authorize mixed action types");
+  return [...actions][0];
+}
+
+function actionForMutation(
+  inputs: readonly EventInput[],
+  projectEvents: readonly Event[],
+): HumanAction | undefined {
+  const direct = actionForTypes(inputs.map((input) => input.type));
+  if (direct) {
+    const consequentialCount = inputs.filter((input) => actionForTypes([input.type]) !== undefined).length;
+    if (direct !== "structural" && consequentialCount !== 1) {
+      throw new EventValidationError("one capability cannot authorize multiple consequential actions");
+    }
+    return direct;
+  }
+  if (inputs.some((input) => input.type === "EDGE_ADDED")) {
+    const state = fold(projectEvents);
+    const touchesStartedWork = inputs.some((input) => {
+      if (input.type !== "EDGE_ADDED") return false;
+      return [input.payload.upstream, input.payload.downstream].some((nodeId) => {
+        const node = state.nodes[nodeId];
+        return Boolean(node && (node.ever_started || node.state !== "queued"));
+      });
+    });
+    if (touchesStartedWork) return "structural";
+  }
+  return undefined;
+}
+
+function capabilityHeaders(request: FastifyRequest): {
+  ref: string;
+  token: string;
+  nonce: string;
+} {
+  const ref = textHeader(request.headers["x-mg-capability-ref"]);
+  const token = textHeader(request.headers["x-mg-capability"]);
+  const nonce = textHeader(request.headers["x-mg-nonce"]);
+  if (!ref || !token || !nonce) {
+    throw new CapabilityError("capability_required", "Visible human confirmation is required for this action.");
+  }
+  return { ref, token, nonce };
 }
 
 const nodeScopedReporterEventTypes = new Set([
@@ -141,6 +238,9 @@ function batchInputs(
 }
 
 function errorReply(error: unknown, reply: FastifyReply): FastifyReply {
+  if (error instanceof CapabilityError) {
+    return reply.code(403).send({ error: { code: error.code, message: error.message } });
+  }
   if (error instanceof EventValidationError || error instanceof GraphValidationError) {
     return reply.code(400).send({ error: { code: "invalid_event", message: error.message } });
   }
@@ -287,53 +387,328 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       .header("access-control-allow-methods", "GET, POST, OPTIONS")
       .header(
         "access-control-allow-headers",
-        "content-type, x-mg-token, x-mg-session, x-mg-actor",
+        "content-type, x-mg-token, x-mg-session, x-mg-session-proof, x-mg-capability-ref, x-mg-capability, x-mg-nonce",
       )
       .header("access-control-max-age", "86400");
     if (request.method === "OPTIONS") return reply.code(204).send();
   });
 
-  app.post("/api/p/:project/mutations", async (request, reply) => {
+  app.post("/api/p/:project/browser-sessions", async (request, reply) => {
     const project = (request.params as { project: string }).project;
     if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
-    let baseSeq: number | undefined;
     try {
-      const body = request.body as Record<string, unknown>;
-      const actor = mutationActor(request);
-      const sessionId = mutationSession(request);
-      baseSeq = baseSequence(body);
-      if (body.batch !== undefined) {
-        const batch = batchInputs(body, actor, id);
-        for (const input of batch.inputs) {
-          if (reporterEventTypes.has(input.type)) {
-            throw new EventValidationError(`${input.type} must use the reporter endpoint`);
-          }
-        }
-        const result = store.appendBatch(project, batch.inputs, batch.idemKey, {
-          ...(baseSeq === undefined ? {} : { baseSeq }),
-          ...(sessionId === undefined ? {} : { sessionId }),
-          ts: now().toISOString(),
-        });
-        return reply.send({ seqs: result.events.map((event) => event.seq) });
-      }
-      const input = parseEventInput({ ...body, actor });
-      if (reporterEventTypes.has(input.type)) {
-        throw new EventValidationError(`${input.type} must use the reporter endpoint`);
-      }
-      const result = store.append(project, input, {
-        ...(baseSeq === undefined ? {} : { baseSeq }),
-        ...(sessionId === undefined ? {} : { sessionId }),
-        ts: now().toISOString(),
+      const createdAt = now();
+      const session = store.issueBrowserSession({
+        id: id(),
+        token: id(),
+        project_id: project,
+        created_at: createdAt.toISOString(),
+        expires_at: new Date(createdAt.getTime() + 12 * 60 * 60_000).toISOString(),
       });
-      return reply.send({ seq: result.event.seq });
+      return reply.send({
+        session_id: session.id,
+        session_proof: session.token,
+        expires_at: session.expires_at,
+      });
     } catch (error) {
-      if (error instanceof StaleSequenceError) {
-        const events = store.listEvents(project);
-        return reply.code(409).send({ fresh_digest: buildDigest(fold(events), events, baseSeq ?? 0) });
-      }
       return errorReply(error, reply);
     }
   });
+
+  app.post("/api/p/:project/policy-drafts", async (request, reply) => {
+    const project = (request.params as { project: string }).project;
+    if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
+    try {
+      const body = record(request.body, "body");
+      const createdAt = now();
+      const sessionId = requiredBrowserSession(store, request, project, createdAt.toISOString());
+      if (typeof body.text !== "string" || body.text.trim() === "") {
+        throw new EventValidationError("text must not be empty");
+      }
+      const maxUses = body.max_uses === undefined ? 4 : body.max_uses;
+      if (!Number.isSafeInteger(maxUses) || (maxUses as number) < 1 || (maxUses as number) > 20) {
+        throw new EventValidationError("max_uses must be an integer between 1 and 20");
+      }
+      const draft = store.stageHumanDraft({
+        id: id(),
+        project_id: project,
+        session_id: sessionId,
+        kind: "policy",
+        actions: ["approve", "reject"],
+        subject_hash: valueHash(body.text),
+        display_text: body.text,
+        policy_text: body.text,
+        max_uses: maxUses as number,
+        created_at: createdAt.toISOString(),
+        expires_at: new Date(createdAt.getTime() + 15 * 60_000).toISOString(),
+      });
+      return reply.send({
+        draft_id: draft.id,
+        project_id: draft.project_id,
+        session_id: draft.session_id,
+        text: draft.display_text,
+        policy_hash: draft.subject_hash,
+        scope: "session",
+        allowed_actions: draft.actions,
+        max_uses: draft.max_uses,
+        created_at: draft.created_at,
+        expires_at: draft.expires_at,
+      });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/p/:project/policy-drafts/:draft/confirm", async (request, reply) => {
+    const { project, draft } = request.params as { project: string; draft: string };
+    if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
+    const confirmedAt = now().toISOString();
+    try {
+      const sessionId = requiredBrowserSession(store, request, project, confirmedAt);
+      const capability = store.confirmHumanDraft({
+        projectId: project,
+        sessionId,
+        draftId: draft,
+        kind: "policy",
+        confirmedAt,
+        requestOrigin: textHeader(request.headers.origin) ?? "same-origin",
+        ref: id(),
+        token: id(),
+      });
+      try {
+        const result = store.append(project, {
+          actor: "human",
+          type: "POLICY_STATED",
+          payload: {
+            policy_ref: capability.ref,
+            text: capability.policy_text ?? "",
+            scope: "session",
+            session_id: sessionId,
+            allowed_actions: ["approve", "reject"],
+            max_uses: capability.max_uses,
+            expires_at: capability.expires_at,
+            confirmed_at: capability.confirmed_at,
+            request_origin: capability.request_origin,
+          },
+          idem_key: `policy-confirm:${draft}`,
+        }, { sessionId, ts: confirmedAt });
+        return reply.send({
+          policy_ref: capability.ref,
+          capability: capability.token,
+          allowed_actions: capability.actions,
+          max_uses: capability.max_uses,
+          expires_at: capability.expires_at,
+          confirmed_at: capability.confirmed_at,
+          seq: result.event.seq,
+        });
+      } catch (error) {
+        store.revokeHumanCapability(capability.ref);
+        throw error;
+      }
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/p/:project/action-drafts", async (request, reply) => {
+    const project = (request.params as { project: string }).project;
+    if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
+    try {
+      const body = record(request.body, "body");
+      const mutation = record(body.mutation, "mutation");
+      const createdAt = now();
+      const sessionId = requiredBrowserSession(store, request, project, createdAt.toISOString());
+      let inputs: EventInput[];
+      if (mutation.batch !== undefined) {
+        if (!Array.isArray(mutation.batch) || mutation.batch.length === 0) {
+          throw new EventValidationError("mutation.batch must be a non-empty array");
+        }
+        inputs = mutation.batch.map((item) => parseEventInput({ ...record(item, "mutation.batch item"), actor: "human", idem_key: id() }));
+      } else {
+        inputs = [parseEventInput({ ...mutation, actor: "human", idem_key: id() })];
+      }
+      const action = actionForMutation(inputs, store.listEvents(project));
+      if (!action) throw new EventValidationError("mutation does not require human-presence confirmation");
+      const displayText = typeof body.summary === "string" && body.summary.trim() !== ""
+        ? body.summary
+        : `Confirm ${action}`;
+      const draftRecord = store.stageHumanDraft({
+        id: id(),
+        project_id: project,
+        session_id: sessionId,
+        kind: "action",
+        actions: [action],
+        subject_hash: mutationSubject(mutation),
+        display_text: displayText,
+        max_uses: 1,
+        created_at: createdAt.toISOString(),
+        expires_at: new Date(createdAt.getTime() + 5 * 60_000).toISOString(),
+      });
+      return reply.send({
+        draft_id: draftRecord.id,
+        project_id: draftRecord.project_id,
+        session_id: draftRecord.session_id,
+        action,
+        summary: draftRecord.display_text,
+        subject_hash: draftRecord.subject_hash,
+        max_uses: 1,
+        created_at: draftRecord.created_at,
+        expires_at: draftRecord.expires_at,
+      });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/p/:project/action-drafts/:draft/confirm", async (request, reply) => {
+    const { project, draft } = request.params as { project: string; draft: string };
+    if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
+    try {
+      const confirmedAt = now().toISOString();
+      const sessionId = requiredBrowserSession(store, request, project, confirmedAt);
+      const capability = store.confirmHumanDraft({
+        projectId: project,
+        sessionId,
+        draftId: draft,
+        kind: "action",
+        confirmedAt,
+        requestOrigin: textHeader(request.headers.origin) ?? "same-origin",
+        ref: id(),
+        token: id(),
+      });
+      return reply.send({
+        capability_ref: capability.ref,
+        capability: capability.token,
+        action: capability.actions[0],
+        expires_at: capability.expires_at,
+        confirmed_at: capability.confirmed_at,
+      });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/p/:project/human-drafts/:draft/deny", async (request, reply) => {
+    const { project, draft } = request.params as { project: string; draft: string };
+    if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
+    try {
+      store.denyHumanDraft({
+        projectId: project,
+        sessionId: requiredBrowserSession(store, request, project, now().toISOString()),
+        draftId: draft,
+        deniedAt: now().toISOString(),
+      });
+      return reply.code(204).send();
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  const mutationHandler = (actor: Extract<Actor, "human" | "browser_agent">) =>
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const project = (request.params as { project: string }).project;
+      if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
+      let baseSeq: number | undefined;
+      try {
+        const body = request.body as Record<string, unknown>;
+        const sessionId = mutationSession(request);
+        baseSeq = baseSequence(body);
+        let inputs: EventInput[];
+        let batchIdemKey: string | undefined;
+        if (body.batch !== undefined) {
+          const batch = batchInputs(body, actor, id);
+          inputs = batch.inputs;
+          batchIdemKey = batch.idemKey;
+        } else {
+          inputs = [parseEventInput({ ...body, actor })];
+        }
+        for (const input of inputs) {
+          if (reporterEventTypes.has(input.type)) {
+            throw new EventValidationError(`${input.type} must use the reporter endpoint`);
+          }
+          if (input.type === "POLICY_STATED") {
+            throw new CapabilityError("capability_required", "Policies must be confirmed in the visible native UI.");
+          }
+        }
+        const action = actionForMutation(inputs, store.listEvents(project));
+        const subjectHash = (() => {
+          if (action !== "approve" && action !== "reject") return mutationSubject(body);
+          const approvalInput = inputs.find((input) => input.type === "APPROVED" || input.type === "REJECTED");
+          const policyRef = approvalInput && "policy_ref" in approvalInput.payload
+            ? approvalInput.payload.policy_ref
+            : undefined;
+          if (!policyRef) return mutationSubject(body);
+          const policy = fold(store.listEvents(project)).policies[policyRef];
+          return valueHash(policy?.text ?? "");
+        })();
+        let audit: ReturnType<EventStore["consumeHumanCapability"]> | undefined;
+        const authorize = action
+          ? () => {
+              const headers = capabilityHeaders(request);
+              const verifiedSessionId = requiredBrowserSession(
+                store,
+                request,
+                project,
+                now().toISOString(),
+              );
+              audit = store.consumeHumanCapability({
+                projectId: project,
+                sessionId: verifiedSessionId,
+                ...headers,
+                action,
+                subjectHash,
+                usedAt: now().toISOString(),
+              });
+              const authorization = {
+                capability_ref: audit.ref,
+                ...(audit.policy_text ? { policy_text: audit.policy_text } : {}),
+                confirmed_at: audit.confirmed_at,
+                request_origin: audit.request_origin,
+                use_nonce: audit.use_nonce,
+              };
+              for (const input of inputs) {
+                switch (input.type) {
+                  case "TASK_REMOVED":
+                  case "TASK_SPLIT":
+                  case "EDGE_ADDED":
+                  case "EDGE_REMOVED":
+                  case "DISPATCHED":
+                  case "PAUSE_REQUESTED":
+                  case "RESUME_REQUESTED":
+                  case "APPROVED":
+                  case "REJECTED":
+                    input.payload.authorization = authorization;
+                }
+              }
+            }
+          : undefined;
+        if (batchIdemKey) {
+          const result = store.appendBatch(project, inputs, batchIdemKey, {
+            ...(baseSeq === undefined ? {} : { baseSeq }),
+            ...(sessionId === undefined ? {} : { sessionId }),
+            ...(authorize ? { authorize } : {}),
+            ts: now().toISOString(),
+          });
+          return reply.send({ seqs: result.events.map((event) => event.seq) });
+        }
+        const result = store.append(project, inputs[0]!, {
+          ...(baseSeq === undefined ? {} : { baseSeq }),
+          ...(sessionId === undefined ? {} : { sessionId }),
+          ...(authorize ? { authorize } : {}),
+          ts: now().toISOString(),
+        });
+        return reply.send({ seq: result.event.seq });
+      } catch (error) {
+        if (error instanceof StaleSequenceError) {
+          const events = store.listEvents(project);
+          return reply.code(409).send({ fresh_digest: buildDigest(fold(events), events, baseSeq ?? 0) });
+        }
+        return errorReply(error, reply);
+      }
+    };
+
+  app.post("/api/p/:project/mutations", mutationHandler("human"));
+  app.post("/api/p/:project/agent-mutations", mutationHandler("browser_agent"));
 
   app.post("/api/p/:project/report", async (request, reply) => {
     const project = (request.params as { project: string }).project;

@@ -31,8 +31,8 @@ import {
 } from './client-logic'
 import { SettledDebouncer } from './settled-debounce'
 
-const SESSION_KEY = 'missiongraph.session-id'
 const IDENTITY_KEY = 'missiongraph.visitor-identity'
+const fixtureSessionId = crypto.randomUUID()
 
 interface CloneResponse extends ClientIdentity {
   cursor: string
@@ -57,6 +57,55 @@ interface BatchMutationResponse {
   seqs: number[]
 }
 
+interface BrowserSessionResponse {
+  session_id: string
+  session_proof: string
+  expires_at: string
+}
+
+interface PolicyDraftResponse {
+  draft_id: string
+  project_id: string
+  session_id: string
+  text: string
+  policy_hash: string
+  scope: 'session'
+  allowed_actions: ('approve' | 'reject')[]
+  max_uses: number
+  created_at: string
+  expires_at: string
+}
+
+interface PolicyConfirmationResponse {
+  policy_ref: string
+  capability: string
+  allowed_actions: ('approve' | 'reject')[]
+  max_uses: number
+  expires_at: string
+  confirmed_at: string
+  seq: number
+}
+
+interface ActionDraftResponse {
+  draft_id: string
+  project_id: string
+  session_id: string
+  action: 'approve' | 'reject' | 'dispatch' | 'pause' | 'resume' | 'structural'
+  summary: string
+  subject_hash: string
+  max_uses: 1
+  created_at: string
+  expires_at: string
+}
+
+interface ActionConfirmationResponse {
+  capability_ref: string
+  capability: string
+  action: ActionDraftResponse['action']
+  expires_at: string
+  confirmed_at: string
+}
+
 interface ErrorBody {
   error?: { code?: string; message?: string } | string
 }
@@ -72,6 +121,11 @@ interface ActiveIdentity {
   clockSampledAt: number | null
 }
 
+interface ActiveBrowserSession extends BrowserSessionResponse {
+  project: string
+  epoch: number
+}
+
 interface MutationContext {
   candidate: ActiveIdentity | null
   epoch: number
@@ -79,8 +133,10 @@ interface MutationContext {
   fixture: boolean
   cursor: string
   sessionId: string
+  sessionProof?: string
   idemKey: string
   staleMode: 'error' | 'silent'
+  capability?: { ref: string; token: string; nonce: string }
 }
 
 interface StreamStamp {
@@ -129,6 +185,7 @@ const mutationDebouncer = new SettledDebouncer<number>({
   clearTimeout: (timer) => window.clearTimeout(timer as number),
 })
 let identity: ActiveIdentity | null = null
+let browserSession: ActiveBrowserSession | null = null
 let identityEpoch = 0
 let socket: WebSocket | null = null
 let eventSource: EventSource | null = null
@@ -144,18 +201,11 @@ let identityRecovery: Promise<void> | null = null
 let mutationQueue = Promise.resolve()
 let initialization: Promise<void> | null = null
 const historyClosers = new Set<() => void>()
+const policyCapabilities = new Map<string, string>()
 
 export type MutationBatchItem = {
   [T in EvType]: { type: T; payload: EventPayloadMap[T] }
 }[EvType]
-
-function sessionId() {
-  const existing = sessionStorage.getItem(SESSION_KEY)
-  if (existing) return existing
-  const created = crypto.randomUUID()
-  sessionStorage.setItem(SESSION_KEY, created)
-  return created
-}
 
 function endpoint(path: string) {
   if (!serverConfiguration.requestBase) {
@@ -208,6 +258,24 @@ async function jsonResponse<T>(response: Response): Promise<T> {
     throw new TransportError(code, message, response.status)
   }
   return body as T
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue)
+  if (typeof value !== 'object' || value === null) return value
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, stableValue(child)]),
+  )
+}
+
+async function valueHash(value: unknown) {
+  const bytes = new TextEncoder().encode(JSON.stringify(stableValue(value)))
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
 }
 
 async function cloneDemo() {
@@ -269,8 +337,50 @@ async function getSnapshot(client = identity) {
   } satisfies SnapshotReceipt
 }
 
+async function issueBrowserSession(candidate: ActiveIdentity) {
+  const session = await jsonResponse<BrowserSessionResponse>(
+    await fetch(
+      endpoint(`/api/p/${encodeURIComponent(candidate.client.project)}/browser-sessions`),
+      {
+        method: 'POST',
+        headers: { 'x-mg-token': candidate.client.token },
+      },
+    ),
+  )
+  if (!identityIsActive(candidate)) {
+    throw new TransportError(
+      'identity_changed',
+      'The active mission changed while establishing its browser session.',
+    )
+  }
+  browserSession = {
+    ...session,
+    project: candidate.client.project,
+    epoch: candidate.epoch,
+  }
+  useMissionStore.getState().setSessionId(session.session_id)
+  return browserSession
+}
+
+function activeBrowserSession(candidate: ActiveIdentity) {
+  if (
+    !identityIsActive(candidate) ||
+    !browserSession ||
+    browserSession.epoch !== candidate.epoch ||
+    browserSession.project !== candidate.client.project
+  ) {
+    throw new TransportError(
+      'session_invalid',
+      'The server-issued browser session is not ready.',
+    )
+  }
+  return browserSession
+}
+
 function activateIdentity(client: ClientIdentity, source: IdentitySource) {
   resetTransportPenalties()
+  policyCapabilities.clear()
+  browserSession = null
   identityEpoch++
   useMissionStore.getState().setClockSkew(0)
   identity = {
@@ -297,6 +407,8 @@ function deactivateIdentity(candidate?: ActiveIdentity) {
   if (candidate && !identityIsActive(candidate)) return
   identityEpoch++
   identity = null
+  browserSession = null
+  policyCapabilities.clear()
 }
 
 function calibrateClock(
@@ -322,18 +434,27 @@ function calibrateClock(
 
 function captureMutationContext(
   staleMode: MutationOptions['staleMode'] = 'error',
+  capability?: MutationOptions['capability'],
 ): MutationContext {
   const state = useMissionStore.getState()
   const candidate = identity
+  const session =
+    candidate &&
+    browserSession?.epoch === candidate.epoch &&
+    browserSession.project === candidate.client.project
+      ? browserSession
+      : null
   return {
     candidate,
     epoch: identityEpoch,
     projectId: candidate?.client.project ?? state.projectId,
     fixture: state.connectionMode === 'fixture',
     cursor: state.cursor,
-    sessionId: state.sessionId,
+    sessionId: session?.session_id ?? state.sessionId,
+    ...(session ? { sessionProof: session.session_proof } : {}),
     idemKey: crypto.randomUUID(),
     staleMode,
+    ...(capability ? { capability } : {}),
   }
 }
 
@@ -465,7 +586,7 @@ async function fetchServerDigest(context: MutationContext) {
   if (cursor === 0) return
   const response = await fetch(
     endpoint(
-      `/api/p/${encodeURIComponent(candidate.client.project)}/mutations`,
+      `/api/p/${encodeURIComponent(candidate.client.project)}/agent-mutations`,
     ),
     {
       method: 'POST',
@@ -473,7 +594,9 @@ async function fetchServerDigest(context: MutationContext) {
         'content-type': 'application/json',
         'x-mg-token': candidate.client.token,
         'x-mg-session': context.sessionId,
-        'x-mg-actor': 'browser_agent',
+        ...(context.sessionProof
+          ? { 'x-mg-session-proof': context.sessionProof }
+          : {}),
       },
       body: JSON.stringify({
         type: 'SELECTION_CHANGED',
@@ -856,7 +979,7 @@ async function postMutation<T extends EvType>(
 
   const response = await fetch(
     endpoint(
-      `/api/p/${encodeURIComponent(candidate.client.project)}/mutations`,
+      `/api/p/${encodeURIComponent(candidate.client.project)}/${actor === 'browser_agent' ? 'agent-mutations' : 'mutations'}`,
     ),
     {
       method: 'POST',
@@ -864,7 +987,16 @@ async function postMutation<T extends EvType>(
         'content-type': 'application/json',
         'x-mg-token': candidate.client.token,
         'x-mg-session': context.sessionId,
-        'x-mg-actor': actor,
+        ...(context.sessionProof
+          ? { 'x-mg-session-proof': context.sessionProof }
+          : {}),
+        ...(context.capability
+          ? {
+              'x-mg-capability-ref': context.capability.ref,
+              'x-mg-capability': context.capability.token,
+              'x-mg-nonce': context.capability.nonce,
+            }
+          : {}),
       },
       body: JSON.stringify({
         type,
@@ -928,7 +1060,7 @@ async function postMutationBatch(
   }
   const response = await fetch(
     endpoint(
-      `/api/p/${encodeURIComponent(candidate.client.project)}/mutations`,
+      `/api/p/${encodeURIComponent(candidate.client.project)}/${actor === 'browser_agent' ? 'agent-mutations' : 'mutations'}`,
     ),
     {
       method: 'POST',
@@ -936,7 +1068,16 @@ async function postMutationBatch(
         'content-type': 'application/json',
         'x-mg-token': candidate.client.token,
         'x-mg-session': context.sessionId,
-        'x-mg-actor': actor,
+        ...(context.sessionProof
+          ? { 'x-mg-session-proof': context.sessionProof }
+          : {}),
+        ...(context.capability
+          ? {
+              'x-mg-capability-ref': context.capability.ref,
+              'x-mg-capability': context.capability.token,
+              'x-mg-nonce': context.capability.nonce,
+            }
+          : {}),
       },
       body: JSON.stringify({
         batch,
@@ -989,6 +1130,325 @@ async function postMutationBatch(
   return result.seqs
 }
 
+function enqueueMutationBatch(
+  batch: MutationBatchItem[],
+  actor: 'human' | 'browser_agent',
+  context: MutationContext,
+) {
+  const queued = mutationQueue.then(() =>
+    postMutationBatch(batch, actor, context),
+  )
+  mutationQueue = queued.then(
+    () => undefined,
+    () => undefined,
+  )
+  return queued
+}
+
+type HumanAction = ActionDraftResponse['action']
+
+function nodeHasStarted(nodeId: string) {
+  const target = useMissionStore.getState().nodes.find((node) => node.id === nodeId) as
+    | ({ state: string } & { ever_started?: boolean })
+    | undefined
+  return Boolean(target && (target.ever_started || target.state !== 'queued'))
+}
+
+function requiredHumanAction(batch: readonly MutationBatchItem[]): HumanAction | null {
+  const actions = new Set<HumanAction>()
+  let consequentialCount = 0
+  for (const item of batch) {
+    switch (item.type) {
+      case 'APPROVED':
+        actions.add('approve')
+        consequentialCount++
+        break
+      case 'REJECTED':
+        actions.add('reject')
+        consequentialCount++
+        break
+      case 'DISPATCHED':
+        actions.add('dispatch')
+        consequentialCount++
+        break
+      case 'PAUSE_REQUESTED':
+        actions.add('pause')
+        consequentialCount++
+        break
+      case 'RESUME_REQUESTED':
+        actions.add('resume')
+        consequentialCount++
+        break
+      case 'TASK_REMOVED':
+      case 'TASK_SPLIT':
+      case 'EDGE_REMOVED':
+        actions.add('structural')
+        consequentialCount++
+        break
+      case 'EDGE_ADDED':
+        if (nodeHasStarted(item.payload.upstream) || nodeHasStarted(item.payload.downstream)) {
+          actions.add('structural')
+          consequentialCount++
+        }
+        break
+    }
+  }
+  if (actions.size > 1) {
+    throw new TransportError(
+      'invalid_event',
+      'One confirmation cannot authorize mixed consequential action types.',
+    )
+  }
+  const action = [...actions][0] ?? null
+  if (action !== null && action !== 'structural' && consequentialCount !== 1) {
+    throw new TransportError(
+      'invalid_event',
+      'One confirmation cannot authorize multiple consequential actions.',
+    )
+  }
+  return action
+}
+
+function policyCapabilityFor<T extends EvType>(
+  type: T,
+  payload: EventPayloadMap[T],
+) {
+  if (type !== 'APPROVED' && type !== 'REJECTED') return undefined
+  const policyRef = 'policy_ref' in payload ? payload.policy_ref : undefined
+  const token = policyRef ? policyCapabilities.get(policyRef) : undefined
+  return policyRef && token
+    ? { ref: policyRef, token, nonce: crypto.randomUUID() }
+    : undefined
+}
+
+function actionSummary(action: HumanAction, batch: readonly MutationBatchItem[]) {
+  const nodeId = batch.flatMap((item) =>
+    'node_id' in item.payload && typeof item.payload.node_id === 'string'
+      ? [item.payload.node_id]
+      : [],
+  )[0]
+  const title = nodeId
+    ? useMissionStore.getState().nodes.find((node) => node.id === nodeId)?.title
+    : undefined
+  const target = title ? ` “${title}”` : ''
+  switch (action) {
+    case 'approve': return `Approve${target} and mark its reviewed work done.`
+    case 'reject': return `Reject${target} and return it for revision.`
+    case 'dispatch': return `Dispatch${target} to a real Codex worker.`
+    case 'pause': return `Request a cooperative pause for${target}.`
+    case 'resume': return `Resume worker execution for${target}.`
+    case 'structural': return 'Apply the reviewed blast-radius graph change.'
+  }
+}
+
+async function denyHumanDraft(
+  candidate: ActiveIdentity,
+  session: ActiveBrowserSession,
+  draftId: string,
+) {
+  if (!identityIsActive(candidate)) return
+  await jsonResponse(
+    await fetch(
+      endpoint(`/api/p/${encodeURIComponent(candidate.client.project)}/human-drafts/${encodeURIComponent(draftId)}/deny`),
+      {
+        method: 'POST',
+        headers: {
+          'x-mg-token': candidate.client.token,
+          'x-mg-session': session.session_id,
+          'x-mg-session-proof': session.session_proof,
+        },
+      },
+    ),
+  )
+}
+
+async function stageActionConfirmation(
+  batch: readonly MutationBatchItem[],
+  actor: 'human' | 'browser_agent',
+  execute: (capability: NonNullable<MutationOptions['capability']>) => Promise<unknown>,
+) {
+  const action = requiredHumanAction(batch)
+  if (!action) return false
+  const state = useMissionStore.getState()
+  const mutation = batch.length === 1
+    ? { type: batch[0]!.type, payload: batch[0]!.payload }
+    : { batch }
+  if (state.connectionMode === 'fixture') {
+    const draftId = crypto.randomUUID()
+    const subjectHash = await valueHash(mutation)
+    state.stageHumanConfirmation({
+      id: draftId,
+      kind: 'action',
+      title: 'Human confirmation required',
+      text: actionSummary(action, batch),
+      details: [
+        `Requested by ${actor === 'browser_agent' ? 'browser agent' : 'native UI'}`,
+        `Project: ${state.projectId ?? 'shorty-demo'}`,
+        `Session: ${state.sessionId}`,
+        `Action: ${action}`,
+        `Bound request SHA-256: ${subjectHash}`,
+        'One use only',
+      ],
+      expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+      confirm: async () => {
+        await execute({ ref: draftId, token: crypto.randomUUID(), nonce: crypto.randomUUID() })
+        if (action === 'structural') useMissionStore.getState().cancelStructural()
+      },
+      deny: async () => {},
+    })
+    return true
+  }
+  const candidate = identity
+  if (!candidate || !identityIsActive(candidate)) {
+    throw new TransportError('not_connected', 'No live project is connected.')
+  }
+  const session = activeBrowserSession(candidate)
+  const draft = await jsonResponse<ActionDraftResponse>(
+    await fetch(
+      endpoint(`/api/p/${encodeURIComponent(candidate.client.project)}/action-drafts`),
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-mg-token': candidate.client.token,
+          'x-mg-session': session.session_id,
+          'x-mg-session-proof': session.session_proof,
+        },
+        body: JSON.stringify({ mutation, summary: actionSummary(action, batch) }),
+      },
+    ),
+  )
+  if (!identityIsActive(candidate)) {
+    throw new TransportError('identity_changed', 'The active mission changed while staging confirmation.')
+  }
+  let confirmedCapability: ActionConfirmationResponse | null = null
+  state.stageHumanConfirmation({
+    id: draft.draft_id,
+    kind: 'action',
+    title: 'Human confirmation required',
+    text: draft.summary,
+    details: [
+      `Requested by ${actor === 'browser_agent' ? 'browser agent' : 'native UI'}`,
+      `Project: ${draft.project_id}`,
+      `Session: ${draft.session_id}`,
+      `Action: ${draft.action}`,
+      `Bound request SHA-256: ${draft.subject_hash}`,
+      'One use only',
+    ],
+    expiresAt: draft.expires_at,
+    confirm: async () => {
+      if (!identityIsActive(candidate)) {
+        throw new TransportError(
+          'identity_changed',
+          'The active mission changed before action confirmation.',
+        )
+      }
+      confirmedCapability ??= await jsonResponse<ActionConfirmationResponse>(
+        await fetch(
+          endpoint(`/api/p/${encodeURIComponent(candidate.client.project)}/action-drafts/${encodeURIComponent(draft.draft_id)}/confirm`),
+          {
+            method: 'POST',
+            headers: {
+              'x-mg-token': candidate.client.token,
+              'x-mg-session': session.session_id,
+              'x-mg-session-proof': session.session_proof,
+            },
+          },
+        ),
+      )
+      try {
+        await execute({
+          ref: confirmedCapability.capability_ref,
+          token: confirmedCapability.capability,
+          nonce: crypto.randomUUID(),
+        })
+      } catch (error) {
+        if (
+          action === 'structural' &&
+          error instanceof TransportError &&
+          error.code === 'stale_mutation'
+        ) {
+          const preview = useMissionStore.getState().structuralPreview
+          if (preview) {
+            await useMissionStore
+              .getState()
+              .confirmStructuralToken(preview.key, preview.opToken)
+          }
+          throw new TransportError(
+            'confirmation_stale',
+            'The graph changed. Review the refreshed blast radius before confirming again.',
+          )
+        }
+        throw error
+      }
+      if (action === 'structural') useMissionStore.getState().cancelStructural()
+    },
+    deny: () => denyHumanDraft(candidate, session, draft.draft_id),
+  })
+  return true
+}
+
+function confirmationRequired() {
+  return new TransportError(
+    'confirmation_required',
+    'The action is staged in the visible MissionGraph confirmation dialog; no mutation has occurred.',
+    undefined,
+    true,
+  )
+}
+
+async function executeSingleWithPresence<T extends EvType>(
+  type: T,
+  payload: EventPayloadMap[T],
+  actor: 'human' | 'browser_agent',
+  context: MutationContext,
+) {
+  const action = requiredHumanAction([{ type, payload } as MutationBatchItem])
+  const policyCapability = policyCapabilityFor(type, payload)
+  if (context.capability || policyCapability || !action) {
+    const authorizedContext = context.capability || !policyCapability
+      ? context
+      : { ...context, capability: policyCapability }
+    return enqueueMutation(type, payload, actor, authorizedContext)
+  }
+  if (actor === 'browser_agent' && (action === 'approve' || action === 'reject')) {
+    throw new TransportError(
+      'capability_required',
+      'Confirm a staged session policy in the visible MissionGraph UI before agent approval or rejection.',
+    )
+  }
+  await stageActionConfirmation([{ type, payload } as MutationBatchItem], actor, (capability) =>
+    enqueueMutation(
+      type,
+      payload,
+      actor,
+      action === 'structural'
+        ? { ...context, capability }
+        : captureMutationContext(context.staleMode, capability),
+    ),
+  )
+  throw confirmationRequired()
+}
+
+async function executeBatchWithPresence(
+  batch: MutationBatchItem[],
+  actor: 'human' | 'browser_agent',
+  context: MutationContext,
+) {
+  const action = requiredHumanAction(batch)
+  if (context.capability || !action) return enqueueMutationBatch(batch, actor, context)
+  await stageActionConfirmation(batch, actor, (capability) =>
+    enqueueMutationBatch(
+      batch,
+      actor,
+      action === 'structural'
+        ? { ...context, capability }
+        : captureMutationContext(context.staleMode, capability),
+    ),
+  )
+  throw confirmationRequired()
+}
+
 function enqueueMutation<T extends EvType>(
   type: T,
   payload: EventPayloadMap[T],
@@ -1008,11 +1468,11 @@ function enqueueMutation<T extends EvType>(
 export function prepareMutation<T extends EvType>(
   type: T,
   payload: EventPayloadMap[T],
-  options: Pick<MutationOptions, 'actor' | 'staleMode'> = {},
+  options: Pick<MutationOptions, 'actor' | 'staleMode' | 'capability'> = {},
 ) {
   const actor = options.actor ?? 'human'
-  const context = captureMutationContext(options.staleMode)
-  return () => enqueueMutation(type, payload, actor, context)
+  const context = captureMutationContext(options.staleMode, options.capability)
+  return () => executeSingleWithPresence(type, payload, actor, context)
 }
 
 export function mutate<T extends EvType>(
@@ -1028,46 +1488,167 @@ export function mutate<T extends EvType>(
       Number(useMissionStore.getState().cursor),
       () => {
         const context = captureMutationContext(options.staleMode)
-        return enqueueMutation(type, payload, actor, context)
+        return executeSingleWithPresence(type, payload, actor, context)
       },
     )
   }
-  const context = captureMutationContext(options.staleMode)
-  return enqueueMutation(type, payload, actor, context)
+  const context = captureMutationContext(options.staleMode, options.capability)
+  return executeSingleWithPresence(type, payload, actor, context)
 }
 
 export function mutateBatch(
   batch: MutationBatchItem[],
-  options: Pick<MutationOptions, 'actor' | 'staleMode'> = {},
+  options: Pick<MutationOptions, 'actor' | 'staleMode' | 'capability'> = {},
 ): Promise<number[]> {
   const actor = options.actor ?? 'human'
-  const context = captureMutationContext(options.staleMode)
-  const queued = mutationQueue.then(() =>
-    postMutationBatch(batch, actor, context),
-  )
-  mutationQueue = queued.then(
-    () => undefined,
-    () => undefined,
-  )
-  return queued
+  const context = captureMutationContext(options.staleMode, options.capability)
+  return executeBatchWithPresence(batch, actor, context)
 }
 
 export function prepareBatchMutation(
   batch: MutationBatchItem[],
-  options: Pick<MutationOptions, 'actor' | 'staleMode'> = {},
+  options: Pick<MutationOptions, 'actor' | 'staleMode' | 'capability'> = {},
 ) {
   const actor = options.actor ?? 'human'
-  const context = captureMutationContext(options.staleMode)
+  const context = captureMutationContext(options.staleMode, options.capability)
   return () => {
-    const queued = mutationQueue.then(() =>
-      postMutationBatch(batch, actor, context),
-    )
-    mutationQueue = queued.then(
-      () => undefined,
-      () => undefined,
-    )
-    return queued
+    return executeBatchWithPresence(batch, actor, context)
   }
+}
+
+export async function stagePolicyDraft(text: string) {
+  const state = useMissionStore.getState()
+  const sessionId = state.sessionId
+  if (!sessionId) {
+    throw new TransportError(
+      'not_connected',
+      'The browser session identity is not ready.',
+    )
+  }
+  if (state.connectionMode === 'fixture') {
+    const createdAt = new Date()
+    const draft: PolicyDraftResponse = {
+      draft_id: crypto.randomUUID(),
+      project_id: state.projectId ?? 'shorty-demo',
+      session_id: sessionId,
+      text,
+      policy_hash: await valueHash(text),
+      scope: 'session',
+      allowed_actions: ['approve', 'reject'],
+      max_uses: 4,
+      created_at: createdAt.toISOString(),
+      expires_at: new Date(createdAt.getTime() + 15 * 60_000).toISOString(),
+    }
+    state.stageHumanConfirmation({
+      id: draft.draft_id,
+      kind: 'policy',
+      title: 'Confirm session approval policy',
+      text: draft.text,
+      details: [
+        `Policy SHA-256: ${draft.policy_hash}`,
+        `Project: ${draft.project_id}`,
+        `Session: ${draft.session_id}`,
+        'Scope: session',
+        `Allowed actions: ${draft.allowed_actions.join(', ')}`,
+        `Maximum uses: ${draft.max_uses}`,
+      ],
+      expiresAt: draft.expires_at,
+      confirm: async () => {
+        const policyRef = crypto.randomUUID()
+        const capability = crypto.randomUUID()
+        await mutate('POLICY_STATED', {
+          policy_ref: policyRef,
+          text: draft.text,
+          scope: 'session',
+          session_id: sessionId,
+          allowed_actions: draft.allowed_actions,
+          max_uses: draft.max_uses,
+          expires_at: draft.expires_at,
+          confirmed_at: new Date().toISOString(),
+          request_origin: 'fixture-native-ui',
+        })
+        policyCapabilities.set(policyRef, capability)
+      },
+      deny: async () => {},
+    })
+    return draft
+  }
+  const candidate = identity
+  if (!candidate || !identityIsActive(candidate)) {
+    throw new TransportError('not_connected', 'No live project is connected.')
+  }
+  const session = activeBrowserSession(candidate)
+  const draft = await jsonResponse<PolicyDraftResponse>(
+    await fetch(
+      endpoint(`/api/p/${encodeURIComponent(candidate.client.project)}/policy-drafts`),
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-mg-token': candidate.client.token,
+          'x-mg-session': session.session_id,
+          'x-mg-session-proof': session.session_proof,
+        },
+        body: JSON.stringify({ text }),
+      },
+    ),
+  )
+  if (!identityIsActive(candidate)) {
+    throw new TransportError(
+      'identity_changed',
+      'The active mission changed while staging the policy.',
+    )
+  }
+  let confirmedPolicy: PolicyConfirmationResponse | null = null
+  state.stageHumanConfirmation({
+    id: draft.draft_id,
+    kind: 'policy',
+    title: 'Confirm session approval policy',
+    text: draft.text,
+    details: [
+      `Policy SHA-256: ${draft.policy_hash}`,
+      `Project: ${draft.project_id}`,
+      `Session: ${draft.session_id}`,
+      'Scope: session',
+      `Allowed actions: ${draft.allowed_actions.join(', ')}`,
+      `Maximum uses: ${draft.max_uses}`,
+    ],
+    expiresAt: draft.expires_at,
+    confirm: async () => {
+      if (!identityIsActive(candidate)) {
+        throw new TransportError(
+          'identity_changed',
+          'The active mission changed before policy confirmation.',
+        )
+      }
+      confirmedPolicy ??= await jsonResponse<PolicyConfirmationResponse>(
+        await fetch(
+          endpoint(`/api/p/${encodeURIComponent(candidate.client.project)}/policy-drafts/${encodeURIComponent(draft.draft_id)}/confirm`),
+          {
+            method: 'POST',
+            headers: {
+              'x-mg-token': candidate.client.token,
+              'x-mg-session': session.session_id,
+              'x-mg-session-proof': session.session_proof,
+            },
+          },
+        ),
+      )
+      if (!identityIsActive(candidate)) {
+        throw new TransportError(
+          'identity_changed',
+          'The active mission changed during policy confirmation.',
+        )
+      }
+      policyCapabilities.set(
+        confirmedPolicy.policy_ref,
+        confirmedPolicy.capability,
+      )
+      await waitForSequence(confirmedPolicy.seq, captureMutationContext())
+    },
+    deny: () => denyHumanDraft(candidate, session, draft.draft_id),
+  })
+  return draft
 }
 
 function sharedIdentityFromUrl(): ClientIdentity | null {
@@ -1092,6 +1673,7 @@ function enterFixtureWithRetry(error: unknown) {
   const delay = bootstrapRetryDelay(bootstrapAttempt++)
   const message =
     error instanceof Error ? error.message : 'The live server is unreachable.'
+  useMissionStore.getState().setSessionId(fixtureSessionId)
   useMissionStore
     .getState()
     .useFixture(
@@ -1111,7 +1693,7 @@ function markBootstrapConnected() {
 
 async function bootstrap() {
   const store = useMissionStore.getState()
-  store.setSessionId(sessionId())
+  store.setSessionId(fixtureSessionId)
   configureMutationSender(mutate, prepareMutation)
   try {
     const linked = sharedIdentityFromUrl()
@@ -1174,6 +1756,8 @@ async function connectProject(client: ClientIdentity, source: IdentitySource) {
   clearReconnectTimer()
   const candidate = activateIdentity(client, source)
   const snapshot = await getSnapshot(candidate)
+  if (!identityIsActive(candidate)) return candidate
+  await issueBrowserSession(candidate)
   if (!identityIsActive(candidate)) return candidate
   calibrateClock(
     candidate,

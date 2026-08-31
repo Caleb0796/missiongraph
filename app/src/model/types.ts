@@ -29,6 +29,14 @@ export interface Handoff {
 
 export type EdgeKind = 'depends' | 'conflicts'
 
+export interface HumanAuthorizationAudit {
+  capability_ref: string
+  policy_text?: string
+  confirmed_at: string
+  request_origin: string
+  use_nonce: string
+}
+
 export interface GraphEdge {
   edge_id: string
   upstream: string
@@ -73,33 +81,41 @@ export type Actor =
 
 export interface EventPayloadMap {
   TASK_ADDED: { node: TaskNode }
-  TASK_REMOVED: { node_id: string; tombstone: true }
+  TASK_REMOVED: {
+    node_id: string
+    tombstone: true
+    authorization?: HumanAuthorizationAudit
+  }
   TASK_SPLIT: {
     parent_id: string
     children: TaskNode[]
     edge_remap: { edge_id: string; new_target: string }[]
+    authorization?: HumanAuthorizationAudit
   }
   EDGE_ADDED: {
     edge_id: string
     upstream: string
     downstream: string
     kind: EdgeKind
+    authorization?: HumanAuthorizationAudit
   }
-  EDGE_REMOVED: { edge_id: string }
+  EDGE_REMOVED: { edge_id: string; authorization?: HumanAuthorizationAudit }
   DISPATCHED: {
     node_id: string
     brief_override?: string
     bypass_cap: boolean
+    authorization?: HumanAuthorizationAudit
   }
   RETRY_REQUESTED: { node_id: string; guidance: string }
-  PAUSE_REQUESTED: { node_id: string }
-  RESUME_REQUESTED: { node_id: string }
+  PAUSE_REQUESTED: { node_id: string; authorization?: HumanAuthorizationAudit }
+  RESUME_REQUESTED: { node_id: string; authorization?: HumanAuthorizationAudit }
   APPROVED: {
     approval_id: string
     node_id: string
     policy_ref?: string
     rationale?: string
     reason?: string
+    authorization?: HumanAuthorizationAudit
   }
   REJECTED: {
     approval_id: string
@@ -107,12 +123,18 @@ export interface EventPayloadMap {
     policy_ref?: string
     rationale?: string
     reason?: string
+    authorization?: HumanAuthorizationAudit
   }
   POLICY_STATED: {
     policy_ref: string
     text: string
     scope: 'session'
     session_id: string
+    allowed_actions?: ('approve' | 'reject')[]
+    max_uses?: number
+    expires_at?: string
+    confirmed_at?: string
+    request_origin?: string
   }
   ANNOTATED: { target_id: string; note: string }
   JOURNAL_NOTE: { text: string }

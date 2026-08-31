@@ -22,6 +22,7 @@ import {
   mutateBatch,
   prepareBatchMutation,
   prepareMutation,
+  stagePolicyDraft,
   type MutationBatchItem,
 } from '../transport/client'
 import type { ToolDefinition, ToolOutcome } from './registry'
@@ -960,7 +961,7 @@ const listPendingApprovals: ToolDefinition = {
 const statePolicy: ToolDefinition = {
   name: 'state_policy',
   description:
-    'Record the human’s verbatim approval policy for this browser session and mint its policy reference.',
+    'Stage an approval policy for visible human confirmation in this browser session.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -971,19 +972,17 @@ const statePolicy: ToolDefinition = {
   },
   async execute(inputs) {
     const text = string(inputs.text, 'text')
-    const sessionId = useMissionStore.getState().sessionId
-    if (!sessionId) throw new Error('The browser session identity is not ready.')
-    const policyRef = crypto.randomUUID()
-    await mutate(
-      'POLICY_STATED',
-      { policy_ref: policyRef, text, scope: 'session', session_id: sessionId },
-      { actor: 'browser_agent' },
-    )
+    const draft = await stagePolicyDraft(text)
     return {
       data: {
-        summary: `Recorded the session approval policy: ${text}`,
-        policy_ref: policyRef,
-        scope: 'session',
+        summary:
+          'Policy staged for visible human confirmation; no policy grant or graph event has been created.',
+        draft_id: draft.draft_id,
+        scope: draft.scope,
+        allowed_actions: draft.allowed_actions,
+        max_uses: draft.max_uses,
+        expires_at: draft.expires_at,
+        status: 'pending_human_confirmation',
       },
     }
   },

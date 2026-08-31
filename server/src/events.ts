@@ -30,38 +30,67 @@ export interface Handoff {
   artifacts: { label: string; url: string }[];
 }
 
+export type HumanAction = "approve" | "reject" | "dispatch" | "pause" | "resume" | "structural";
+
+export interface AuthorizationAudit {
+  capability_ref: string;
+  policy_text?: string;
+  confirmed_at: string;
+  request_origin: string;
+  use_nonce: string;
+}
+
 export interface EventPayloads {
   TASK_ADDED: { node: TaskNode };
-  TASK_REMOVED: { node_id: string; tombstone: true };
+  TASK_REMOVED: { node_id: string; tombstone: true; authorization?: AuthorizationAudit };
   TASK_SPLIT: {
     parent_id: string;
     children: TaskNode[];
     edge_remap: { edge_id: string; new_target: string }[];
+    authorization?: AuthorizationAudit;
   };
   EDGE_ADDED: {
     edge_id: string;
     upstream: string;
     downstream: string;
     kind: "depends" | "conflicts";
+    authorization?: AuthorizationAudit;
   };
-  EDGE_REMOVED: { edge_id: string };
-  DISPATCHED: { node_id: string; brief_override?: string; bypass_cap: boolean };
+  EDGE_REMOVED: { edge_id: string; authorization?: AuthorizationAudit };
+  DISPATCHED: {
+    node_id: string;
+    brief_override?: string;
+    bypass_cap: boolean;
+    authorization?: AuthorizationAudit;
+  };
   RETRY_REQUESTED: { node_id: string; guidance: string };
-  PAUSE_REQUESTED: { node_id: string };
-  RESUME_REQUESTED: { node_id: string };
+  PAUSE_REQUESTED: { node_id: string; authorization?: AuthorizationAudit };
+  RESUME_REQUESTED: { node_id: string; authorization?: AuthorizationAudit };
   APPROVED: {
     approval_id: string;
     node_id: string;
     policy_ref?: string;
     rationale?: string;
+    authorization?: AuthorizationAudit;
   };
   REJECTED: {
     approval_id: string;
     node_id: string;
     policy_ref?: string;
     reason?: string;
+    authorization?: AuthorizationAudit;
   };
-  POLICY_STATED: { policy_ref: string; text: string; scope: "session"; session_id: string };
+  POLICY_STATED: {
+    policy_ref: string;
+    text: string;
+    scope: "session";
+    session_id: string;
+    allowed_actions?: ("approve" | "reject")[];
+    max_uses?: number;
+    expires_at?: string;
+    confirmed_at?: string;
+    request_origin?: string;
+  };
   ANNOTATED: { target_id: string; note: string };
   JOURNAL_NOTE: { text: string };
   NODE_STATE_CHANGED: { node_id: string; from: NodeState; to: NodeState; detail?: string };
@@ -246,6 +275,25 @@ function handoff(value: unknown): Handoff {
   };
 }
 
+function authorizationAudit(value: unknown): AuthorizationAudit {
+  const item = object(value, "payload.authorization");
+  return {
+    capability_ref: identifier(item.capability_ref, "payload.authorization.capability_ref"),
+    ...(item.policy_text === undefined
+      ? {}
+      : { policy_text: string(item.policy_text, "payload.authorization.policy_text") }),
+    confirmed_at: identifier(item.confirmed_at, "payload.authorization.confirmed_at"),
+    request_origin: identifier(item.request_origin, "payload.authorization.request_origin"),
+    use_nonce: identifier(item.use_nonce, "payload.authorization.use_nonce"),
+  };
+}
+
+function authorizationField(payload: Record<string, unknown>): { authorization?: AuthorizationAudit } {
+  return payload.authorization === undefined
+    ? {}
+    : { authorization: authorizationAudit(payload.authorization) };
+}
+
 function nodeIdPayload(payload: Record<string, unknown>): { node_id: string } {
   return { node_id: identifier(payload.node_id, "payload.node_id") };
 }
@@ -273,7 +321,11 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
       break;
     case "TASK_REMOVED":
       if (payload.tombstone !== true) throw new EventValidationError("payload.tombstone must be true");
-      parsed = { node_id: identifier(payload.node_id, "payload.node_id"), tombstone: true };
+      parsed = {
+        node_id: identifier(payload.node_id, "payload.node_id"),
+        tombstone: true,
+        ...authorizationField(payload),
+      };
       break;
     case "TASK_SPLIT":
       if (!Array.isArray(payload.children) || !Array.isArray(payload.edge_remap)) {
@@ -289,6 +341,7 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
             new_target: identifier(entry.new_target, `payload.edge_remap[${index}].new_target`),
           };
         }),
+        ...authorizationField(payload),
       };
       break;
     case "EDGE_ADDED":
@@ -297,10 +350,14 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
         upstream: identifier(payload.upstream, "payload.upstream"),
         downstream: identifier(payload.downstream, "payload.downstream"),
         kind: oneOf(payload.kind, ["depends", "conflicts"] as const, "payload.kind"),
+        ...authorizationField(payload),
       };
       break;
     case "EDGE_REMOVED":
-      parsed = { edge_id: identifier(payload.edge_id, "payload.edge_id") };
+      parsed = {
+        edge_id: identifier(payload.edge_id, "payload.edge_id"),
+        ...authorizationField(payload),
+      };
       break;
     case "DISPATCHED": {
       const brief_override = optionalString(payload.brief_override, "payload.brief_override");
@@ -308,6 +365,7 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
         ...nodeIdPayload(payload),
         ...(brief_override === undefined ? {} : { brief_override }),
         bypass_cap: boolean(payload.bypass_cap, "payload.bypass_cap"),
+        ...authorizationField(payload),
       };
       break;
     }
@@ -316,38 +374,68 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
       break;
     case "PAUSE_REQUESTED":
     case "RESUME_REQUESTED":
+      parsed = { ...nodeIdPayload(payload), ...authorizationField(payload) };
+      break;
     case "PAUSE_ACKED":
       parsed = nodeIdPayload(payload);
       break;
     case "APPROVED": {
       const policy_ref = optionalIdentifier(payload.policy_ref, "payload.policy_ref");
       const rationale = optionalString(payload.rationale, "payload.rationale");
+      const authorization =
+        payload.authorization === undefined ? undefined : authorizationAudit(payload.authorization);
       parsed = {
         approval_id: identifier(payload.approval_id, "payload.approval_id"),
         node_id: identifier(payload.node_id, "payload.node_id"),
         ...(policy_ref === undefined ? {} : { policy_ref }),
         ...(rationale === undefined ? {} : { rationale }),
+        ...(authorization === undefined ? {} : { authorization }),
       };
       break;
     }
     case "REJECTED": {
       const policy_ref = optionalIdentifier(payload.policy_ref, "payload.policy_ref");
       const reason = optionalString(payload.reason, "payload.reason");
+      const authorization =
+        payload.authorization === undefined ? undefined : authorizationAudit(payload.authorization);
       parsed = {
         approval_id: identifier(payload.approval_id, "payload.approval_id"),
         node_id: identifier(payload.node_id, "payload.node_id"),
         ...(policy_ref === undefined ? {} : { policy_ref }),
         ...(reason === undefined ? {} : { reason }),
+        ...(authorization === undefined ? {} : { authorization }),
       };
       break;
     }
     case "POLICY_STATED":
       if (payload.scope !== "session") throw new EventValidationError("payload.scope must be session");
+      if (
+        payload.allowed_actions !== undefined &&
+        (!Array.isArray(payload.allowed_actions) ||
+          payload.allowed_actions.some((action) => action !== "approve" && action !== "reject"))
+      ) {
+        throw new EventValidationError("payload.allowed_actions must contain approve or reject");
+      }
       parsed = {
         policy_ref: identifier(payload.policy_ref, "payload.policy_ref"),
         text: string(payload.text, "payload.text"),
         scope: "session",
         session_id: identifier(payload.session_id, "payload.session_id"),
+        ...(payload.allowed_actions === undefined
+          ? {}
+          : { allowed_actions: [...payload.allowed_actions] as ("approve" | "reject")[] }),
+        ...(payload.max_uses === undefined
+          ? {}
+          : { max_uses: number(payload.max_uses, "payload.max_uses", 1) }),
+        ...(payload.expires_at === undefined
+          ? {}
+          : { expires_at: identifier(payload.expires_at, "payload.expires_at") }),
+        ...(payload.confirmed_at === undefined
+          ? {}
+          : { confirmed_at: identifier(payload.confirmed_at, "payload.confirmed_at") }),
+        ...(payload.request_origin === undefined
+          ? {}
+          : { request_origin: identifier(payload.request_origin, "payload.request_origin") }),
       };
       break;
     case "ANNOTATED":
@@ -477,6 +565,60 @@ export interface ReporterIdentity {
   expires_at: string;
 }
 
+export interface BrowserSession {
+  id: string;
+  token: string;
+  project_id: string;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface HumanDraft {
+  id: string;
+  project_id: string;
+  session_id: string;
+  kind: "policy" | "action";
+  actions: HumanAction[];
+  subject_hash: string;
+  display_text: string;
+  policy_text?: string;
+  max_uses: number;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface HumanCapability {
+  ref: string;
+  token: string;
+  project_id: string;
+  session_id: string;
+  kind: "policy" | "action";
+  actions: HumanAction[];
+  subject_hash: string;
+  policy_text?: string;
+  max_uses: number;
+  created_at: string;
+  expires_at: string;
+  confirmed_at: string;
+  request_origin: string;
+}
+
+export interface HumanCapabilityAudit {
+  ref: string;
+  kind: "policy" | "action";
+  policy_text?: string;
+  confirmed_at: string;
+  request_origin: string;
+  use_nonce: string;
+}
+
+export class CapabilityError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = "CapabilityError";
+  }
+}
+
 export interface CreateProjectOptions {
   seedProjectId?: string;
   reporterToken?: string;
@@ -601,9 +743,56 @@ export class EventStore {
         actor TEXT NOT NULL,
         expires_at TEXT NOT NULL
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS browser_sessions (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS human_drafts (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        session_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('policy', 'action')),
+        actions_json TEXT NOT NULL CHECK(json_valid(actions_json)),
+        subject_hash TEXT NOT NULL,
+        display_text TEXT NOT NULL,
+        policy_text TEXT,
+        max_uses INTEGER NOT NULL CHECK(max_uses > 0),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        confirmed_at TEXT,
+        denied_at TEXT
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS human_capabilities (
+        ref TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        session_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('policy', 'action')),
+        actions_json TEXT NOT NULL CHECK(json_valid(actions_json)),
+        subject_hash TEXT NOT NULL,
+        policy_text TEXT,
+        max_uses INTEGER NOT NULL CHECK(max_uses > 0),
+        uses INTEGER NOT NULL DEFAULT 0 CHECK(uses >= 0),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        confirmed_at TEXT NOT NULL,
+        request_origin TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS human_capability_uses (
+        capability_ref TEXT NOT NULL REFERENCES human_capabilities(ref),
+        nonce TEXT NOT NULL,
+        used_at TEXT NOT NULL,
+        PRIMARY KEY (capability_ref, nonce)
+      ) STRICT;
       CREATE INDEX IF NOT EXISTS events_project_node ON events(project_id, node_ref, seq);
       CREATE INDEX IF NOT EXISTS events_project_edge ON events(project_id, edge_ref, seq);
       CREATE INDEX IF NOT EXISTS reporter_credentials_project ON reporter_credentials(project_id, expires_at);
+      CREATE INDEX IF NOT EXISTS browser_sessions_project ON browser_sessions(project_id, expires_at);
+      CREATE INDEX IF NOT EXISTS human_drafts_project ON human_drafts(project_id, session_id, expires_at);
+      CREATE INDEX IF NOT EXISTS human_capabilities_project ON human_capabilities(project_id, session_id, expires_at);
     `);
   }
 
@@ -776,6 +965,263 @@ export class EventStore {
     return { project_id: row.project_id, actor: reporterActor(parseActor(row.actor)), expires_at: row.expires_at };
   }
 
+  issueBrowserSession(session: BrowserSession): BrowserSession {
+    if (!this.hasProject(session.project_id)) throw new UnknownProjectError(session.project_id);
+    this.database
+      .prepare(
+        `INSERT INTO browser_sessions (id, token_hash, project_id, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        session.id,
+        reporterTokenHash(session.token),
+        session.project_id,
+        session.created_at,
+        session.expires_at,
+      );
+    return session;
+  }
+
+  browserSessionMatches(
+    projectId: string,
+    sessionId: string,
+    token: string,
+    at: string,
+  ): boolean {
+    const row = this.database
+      .prepare(
+        `SELECT 1 AS found FROM browser_sessions
+         WHERE id = ? AND token_hash = ? AND project_id = ? AND expires_at > ?`,
+      )
+      .get(sessionId, reporterTokenHash(token), projectId, at) as { found: number } | undefined;
+    return row?.found === 1;
+  }
+
+  stageHumanDraft(input: HumanDraft): HumanDraft {
+    if (!this.hasProject(input.project_id)) throw new UnknownProjectError(input.project_id);
+    this.database
+      .prepare(
+        `INSERT INTO human_drafts
+          (id, project_id, session_id, kind, actions_json, subject_hash, display_text,
+           policy_text, max_uses, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.id,
+        input.project_id,
+        input.session_id,
+        input.kind,
+        JSON.stringify(input.actions),
+        input.subject_hash,
+        input.display_text,
+        input.policy_text ?? null,
+        input.max_uses,
+        input.created_at,
+        input.expires_at,
+      );
+    return input;
+  }
+
+  confirmHumanDraft(input: {
+    projectId: string;
+    sessionId: string;
+    draftId: string;
+    kind: "policy" | "action";
+    confirmedAt: string;
+    requestOrigin: string;
+    ref: string;
+    token: string;
+  }): HumanCapability {
+    const row = this.database
+      .prepare("SELECT * FROM human_drafts WHERE id = ?")
+      .get(input.draftId) as
+      | {
+          id: string;
+          project_id: string;
+          session_id: string;
+          kind: "policy" | "action";
+          actions_json: string;
+          subject_hash: string;
+          display_text: string;
+          policy_text: string | null;
+          max_uses: number;
+          created_at: string;
+          expires_at: string;
+          confirmed_at: string | null;
+          denied_at: string | null;
+        }
+      | undefined;
+    if (
+      !row ||
+      row.project_id !== input.projectId ||
+      row.session_id !== input.sessionId ||
+      row.kind !== input.kind
+    ) {
+      throw new CapabilityError("capability_invalid", "The confirmation draft does not belong to this project session.");
+    }
+    if (row.confirmed_at) {
+      throw new CapabilityError("capability_replayed", "This confirmation draft was already used.");
+    }
+    if (row.denied_at) {
+      throw new CapabilityError("capability_denied", "This confirmation draft was denied.");
+    }
+    if (row.expires_at <= input.confirmedAt) {
+      throw new CapabilityError("capability_expired", "This confirmation draft expired.");
+    }
+    const capability: HumanCapability = {
+      ref: input.ref,
+      token: input.token,
+      project_id: row.project_id,
+      session_id: row.session_id,
+      kind: row.kind,
+      actions: JSON.parse(row.actions_json) as HumanAction[],
+      subject_hash: row.subject_hash,
+      ...(row.policy_text === null ? {} : { policy_text: row.policy_text }),
+      max_uses: row.max_uses,
+      created_at: row.created_at,
+      expires_at: row.expires_at,
+      confirmed_at: input.confirmedAt,
+      request_origin: input.requestOrigin,
+    };
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const changed = this.database
+        .prepare(
+          "UPDATE human_drafts SET confirmed_at = ? WHERE id = ? AND confirmed_at IS NULL AND denied_at IS NULL",
+        )
+        .run(input.confirmedAt, row.id);
+      if (changed.changes !== 1) {
+        throw new CapabilityError("capability_replayed", "This confirmation draft was already used.");
+      }
+      this.database
+        .prepare(
+          `INSERT INTO human_capabilities
+            (ref, token_hash, project_id, session_id, kind, actions_json, subject_hash,
+             policy_text, max_uses, created_at, expires_at, confirmed_at, request_origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          capability.ref,
+          reporterTokenHash(capability.token),
+          capability.project_id,
+          capability.session_id,
+          capability.kind,
+          JSON.stringify(capability.actions),
+          capability.subject_hash,
+          capability.policy_text ?? null,
+          capability.max_uses,
+          capability.created_at,
+          capability.expires_at,
+          capability.confirmed_at,
+          capability.request_origin,
+        );
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return capability;
+  }
+
+  denyHumanDraft(input: {
+    projectId: string;
+    sessionId: string;
+    draftId: string;
+    deniedAt: string;
+  }): void {
+    const row = this.database
+      .prepare("SELECT project_id, session_id, confirmed_at, denied_at FROM human_drafts WHERE id = ?")
+      .get(input.draftId) as
+      | {
+          project_id: string;
+          session_id: string;
+          confirmed_at: string | null;
+          denied_at: string | null;
+        }
+      | undefined;
+    if (!row || row.project_id !== input.projectId || row.session_id !== input.sessionId) {
+      throw new CapabilityError("capability_invalid", "The confirmation draft does not belong to this project session.");
+    }
+    if (row.confirmed_at) {
+      throw new CapabilityError("capability_replayed", "This confirmation draft was already used.");
+    }
+    if (row.denied_at) return;
+    this.database
+      .prepare(
+        "UPDATE human_drafts SET denied_at = ? WHERE id = ? AND confirmed_at IS NULL AND denied_at IS NULL",
+      )
+      .run(input.deniedAt, input.draftId);
+  }
+
+  revokeHumanCapability(ref: string): void {
+    this.database.prepare("DELETE FROM human_capabilities WHERE ref = ?").run(ref);
+  }
+
+  consumeHumanCapability(input: {
+    projectId: string;
+    sessionId: string;
+    ref: string;
+    token: string;
+    action: HumanAction;
+    subjectHash: string;
+    nonce: string;
+    usedAt: string;
+  }): HumanCapabilityAudit {
+    const row = this.database
+      .prepare(
+        `SELECT ref, project_id, session_id, kind, actions_json, subject_hash, policy_text,
+                max_uses, uses, expires_at, confirmed_at, request_origin
+         FROM human_capabilities WHERE ref = ? AND token_hash = ?`,
+      )
+      .get(input.ref, reporterTokenHash(input.token)) as
+      | {
+          ref: string;
+          project_id: string;
+          session_id: string;
+          kind: "policy" | "action";
+          actions_json: string;
+          subject_hash: string;
+          policy_text: string | null;
+          max_uses: number;
+          uses: number;
+          expires_at: string;
+          confirmed_at: string;
+          request_origin: string;
+        }
+      | undefined;
+    if (!row || row.project_id !== input.projectId || row.session_id !== input.sessionId) {
+      throw new CapabilityError("capability_invalid", "The human-presence capability is invalid for this project session.");
+    }
+    if (row.expires_at <= input.usedAt) {
+      throw new CapabilityError("capability_expired", "The human-presence capability expired.");
+    }
+    const actions = JSON.parse(row.actions_json) as HumanAction[];
+    if (!actions.includes(input.action) || row.subject_hash !== input.subjectHash) {
+      throw new CapabilityError("capability_invalid", "The human-presence capability does not authorize this action.");
+    }
+    if (row.uses >= row.max_uses) {
+      throw new CapabilityError("capability_exhausted", "The human-presence capability has no uses remaining.");
+    }
+    const prior = this.database
+      .prepare("SELECT 1 AS found FROM human_capability_uses WHERE capability_ref = ? AND nonce = ?")
+      .get(row.ref, input.nonce) as { found: number } | undefined;
+    if (prior) throw new CapabilityError("capability_replayed", "This capability use nonce was already consumed.");
+    this.database
+      .prepare("INSERT INTO human_capability_uses (capability_ref, nonce, used_at) VALUES (?, ?, ?)")
+      .run(row.ref, input.nonce, input.usedAt);
+    this.database
+      .prepare("UPDATE human_capabilities SET uses = uses + 1 WHERE ref = ?")
+      .run(row.ref);
+    return {
+      ref: row.ref,
+      kind: row.kind,
+      ...(row.policy_text === null ? {} : { policy_text: row.policy_text }),
+      confirmed_at: row.confirmed_at,
+      request_origin: row.request_origin,
+      use_nonce: input.nonce,
+    };
+  }
+
   latestSeq(projectId: string): number {
     if (!this.hasProject(projectId)) throw new UnknownProjectError(projectId);
     const row = this.database
@@ -801,7 +1247,13 @@ export class EventStore {
   append(
     projectId: string,
     input: EventInput,
-    options: { baseSeq?: number; ts?: string; sessionId?: string; trustedImport?: boolean } = {},
+    options: {
+      baseSeq?: number;
+      ts?: string;
+      sessionId?: string;
+      trustedImport?: boolean;
+      authorize?: () => void;
+    } = {},
   ): { event: Event; duplicate: boolean } {
     if (!this.hasProject(projectId)) throw new UnknownProjectError(projectId);
     this.database.exec("BEGIN IMMEDIATE");
@@ -823,6 +1275,7 @@ export class EventStore {
           ts: options.ts ?? new Date().toISOString(),
           ...input,
         } as Event;
+        options.authorize?.();
         reduceEvent(fold(this.listEvents(projectId)), event, {
           ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
           ...(options.trustedImport === true ? { replay: true } : {}),
@@ -860,7 +1313,7 @@ export class EventStore {
     projectId: string,
     inputs: readonly EventInput[],
     idemKey: string,
-    options: { baseSeq?: number; ts?: string; sessionId?: string } = {},
+    options: { baseSeq?: number; ts?: string; sessionId?: string; authorize?: () => void } = {},
   ): { events: Event[]; duplicate: boolean } {
     if (!this.hasProject(projectId)) throw new UnknownProjectError(projectId);
     if (inputs.length === 0) throw new EventValidationError("batch must not be empty");
@@ -883,6 +1336,7 @@ export class EventStore {
         }
         const timestamp = options.ts ?? new Date().toISOString();
         const batchHash = createHash("sha256").update(idemKey).digest("hex");
+        options.authorize?.();
         let state = fold(this.listEvents(projectId));
         const events: Event[] = [];
         for (const [index, input] of inputs.entries()) {

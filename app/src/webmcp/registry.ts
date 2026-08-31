@@ -1,13 +1,18 @@
 import { TransportError } from '../transport/client'
 import { toolCursorForProject } from '../transport/client-logic'
 import { useMissionStore } from '../store/mission-store'
-import { DynamicToolController } from './dynamic-tools'
+import {
+  detectDynamicRegistrationTier,
+  DynamicToolController,
+} from './dynamic-tools'
 import {
   RegistrationScope,
   RegistryLifecycle,
   missionClientReadiness,
   type RegistryLifecycleStatus,
 } from './registry-lifecycle'
+
+export { executeRegisteredTool } from './dynamic-tools'
 
 export type ModelContextNamespace = 'document' | 'navigator'
 export type DynamicToolsTier = 'abort-controller' | 'provide-context' | 'none'
@@ -48,7 +53,10 @@ interface ModelContext {
     tools: ModelContextTool[]
   }) => Promise<void> | void
   getTools: () => Promise<RegisteredTool[]>
-  executeTool: (tool: RegisteredTool, input: string) => Promise<string | null>
+  executeTool: (
+    tool: RegisteredTool,
+    input: string | Record<string, unknown>,
+  ) => Promise<string | null>
 }
 
 declare global {
@@ -226,44 +234,35 @@ function wrapTool(definition: ToolDefinition): ModelContextTool {
   }
 }
 
-function isAbortError(error: unknown) {
-  return error instanceof DOMException && error.name === 'AbortError'
+function registrationErrorMessage(error: unknown) {
+  if (error instanceof Error) return `${error.name}: ${error.message}`
+  if (
+    typeof error === 'object' &&
+    error !== null &&
+    'message' in error &&
+    typeof error.message === 'string'
+  ) {
+    return error.message
+  }
+  const message = String(error)
+  return message === '[object Object]'
+    ? 'WebMCP registration failed with an opaque browser error.'
+    : message
 }
 
 async function bootstrapWebMcp(
   runtime: WebMcpRuntime,
   scope: RegistrationScope,
 ) {
-  const controller = new AbortController()
-  controller.abort()
-  if (runtime.modelContext.provideContext) {
+  const dynamicToolsTier = await detectDynamicRegistrationTier(
+    runtime.modelContext,
+    wrapTool(helloMissionGraph),
+  )
+  const registeredTools = await runtime.modelContext.getTools()
+  if (dynamicToolsTier === 'provide-context') {
     scope.addCleanup(() =>
       runtime.modelContext.provideContext?.({ tools: [] }),
     )
-  }
-  let registrationError: unknown
-  try {
-    await runtime.modelContext.registerTool(wrapTool(helloMissionGraph), {
-      signal: controller.signal,
-    })
-  } catch (error) {
-    registrationError = error
-  }
-
-  const registeredTools = await runtime.modelContext.getTools()
-  const helloWasRegistered = registeredTools.some(
-    (tool) => tool.name === helloMissionGraph.name,
-  )
-  let dynamicToolsTier: DynamicToolsTier
-  if (!helloWasRegistered) {
-    if (registrationError && !isAbortError(registrationError)) {
-      throw registrationError
-    }
-    dynamicToolsTier = 'abort-controller'
-  } else if (typeof runtime.modelContext.provideContext === 'function') {
-    dynamicToolsTier = 'provide-context'
-  } else {
-    dynamicToolsTier = 'none'
   }
 
   const coreTools = coreDefinitions.map(wrapTool)
@@ -275,11 +274,15 @@ async function bootstrapWebMcp(
         : coreTools
     for (const tool of initialTools) {
       if (!existing.has(tool.name)) {
-        const registrationController = new AbortController()
-        scope.addCleanup(() => registrationController.abort())
-        await runtime.modelContext.registerTool(tool, {
-          signal: registrationController.signal,
-        })
+        if (dynamicToolsTier === 'abort-controller') {
+          const registrationController = new AbortController()
+          scope.addCleanup(() => registrationController.abort())
+          await runtime.modelContext.registerTool(tool, {
+            signal: registrationController.signal,
+          })
+        } else {
+          await runtime.modelContext.registerTool(tool)
+        }
       }
       existing.add(tool.name)
     }
@@ -337,10 +340,11 @@ async function bootstrapWebMcp(
 const registryLifecycle = new RegistryLifecycle({
   getRuntime: getWebMcpRuntime,
   bootstrap: bootstrapWebMcp,
+  errorMessage: registrationErrorMessage,
   onBackgroundError(error) {
     console.warn(
       '[MissionGraph] WebMCP registration failed; waiting to retry.',
-      error,
+      registrationErrorMessage(error),
     )
   },
 })

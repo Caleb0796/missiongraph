@@ -115,6 +115,7 @@ function MissionBoard() {
   const topologyRevision = useMissionStore((state) => state.topologyRevision)
   const toast = useMissionStore((state) => state.toast)
   const structuralPreview = useMissionStore((state) => state.structuralPreview)
+  const humanConfirmation = useMissionStore((state) => state.humanConfirmation)
   const contextualToolsDegraded = useMissionStore(
     (state) => state.contextualToolsDegraded,
   )
@@ -128,6 +129,12 @@ function MissionBoard() {
   const clearToast = useMissionStore((state) => state.clearToast)
   const confirmStructural = useMissionStore((state) => state.confirmStructural)
   const cancelStructural = useMissionStore((state) => state.cancelStructural)
+  const confirmHumanConfirmation = useMissionStore(
+    (state) => state.confirmHumanConfirmation,
+  )
+  const denyHumanConfirmation = useMissionStore(
+    (state) => state.denyHumanConfirmation,
+  )
   const [dragPositions, setDragPositions] = useState<
     Record<string, { x: number; y: number }>
   >({})
@@ -654,7 +661,46 @@ function MissionBoard() {
           <span className="hidden xl:inline">Drag to arrange · connect ports to depend · delete to tombstone</span>
         </div>
         <FlightPanel now={correctedNow} />
-        {structuralPreview && (
+        {humanConfirmation && (
+          <section className="structural-confirm" role="dialog" aria-modal="true">
+            <p className="structural-confirm-kicker">
+              {humanConfirmation.kind === 'policy'
+                ? 'Human policy confirmation'
+                : 'Human action confirmation'}
+            </p>
+            <h2>{humanConfirmation.title}</h2>
+            <div className="structural-confirm-plan">
+              <p>{humanConfirmation.text}</p>
+              <ul>
+                {humanConfirmation.details.map((detail) => (
+                  <li key={detail}>{detail}</li>
+                ))}
+              </ul>
+              <p>
+                Expires {new Date(humanConfirmation.expiresAt).toLocaleString()}.
+              </p>
+            </div>
+            <div>
+              <button
+                type="button"
+                className="action-secondary"
+                onClick={denyHumanConfirmation}
+                disabled={humanConfirmation.busy}
+              >
+                Deny
+              </button>
+              <button
+                type="button"
+                className="action-primary"
+                onClick={confirmHumanConfirmation}
+                disabled={humanConfirmation.busy}
+              >
+                {humanConfirmation.busy ? 'Confirming…' : 'Confirm'}
+              </button>
+            </div>
+          </section>
+        )}
+        {!humanConfirmation && structuralPreview && (
           <section className="structural-confirm" role="dialog" aria-modal="true">
             <p className="structural-confirm-kicker">Blast-radius preview</p>
             <h2>{structuralPreview.title}</h2>
