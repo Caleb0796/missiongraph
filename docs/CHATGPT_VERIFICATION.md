@@ -8,7 +8,11 @@
 
 ## TASK FOR CHATGPT (paste everything below this line)
 
-You are verifying a WebMCP-enabled web application called **MissionGraph** using your built-in browser. The page registers tools on `document.modelContext` (WebMCP). Your first visit auto-clones a private sandbox copy of a mission, so any write operations you perform are safe and affect only your copy. Work through Acts A–C in order and produce the report in Act C exactly in the given format. Where a step says "paste raw", include the verbatim text/JSON you received, untruncated where reasonable.
+You are verifying a WebMCP-enabled web application called **MissionGraph** using your built-in browser. The page registers tools on `document.modelContext` (WebMCP). Your first visit auto-clones a private sandbox copy of a mission, so any write operations you perform are safe and affect only your copy. Work through Acts 0 and A–C in order and produce the report in Act C exactly in the given format. Where a step says "paste raw", include the verbatim text/JSON you received, untruncated where reasonable.
+
+### Act 0 — environment gate (do this FIRST)
+
+State which application and browsing surface you are: you must be the **ChatGPT app's built-in browser** (the WebMCP Challenge's judging surface). If you are any other embedded browser — the Codex app, a generic webview, a headless fetch — STOP here and report only: `ENVIRONMENT MISMATCH: <what you are>`. Do not proceed to Act A, because a WebMCP-absent result from a non-ChatGPT surface is meaningless for this verification.
 
 ### Act A — compatibility page self-test
 
