@@ -5,6 +5,11 @@ export interface ClientIdentity {
 
 export type IdentitySource = 'url' | 'stored'
 
+export interface ProjectCursor {
+  projectId: string | null
+  cursor: string
+}
+
 export function parseStoredIdentity(value: string | null): ClientIdentity | null {
   if (!value) return null
   try {
@@ -70,6 +75,36 @@ export function shouldApplySnapshot(
   )
 }
 
+export function shouldApplyDigest(
+  currentProject: string | null,
+  currentCursor: string,
+  incomingProject: string,
+  incomingCursor: string,
+) {
+  return (
+    currentProject === incomingProject &&
+    Number(incomingCursor) >= Number(currentCursor)
+  )
+}
+
+export function mutationEpochMatches(
+  capturedEpoch: number,
+  capturedProject: string | null,
+  activeEpoch: number,
+  activeProject: string | null,
+) {
+  return capturedEpoch === activeEpoch && capturedProject === activeProject
+}
+
+export function toolCursorForProject(
+  clientCursor: ProjectCursor | null,
+  projectId: string | null,
+  storeCursor: string,
+) {
+  if (!clientCursor) return storeCursor
+  return clientCursor.projectId === projectId ? clientCursor.cursor : '0'
+}
+
 export function realtimeTransport(failedWebSockets: number) {
   return failedWebSockets >= 3 ? 'sse' : 'websocket'
 }
@@ -86,6 +121,10 @@ export function bootstrapRetryDelay(attempt: number) {
   return [5_000, 15_000, 30_000][attempt] ?? 60_000
 }
 
+export function digestRetryDelay(attempt: number) {
+  return [500, 1_500, 5_000, 15_000][attempt] ?? null
+}
+
 export function connectionProvedStable(
   openedAt: number,
   now: number,
@@ -97,7 +136,17 @@ export function connectionProvedStable(
 export function estimateClockSkew(serverTimestamp: string | null, receivedAt: number) {
   if (!serverTimestamp) return 0
   const serverTime = Date.parse(serverTimestamp)
-  return Number.isNaN(serverTime) ? 0 : serverTime - receivedAt
+  if (Number.isNaN(serverTime)) return 0
+  const offset = serverTime - receivedAt
+  return Math.abs(offset) > 24 * 60 * 60_000 ? 0 : offset
+}
+
+export function clockSampleIsFresh(
+  sampledAt: number | null,
+  now: number,
+  maxAgeMs = 5 * 60_000,
+) {
+  return sampledAt !== null && now - sampledAt >= 0 && now - sampledAt < maxAgeMs
 }
 
 export function skewCorrectedNow(localNow: number, skewMs: number) {

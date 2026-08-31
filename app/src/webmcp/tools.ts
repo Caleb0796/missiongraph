@@ -15,6 +15,7 @@ import {
   loadChangesSince,
   mutate,
   mutateBatch,
+  prepareMutation,
   type MutationBatchItem,
 } from '../transport/client'
 import type { ToolDefinition, ToolOutcome } from './registry'
@@ -134,7 +135,7 @@ async function confirmed(
   }
   pendingOperations.delete(token)
   if (isPreviewStale(pending.cursor, useMissionStore.getState().cursor)) {
-    const fresh = preview(key, pending.ids, pending.apply)
+    const fresh = preview(key, ids, apply)
     return {
       ...fresh,
       error: {
@@ -432,17 +433,18 @@ const link: ToolDefinition = {
     }
     const edgeId = crypto.randomUUID()
     const key = `link:${upstream}:${downstream}:${kind}`
+    const applyMutation = prepareMutation(
+      'EDGE_ADDED',
+      { edge_id: edgeId, upstream, downstream, kind },
+      { actor: 'browser_agent' },
+    )
     return confirmed(
       key,
       inputs,
       [upstream, downstream],
       isNonIdle(upstreamNode) || isNonIdle(downstreamNode),
       async () => {
-        await mutate(
-          'EDGE_ADDED',
-          { edge_id: edgeId, upstream, downstream, kind },
-          { actor: 'browser_agent' },
-        )
+        await applyMutation()
         return {
           data: {
             summary:
@@ -472,13 +474,18 @@ const unlink: ToolDefinition = {
     const edge = state.edges.find((item) => item.edge_id === edgeId)
     if (!edge) throw new Error(`Edge ${edgeId} does not exist.`)
     const touched = [node(edge.upstream), node(edge.downstream)]
+    const applyMutation = prepareMutation(
+      'EDGE_REMOVED',
+      { edge_id: edgeId },
+      { actor: 'browser_agent' },
+    )
     return confirmed(
       `unlink:${edgeId}`,
       inputs,
       touched.map((item) => item.id),
       touched.some(isNonIdle),
       async () => {
-        await mutate('EDGE_REMOVED', { edge_id: edgeId }, { actor: 'browser_agent' })
+        await applyMutation()
         return {
           data: {
             summary: `Removed the ${edge.kind} relationship between “${touched[0].title}” and “${touched[1].title}”.`,
@@ -529,17 +536,18 @@ const remove: ToolDefinition = {
     const hasIncidentEdge = useMissionStore
       .getState()
       .edges.some((edge) => edge.upstream === nodeId || edge.downstream === nodeId)
+    const applyMutation = prepareMutation(
+      'TASK_REMOVED',
+      { node_id: nodeId, tombstone: true },
+      { actor: 'browser_agent' },
+    )
     return confirmed(
       `remove:${nodeId}`,
       inputs,
       [nodeId],
       isNonIdle(target) || hasIncidentEdge,
       async () => {
-        await mutate(
-          'TASK_REMOVED',
-          { node_id: nodeId, tombstone: true },
-          { actor: 'browser_agent' },
-        )
+        await applyMutation()
         return {
           data: { summary: `Tombstoned and removed “${target.title}”.`, node_id: nodeId },
         }

@@ -1,4 +1,5 @@
 import { TransportError } from '../transport/client'
+import { toolCursorForProject } from '../transport/client-logic'
 import { useMissionStore } from '../store/mission-store'
 
 export type ModelContextNamespace = 'document' | 'navigator'
@@ -136,11 +137,13 @@ async function executeDefinition(
     definition.name === 'graph_digest' && typeof inputs.since === 'string'
       ? inputs.since
       : null
-  const scopedCursor =
-    clientCursor?.projectId === storeBefore.projectId
-      ? clientCursor.cursor
-      : null
-  const since = explicitSince ?? scopedCursor ?? storeBefore.cursor
+  const since =
+    explicitSince ??
+    toolCursorForProject(
+      clientCursor,
+      storeBefore.projectId,
+      storeBefore.cursor,
+    )
   let outcome: ToolOutcome
   try {
     outcome = await definition.execute(inputs, options)
@@ -148,12 +151,15 @@ async function executeDefinition(
     outcome = { error: errorShape(error) }
   }
   const storeAfter = useMissionStore.getState()
-  const changes = storeAfter.changes
-    .filter((change) => change.seq > Number(since))
-    .slice(-50)
+  const projectChanged = storeAfter.projectId !== storeBefore.projectId
+  const changes = projectChanged
+    ? []
+    : storeAfter.changes
+        .filter((change) => change.seq > Number(since))
+        .slice(-50)
   clientCursor = {
     projectId: storeAfter.projectId,
-    cursor: storeAfter.cursor,
+    cursor: projectChanged ? '0' : storeAfter.cursor,
   }
   return JSON.stringify({
     ok: !outcome.error,

@@ -29,6 +29,7 @@ import type {
 } from '../model/types'
 import {
   eventBelongsToProject,
+  shouldApplyDigest,
   shouldApplySnapshot,
 } from '../transport/client-logic'
 
@@ -68,6 +69,12 @@ export type MutationSender = <T extends EvType>(
   options?: MutationOptions,
 ) => Promise<number>
 
+export type MutationPreparer = <T extends EvType>(
+  type: T,
+  payload: EventPayloadMap[T],
+  options?: MutationOptions,
+) => () => Promise<number>
+
 interface MissionState {
   nodes: TaskNode[]
   edges: GraphEdge[]
@@ -78,6 +85,7 @@ interface MissionState {
   approvals: Record<string, Approval>
   approvalRanking: GraphDigest['summary']['pending_approvals']
   approvalRankingSource: 'server' | 'fixture' | 'pending'
+  approvalRankingStale: boolean
   policies: GraphSnapshotState['policies']
   annotations: GraphSnapshotState['annotations']
   handoffs: Record<string, Handoff>
@@ -104,8 +112,13 @@ interface MissionState {
   ) => void
   applyEvent: (event: MissionEvent) => void
   recordHistoricalEvent: (event: MissionEvent) => void
-  applyDigestChanges: (changes: DigestChange[], cursor: string) => void
+  applyDigestChanges: (
+    projectId: string,
+    changes: DigestChange[],
+    cursor: string,
+  ) => void
   applyServerDigest: (projectId: string, digest: GraphDigest) => void
+  markApprovalRankingStale: (projectId: string) => void
   useFixture: (message: string) => void
   setConnectionMode: (mode: ConnectionMode, message: string) => void
   setClockSkew: (clockSkewMs: number) => void
@@ -127,6 +140,7 @@ interface MissionState {
 }
 
 let mutationSender: MutationSender | null = null
+let mutationPreparer: MutationPreparer | null = null
 let pendingStructuralOperation: {
   title: string
   ids: string[]
@@ -134,8 +148,12 @@ let pendingStructuralOperation: {
   apply: () => Promise<number>
 } | null = null
 
-export function configureMutationSender(sender: MutationSender) {
+export function configureMutationSender(
+  sender: MutationSender,
+  preparer: MutationPreparer,
+) {
   mutationSender = sender
+  mutationPreparer = preparer
 }
 
 function sendMutation<T extends EvType>(
@@ -147,6 +165,34 @@ function sendMutation<T extends EvType>(
     return Promise.reject(new Error('MissionGraph transport is not ready.'))
   }
   return mutationSender(type, payload, options)
+}
+
+function prepareStoreMutation<T extends EvType>(
+  type: T,
+  payload: EventPayloadMap[T],
+  options?: MutationOptions,
+) {
+  if (!mutationPreparer) {
+    return () => Promise.reject(new Error('MissionGraph transport is not ready.'))
+  }
+  return mutationPreparer(type, payload, options)
+}
+
+function mutationErrorWasNotified(error: unknown) {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'notified' in error &&
+    error.notified === true
+  )
+}
+
+function reportMutationError(error: unknown, state: MissionState) {
+  if (mutationErrorWasNotified(error)) return
+  state.showToast(
+    error instanceof Error ? error.message : String(error),
+    'error',
+  )
 }
 
 function fixtureState() {
@@ -266,6 +312,7 @@ function fixtureState() {
     approvals,
     approvalRanking,
     approvalRankingSource: 'fixture' as const,
+    approvalRankingStale: false,
     policies,
     annotations,
     handoffs,
@@ -373,6 +420,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         approvalRankingSource: projectChanged
           ? ('pending' as const)
           : state.approvalRankingSource,
+        approvalRankingStale: projectChanged
+          ? false
+          : state.approvalRankingStale,
         selectedId: selectedExists ? state.selectedId : null,
         connectionMode: 'live',
         connectionMessage: 'Live server',
@@ -630,9 +680,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       ]),
     })
   },
-  applyDigestChanges(changes, cursor) {
+  applyDigestChanges(projectId, changes, cursor) {
     set((state) =>
-      Number(cursor) < Number(state.cursor)
+      !shouldApplyDigest(state.projectId, state.cursor, projectId, cursor)
         ? state
         : {
             changes: boundedHistory(
@@ -662,8 +712,16 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       return {
         approvalRanking: digest.summary.pending_approvals,
         approvalRankingSource: 'server',
+        approvalRankingStale: false,
       }
     })
+  },
+  markApprovalRankingStale(projectId) {
+    set((state) =>
+      state.projectId === projectId
+        ? { approvalRankingStale: true }
+        : state,
+    )
   },
   useFixture(message) {
     set({
@@ -707,9 +765,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       'NODE_MOVED',
       { node_id: nodeId, x: point.x, y: point.y },
       { debounceKey: `move:${nodeId}` },
-    ).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    ).catch((error: unknown) => reportMutationError(error, get()))
   },
   connectNodes(upstream, downstream) {
     const state = get()
@@ -737,7 +793,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       downstream,
       kind: 'depends',
     } as const
-    const apply = () => sendMutation('EDGE_ADDED', payload)
+    const apply = prepareStoreMutation('EDGE_ADDED', payload)
     const touched = state.nodes.filter(
       (node) => node.id === upstream || node.id === downstream,
     )
@@ -758,9 +814,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       })
       return true
     }
-    void apply().catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    void apply().catch((error: unknown) => reportMutationError(error, get()))
     return true
   },
   removeSelected() {
@@ -771,9 +825,12 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       (candidate) => candidate.edge_id === state.selectedId,
     )
     const apply = node
-      ? () => sendMutation('TASK_REMOVED', { node_id: node.id, tombstone: true })
+      ? prepareStoreMutation('TASK_REMOVED', {
+          node_id: node.id,
+          tombstone: true,
+        })
       : edge
-        ? () => sendMutation('EDGE_REMOVED', { edge_id: edge.edge_id })
+        ? prepareStoreMutation('EDGE_REMOVED', { edge_id: edge.edge_id })
         : null
     if (!apply) return
     const ids = node ? [node.id] : [edge!.upstream, edge!.downstream]
@@ -804,9 +861,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       })
       return
     }
-    void apply().catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    void apply().catch((error: unknown) => reportMutationError(error, get()))
   },
   confirmStructural() {
     const pending = pendingStructuralOperation
@@ -830,7 +885,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     pendingStructuralOperation = null
     set({ structuralPreview: null })
     void pending.apply().catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
+      reportMutationError(error, get()),
     )
   },
   cancelStructural() {
@@ -844,9 +899,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     void sendMutation('SELECTION_CHANGED', {
       client_id: sessionId,
       selected: id ? [id] : [],
-    }).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    }).catch((error: unknown) => reportMutationError(error, get()))
   },
   approve(nodeId, policyRef) {
     const approval = Object.values(get().approvals).find(
@@ -858,9 +911,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       node_id: nodeId,
       rationale: 'Approved from the MissionGraph dossier after review.',
       ...(policyRef ? { policy_ref: policyRef } : {}),
-    }).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    }).catch((error: unknown) => reportMutationError(error, get()))
   },
   reject(nodeId, policyRef) {
     const approval = Object.values(get().approvals).find(
@@ -872,17 +923,13 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       node_id: nodeId,
       reason: 'Returned from the MissionGraph dossier for another pass.',
       ...(policyRef ? { policy_ref: policyRef } : {}),
-    }).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    }).catch((error: unknown) => reportMutationError(error, get()))
   },
   dispatch(nodeId) {
     void sendMutation('DISPATCHED', {
       node_id: nodeId,
       bypass_cap: true,
-    }).catch((error: unknown) =>
-      get().showToast(error instanceof Error ? error.message : String(error), 'error'),
-    )
+    }).catch((error: unknown) => reportMutationError(error, get()))
   },
   setHighlights(highlightedIds) {
     set({ highlightedIds })

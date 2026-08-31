@@ -14,10 +14,13 @@ import {
 } from '../store/mission-store'
 import {
   bootstrapRetryDelay,
+  clockSampleIsFresh,
   connectionProvedStable,
   configuredServer,
+  digestRetryDelay,
   estimateClockSkew,
   identityFailureDisposition,
+  mutationEpochMatches,
   parseStoredIdentity,
   reconnectDelay,
   realtimeTransport,
@@ -39,7 +42,8 @@ interface SnapshotResponse {
 }
 
 interface SnapshotReceipt extends SnapshotResponse {
-  serverTimestamp: string | null
+  bodyTimestamp: string | null
+  headerTimestamp: string | null
   receivedAt: number
 }
 
@@ -63,7 +67,17 @@ interface ActiveIdentity {
   client: ClientIdentity
   source: IdentitySource
   epoch: number
-  clockCalibrated: boolean
+  clockSampledAt: number | null
+}
+
+interface MutationContext {
+  candidate: ActiveIdentity | null
+  epoch: number
+  projectId: string | null
+  fixture: boolean
+  cursor: string
+  sessionId: string
+  idemKey: string
 }
 
 interface StreamStamp {
@@ -76,12 +90,19 @@ interface StreamStamp {
 export class TransportError extends Error {
   code: string
   status?: number
+  notified: boolean
 
-  constructor(code: string, message: string, status?: number) {
+  constructor(
+    code: string,
+    message: string,
+    status?: number,
+    notified = false,
+  ) {
     super(message)
     this.name = 'TransportError'
     this.code = code
     this.status = status
+    this.notified = notified
   }
 }
 
@@ -101,7 +122,11 @@ const serverConfiguration = (() => {
 })()
 const debounceTimers = new Map<
   string,
-  { timer: number; resolve: (cursor: number) => void }
+  {
+    timer: number
+    context: MutationContext
+    resolve: (cursor: number) => void
+  }
 >()
 let identity: ActiveIdentity | null = null
 let identityEpoch = 0
@@ -110,6 +135,7 @@ let eventSource: EventSource | null = null
 let reconnectTimer: number | null = null
 let stableTimer: number | null = null
 let digestTimer: number | null = null
+let digestRetryAttempt = 0
 let bootstrapRetryTimer: number | null = null
 let failedWebSockets = 0
 let reconnectAttempt = 0
@@ -200,6 +226,30 @@ function persistIdentity(client: ClientIdentity) {
   localStorage.setItem(IDENTITY_KEY, JSON.stringify(client))
 }
 
+function latestSnapshotTimestamp(state: GraphSnapshotState) {
+  const candidates = [
+    ...Object.values(state.nodes).map((node) => node.ready_since),
+    ...Object.values(state.tombstones).map((item) => item.removed_at),
+    ...Object.values(state.approvals).flatMap((item) => [
+      item.created_at,
+      item.resolved_at,
+    ]),
+    ...Object.values(state.policies).map((item) => item.stated_at),
+    ...Object.values(state.annotations).flatMap((items) =>
+      items.map((item) => item.ts),
+    ),
+    ...state.journal.map((item) => item.ts),
+    ...Object.values(state.deviations).flatMap((items) =>
+      items.map((item) => item.ts),
+    ),
+  ].filter((value): value is string => Boolean(value))
+  return candidates.reduce<string | null>((latest, value) => {
+    const parsed = Date.parse(value)
+    if (Number.isNaN(parsed)) return latest
+    return latest === null || parsed > Date.parse(latest) ? value : latest
+  }, null)
+}
+
 async function getSnapshot(client = identity) {
   const resolved = client && 'client' in client ? client.client : client
   if (!resolved) {
@@ -210,21 +260,24 @@ async function getSnapshot(client = identity) {
     { headers: { 'x-mg-token': resolved.token } },
   )
   const receivedAt = Date.now()
+  const snapshot = await jsonResponse<SnapshotResponse>(response)
   return {
-    ...(await jsonResponse<SnapshotResponse>(response)),
-    serverTimestamp: response.headers.get('date'),
+    ...snapshot,
+    bodyTimestamp: latestSnapshotTimestamp(snapshot.state),
+    headerTimestamp: response.headers.get('date'),
     receivedAt,
   } satisfies SnapshotReceipt
 }
 
 function activateIdentity(client: ClientIdentity, source: IdentitySource) {
+  resetTransportPenalties()
   identityEpoch++
   useMissionStore.getState().setClockSkew(0)
   identity = {
     client,
     source,
     epoch: identityEpoch,
-    clockCalibrated: false,
+    clockSampledAt: null,
   }
   return identity
 }
@@ -248,22 +301,107 @@ function deactivateIdentity(candidate?: ActiveIdentity) {
 
 function calibrateClock(
   candidate: ActiveIdentity,
-  serverTimestamp: string | null,
+  bodyTimestamp: string | null,
   receivedAt: number,
+  headerTimestamp: string | null = null,
+  force = false,
 ) {
-  if (!identityIsActive(candidate) || candidate.clockCalibrated) return
+  if (
+    !identityIsActive(candidate) ||
+    (!force && clockSampleIsFresh(candidate.clockSampledAt, receivedAt))
+  ) {
+    return
+  }
+  const serverTimestamp = headerTimestamp ?? bodyTimestamp
   if (!serverTimestamp || Number.isNaN(Date.parse(serverTimestamp))) return
-  candidate.clockCalibrated = true
+  candidate.clockSampledAt = receivedAt
   useMissionStore
     .getState()
     .setClockSkew(estimateClockSkew(serverTimestamp, receivedAt))
+}
+
+function captureMutationContext(): MutationContext {
+  const state = useMissionStore.getState()
+  const candidate = identity
+  return {
+    candidate,
+    epoch: identityEpoch,
+    projectId: candidate?.client.project ?? state.projectId,
+    fixture: state.connectionMode === 'fixture',
+    cursor: state.cursor,
+    sessionId: state.sessionId,
+    idemKey: crypto.randomUUID(),
+  }
+}
+
+function mutationContextIsActive(context: MutationContext) {
+  const activeProject =
+    identity?.client.project ?? useMissionStore.getState().projectId
+  return mutationEpochMatches(
+    context.epoch,
+    context.projectId,
+    identityEpoch,
+    activeProject,
+  )
+}
+
+function staleMutationError(
+  context: MutationContext,
+  operation: string,
+  userVisible: boolean,
+) {
+  console.info(
+    `[MissionGraph] Dropped ${operation} from expired identity epoch ${context.epoch}.`,
+  )
+  const message = 'Action skipped because the active mission changed.'
+  if (userVisible) useMissionStore.getState().showToast(message, 'info')
+  return new TransportError('identity_changed', message, undefined, userVisible)
+}
+
+function assertMutationContextActive(
+  context: MutationContext,
+  operation: string,
+  userVisible = true,
+) {
+  if (!mutationContextIsActive(context)) {
+    throw staleMutationError(context, operation, userVisible)
+  }
+}
+
+async function mutationResponseBody<T>(
+  response: Response,
+  context: MutationContext,
+  operation: string,
+) {
+  try {
+    return (await response.json()) as T
+  } finally {
+    assertMutationContextActive(context, operation)
+  }
+}
+
+async function mutationJsonResponse<T>(
+  response: Response,
+  context: MutationContext,
+  operation: string,
+) {
+  try {
+    return await jsonResponse<T>(response)
+  } finally {
+    assertMutationContextActive(context, operation)
+  }
 }
 
 async function refreshSnapshot(candidate = identity) {
   if (!candidate) return
   const snapshot = await getSnapshot(candidate)
   if (!identityIsActive(candidate)) return
-  calibrateClock(candidate, snapshot.serverTimestamp, snapshot.receivedAt)
+  calibrateClock(
+    candidate,
+    snapshot.bodyTimestamp,
+    snapshot.receivedAt,
+    snapshot.headerTimestamp,
+  )
   useMissionStore
     .getState()
     .applySnapshot(snapshot.state, snapshot.cursor, candidate.client.project)
@@ -310,10 +448,17 @@ function clearBootstrapRetryTimer() {
   }
 }
 
-async function fetchServerDigest(candidate: ActiveIdentity) {
-  if (!identityIsActive(candidate)) return
-  const state = useMissionStore.getState()
-  const cursor = Number(state.cursor)
+function resetTransportPenalties() {
+  failedWebSockets = 0
+  reconnectAttempt = 0
+  digestRetryAttempt = 0
+}
+
+async function fetchServerDigest(context: MutationContext) {
+  assertMutationContextActive(context, 'digest probe', false)
+  const candidate = context.candidate
+  if (!candidate) return
+  const cursor = Number(context.cursor)
   if (cursor === 0) return
   const response = await fetch(
     endpoint(
@@ -324,26 +469,27 @@ async function fetchServerDigest(candidate: ActiveIdentity) {
       headers: {
         'content-type': 'application/json',
         'x-mg-token': candidate.client.token,
-        'x-mg-session': state.sessionId,
+        'x-mg-session': context.sessionId,
         'x-mg-actor': 'browser_agent',
       },
       body: JSON.stringify({
         type: 'SELECTION_CHANGED',
-        payload: { client_id: state.sessionId, selected: [] },
-        idem_key: crypto.randomUUID(),
+        payload: { client_id: context.sessionId, selected: [] },
+        idem_key: context.idemKey,
         base_seq: cursor - 1,
       }),
     },
   )
   const receivedAt = Date.now()
-  calibrateClock(candidate, response.headers.get('date'), receivedAt)
+  assertMutationContextActive(context, 'digest response', false)
+  calibrateClock(candidate, null, receivedAt, response.headers.get('date'))
   if (response.status === 409) {
     const stale = (await response.json()) as StaleBody
-    if (identityIsActive(candidate)) {
-      useMissionStore
-        .getState()
-        .applyServerDigest(candidate.client.project, stale.fresh_digest)
-    }
+    assertMutationContextActive(context, 'digest 409 response', false)
+    useMissionStore
+      .getState()
+      .applyServerDigest(candidate.client.project, stale.fresh_digest)
+    digestRetryAttempt = 0
     return
   }
   if (!response.ok) await jsonResponse(response)
@@ -353,11 +499,13 @@ async function fetchServerDigest(candidate: ActiveIdentity) {
   )
 }
 
-function scheduleServerDigest(candidate: ActiveIdentity) {
-  if (!identityIsActive(candidate) || digestTimer !== null) return
+function scheduleDigestAttempt(context: MutationContext, delay: number) {
   digestTimer = window.setTimeout(() => {
     digestTimer = null
-    void fetchServerDigest(candidate).catch((error: unknown) => {
+    void fetchServerDigest(context).catch((error: unknown) => {
+      if (!mutationContextIsActive(context)) return
+      const candidate = context.candidate
+      if (!candidate) return
       if (
         error instanceof TransportError &&
         identityFailureDisposition(candidate.source, error.status) !== 'retry'
@@ -365,9 +513,55 @@ function scheduleServerDigest(candidate: ActiveIdentity) {
         void recoverExpiredIdentity(candidate, error.status).catch(
           enterFixtureWithRetry,
         )
+        return
       }
+      useMissionStore
+        .getState()
+        .markApprovalRankingStale(candidate.client.project)
+      const retryDelay = digestRetryDelay(digestRetryAttempt++)
+      if (retryDelay === null) {
+        console.warn('[MissionGraph] Approval ranking refresh retries exhausted.')
+        return
+      }
+      console.warn(
+        `[MissionGraph] Approval ranking refresh failed; retrying in ${retryDelay}ms.`,
+      )
+      scheduleDigestAttempt(context, retryDelay)
     })
-  }, 80)
+  }, delay)
+}
+
+function scheduleServerDigest(candidate: ActiveIdentity) {
+  if (!identityIsActive(candidate)) return
+  if (digestTimer !== null) window.clearTimeout(digestTimer)
+  digestRetryAttempt = 0
+  const context = captureMutationContext()
+  if (Number(context.cursor) === 0) return
+  useMissionStore
+    .getState()
+    .markApprovalRankingStale(candidate.client.project)
+  scheduleDigestAttempt(context, 80)
+}
+
+async function refreshServerDigest(candidate: ActiveIdentity) {
+  const context = captureMutationContext()
+  if (Number(context.cursor) === 0) return
+  useMissionStore
+    .getState()
+    .markApprovalRankingStale(candidate.client.project)
+  try {
+    await fetchServerDigest(context)
+  } catch (error) {
+    if (!mutationContextIsActive(context)) return
+    if (
+      error instanceof TransportError &&
+      identityFailureDisposition(candidate.source, error.status) !== 'retry'
+    ) {
+      throw error
+    }
+    const retryDelay = digestRetryDelay(digestRetryAttempt++)
+    if (retryDelay !== null) scheduleDigestAttempt(context, retryDelay)
+  }
 }
 
 async function recoverExpiredIdentity(
@@ -389,6 +583,7 @@ async function recoverExpiredIdentity(
     closeAllStreams()
     clearReconnectTimer()
     deactivateIdentity(candidate)
+    resetTransportPenalties()
     localStorage.removeItem(IDENTITY_KEY)
     useMissionStore
       .getState()
@@ -413,7 +608,12 @@ async function reconnect() {
   try {
     const snapshot = await getSnapshot(candidate)
     if (!identityIsActive(candidate)) return
-    calibrateClock(candidate, snapshot.serverTimestamp, snapshot.receivedAt)
+    calibrateClock(
+      candidate,
+      snapshot.bodyTimestamp,
+      snapshot.receivedAt,
+      snapshot.headerTimestamp,
+    )
     useMissionStore
       .getState()
       .applySnapshot(
@@ -421,7 +621,7 @@ async function reconnect() {
         snapshot.cursor,
         candidate.client.project,
       )
-    await fetchServerDigest(candidate)
+    await refreshServerDigest(candidate)
     openRealtime(candidate)
   } catch (error) {
     if (
@@ -489,11 +689,16 @@ function handleRealtimeMessage(raw: string, stamp: StreamStamp) {
       scheduleReconnect()
       return
     }
-    calibrateClock(identity!, data.event.ts, Date.now())
+    calibrateClock(identity!, data.event.ts, Date.now(), null, true)
     store.applyEvent(data.event)
     proveConnectionStable(stamp, true)
     scheduleServerDigest(identity!)
   } else {
+    calibrateClock(
+      identity!,
+      latestSnapshotTimestamp(data.state),
+      Date.now(),
+    )
     useMissionStore
       .getState()
       .applySnapshot(data.state, data.cursor, stamp.project)
@@ -569,28 +774,37 @@ function openRealtime(candidate = identity) {
   }
 }
 
-async function waitForSequence(seq: number, candidate: ActiveIdentity) {
+async function waitForSequence(seq: number, context: MutationContext) {
+  const candidate = context.candidate
+  if (!candidate) return
   const deadline = Date.now() + 1_500
   while (
-    identityIsActive(candidate) &&
+    mutationContextIsActive(context) &&
     Number(useMissionStore.getState().cursor) < seq &&
     Date.now() < deadline
   ) {
     await new Promise((resolve) => window.setTimeout(resolve, 20))
   }
   if (
-    identityIsActive(candidate) &&
+    mutationContextIsActive(context) &&
     Number(useMissionStore.getState().cursor) < seq
   ) {
     await refreshSnapshot(candidate)
   }
+  assertMutationContextActive(context, 'mutation completion')
 }
 
 function fixtureMutation<T extends EvType>(
   type: T,
   payload: EventPayloadMap[T],
   actor: Actor,
+  context: MutationContext,
+  offset = 0,
 ) {
+  assertMutationContextActive(context, 'fixture mutation')
+  if (!context.fixture) {
+    throw new TransportError('not_connected', 'No live project is connected.')
+  }
   if (
     actor === 'browser_agent' &&
     (type === 'APPROVED' || type === 'REJECTED') &&
@@ -602,14 +816,21 @@ function fixtureMutation<T extends EvType>(
     )
   }
   const state = useMissionStore.getState()
+  const expectedCursor = Number(context.cursor) + offset
+  if (Number(state.cursor) !== expectedCursor) {
+    throw new TransportError(
+      'stale_mutation',
+      'The graph changed concurrently; retry this action.',
+    )
+  }
   const event = {
-    seq: Number(state.cursor) + 1,
-    project_id: state.projectId ?? 'shorty-demo',
+    seq: expectedCursor + 1,
+    project_id: context.projectId ?? 'shorty-demo',
     ts: new Date().toISOString(),
     actor,
     type,
     payload,
-    idem_key: crypto.randomUUID(),
+    idem_key: offset === 0 ? context.idemKey : `${context.idemKey}:${offset}`,
   } as MissionEvent
   state.applyEvent(event)
   return event.seq
@@ -619,12 +840,13 @@ async function postMutation<T extends EvType>(
   type: T,
   payload: EventPayloadMap[T],
   actor: 'human' | 'browser_agent',
+  context: MutationContext,
 ): Promise<number> {
-  const state = useMissionStore.getState()
-  if (state.connectionMode === 'fixture') {
-    return fixtureMutation(type, payload, actor)
+  assertMutationContextActive(context, 'deferred mutation')
+  if (context.fixture) {
+    return fixtureMutation(type, payload, actor, context)
   }
-  const candidate = identity
+  const candidate = context.candidate
   if (!candidate) {
     throw new TransportError('not_connected', 'No live project is connected.')
   }
@@ -638,22 +860,28 @@ async function postMutation<T extends EvType>(
       headers: {
         'content-type': 'application/json',
         'x-mg-token': candidate.client.token,
-        'x-mg-session': state.sessionId,
+        'x-mg-session': context.sessionId,
         'x-mg-actor': actor,
       },
       body: JSON.stringify({
         type,
         payload,
-        idem_key: crypto.randomUUID(),
-        base_seq: Number(state.cursor),
+        idem_key: context.idemKey,
+        base_seq: Number(context.cursor),
       }),
     },
   )
+  assertMutationContextActive(context, 'mutation response')
   if (response.status === 409) {
-    const stale = (await response.json()) as StaleBody
+    const stale = await mutationResponseBody<StaleBody>(
+      response,
+      context,
+      'mutation 409 response',
+    )
     useMissionStore
       .getState()
       .applyDigestChanges(
+        candidate.client.project,
         stale.fresh_digest.changes_since as DigestChange[],
         stale.fresh_digest.cursor,
       )
@@ -661,6 +889,7 @@ async function postMutation<T extends EvType>(
       .getState()
       .applyServerDigest(candidate.client.project, stale.fresh_digest)
     await refreshSnapshot(candidate)
+    assertMutationContextActive(context, 'mutation refresh')
     const error = new TransportError(
       'stale_mutation',
       'The graph changed concurrently; the live snapshot was refreshed.',
@@ -668,20 +897,27 @@ async function postMutation<T extends EvType>(
     useMissionStore.getState().showToast(error.message, 'error')
     throw error
   }
-  const result = await jsonResponse<MutationResponse>(response)
-  await waitForSequence(result.seq, candidate)
+  const result = await mutationJsonResponse<MutationResponse>(
+    response,
+    context,
+    'mutation result',
+  )
+  await waitForSequence(result.seq, context)
   return result.seq
 }
 
 async function postMutationBatch(
   batch: MutationBatchItem[],
   actor: 'human' | 'browser_agent',
+  context: MutationContext,
 ): Promise<number[]> {
-  const state = useMissionStore.getState()
-  if (state.connectionMode === 'fixture') {
-    return batch.map((item) => fixtureMutation(item.type, item.payload, actor))
+  assertMutationContextActive(context, 'deferred batch mutation')
+  if (context.fixture) {
+    return batch.map((item, index) =>
+      fixtureMutation(item.type, item.payload, actor, context, index),
+    )
   }
-  const candidate = identity
+  const candidate = context.candidate
   if (!candidate) {
     throw new TransportError('not_connected', 'No live project is connected.')
   }
@@ -694,21 +930,27 @@ async function postMutationBatch(
       headers: {
         'content-type': 'application/json',
         'x-mg-token': candidate.client.token,
-        'x-mg-session': state.sessionId,
+        'x-mg-session': context.sessionId,
         'x-mg-actor': actor,
       },
       body: JSON.stringify({
         batch,
-        idem_key: crypto.randomUUID(),
-        base_seq: Number(state.cursor),
+        idem_key: context.idemKey,
+        base_seq: Number(context.cursor),
       }),
     },
   )
+  assertMutationContextActive(context, 'batch mutation response')
   if (response.status === 409) {
-    const stale = (await response.json()) as StaleBody
+    const stale = await mutationResponseBody<StaleBody>(
+      response,
+      context,
+      'batch mutation 409 response',
+    )
     useMissionStore
       .getState()
       .applyDigestChanges(
+        candidate.client.project,
         stale.fresh_digest.changes_since as DigestChange[],
         stale.fresh_digest.cursor,
       )
@@ -716,6 +958,7 @@ async function postMutationBatch(
       .getState()
       .applyServerDigest(candidate.client.project, stale.fresh_digest)
     await refreshSnapshot(candidate)
+    assertMutationContextActive(context, 'batch mutation refresh')
     const error = new TransportError(
       'stale_mutation',
       'The graph changed concurrently; the live snapshot was refreshed.',
@@ -723,12 +966,46 @@ async function postMutationBatch(
     useMissionStore.getState().showToast(error.message, 'error')
     throw error
   }
-  const result = await jsonResponse<BatchMutationResponse>(response)
+  const result = await mutationJsonResponse<BatchMutationResponse>(
+    response,
+    context,
+    'batch mutation result',
+  )
   if (result.seqs.length > 0) {
-    await waitForSequence(result.seqs.at(-1)!, candidate)
-    await loadChangesSince(state.cursor, candidate)
+    await waitForSequence(result.seqs.at(-1)!, context)
+    try {
+      await loadChangesSince(context.cursor, candidate)
+    } finally {
+      assertMutationContextActive(context, 'batch history result')
+    }
   }
   return result.seqs
+}
+
+function enqueueMutation<T extends EvType>(
+  type: T,
+  payload: EventPayloadMap[T],
+  actor: 'human' | 'browser_agent',
+  context: MutationContext,
+) {
+  const queued = mutationQueue.then(() =>
+    postMutation(type, payload, actor, context),
+  )
+  mutationQueue = queued.then(
+    () => undefined,
+    () => undefined,
+  )
+  return queued
+}
+
+export function prepareMutation<T extends EvType>(
+  type: T,
+  payload: EventPayloadMap[T],
+  options: Pick<MutationOptions, 'actor'> = {},
+) {
+  const actor = options.actor ?? 'human'
+  const context = captureMutationContext()
+  return () => enqueueMutation(type, payload, actor, context)
 }
 
 export function mutate<T extends EvType>(
@@ -737,27 +1014,22 @@ export function mutate<T extends EvType>(
   options: MutationOptions = {},
 ): Promise<number> {
   const actor = options.actor ?? 'human'
+  const context = captureMutationContext()
   if (options.debounceKey) {
     const previous = debounceTimers.get(options.debounceKey)
     if (previous) {
       window.clearTimeout(previous.timer)
-      previous.resolve(Number(useMissionStore.getState().cursor))
+      previous.resolve(Number(previous.context.cursor))
     }
     return new Promise((resolve, reject) => {
       const timer = window.setTimeout(() => {
         debounceTimers.delete(options.debounceKey!)
-        mutate(type, payload, { actor }).then(resolve, reject)
+        enqueueMutation(type, payload, actor, context).then(resolve, reject)
       }, 260)
-      debounceTimers.set(options.debounceKey!, { timer, resolve })
+      debounceTimers.set(options.debounceKey!, { timer, context, resolve })
     })
   }
-
-  const queued = mutationQueue.then(() => postMutation(type, payload, actor))
-  mutationQueue = queued.then(
-    () => undefined,
-    () => undefined,
-  )
-  return queued
+  return enqueueMutation(type, payload, actor, context)
 }
 
 export function mutateBatch(
@@ -765,7 +1037,10 @@ export function mutateBatch(
   options: Pick<MutationOptions, 'actor'> = {},
 ): Promise<number[]> {
   const actor = options.actor ?? 'human'
-  const queued = mutationQueue.then(() => postMutationBatch(batch, actor))
+  const context = captureMutationContext()
+  const queued = mutationQueue.then(() =>
+    postMutationBatch(batch, actor, context),
+  )
   mutationQueue = queued.then(
     () => undefined,
     () => undefined,
@@ -815,7 +1090,7 @@ function markBootstrapConnected() {
 async function bootstrap() {
   const store = useMissionStore.getState()
   store.setSessionId(sessionId())
-  configureMutationSender(mutate)
+  configureMutationSender(mutate, prepareMutation)
   try {
     const linked = sharedIdentityFromUrl()
     if (linked) {
@@ -878,10 +1153,15 @@ async function connectProject(client: ClientIdentity, source: IdentitySource) {
   const candidate = activateIdentity(client, source)
   const snapshot = await getSnapshot(candidate)
   if (!identityIsActive(candidate)) return candidate
-  calibrateClock(candidate, snapshot.serverTimestamp, snapshot.receivedAt)
+  calibrateClock(
+    candidate,
+    snapshot.bodyTimestamp,
+    snapshot.receivedAt,
+    snapshot.headerTimestamp,
+  )
   const store = useMissionStore.getState()
   store.applySnapshot(snapshot.state, snapshot.cursor, client.project)
-  await fetchServerDigest(candidate)
+  await refreshServerDigest(candidate)
   await loadChangesSince('0', candidate)
   openRealtime(candidate)
   return candidate
@@ -901,8 +1181,7 @@ async function startFreshMission(message: string, announce: boolean) {
   closeAllStreams()
   clearReconnectTimer()
   deactivateIdentity()
-  failedWebSockets = 0
-  reconnectAttempt = 0
+  resetTransportPenalties()
   useMissionStore
     .getState()
     .setConnectionMode('loading', message)
@@ -980,20 +1259,21 @@ async function copyText(text: string) {
   } catch {
     // Try the synchronous browser fallback below.
   }
-  const textarea = document.createElement('textarea')
-  textarea.value = text
-  textarea.setAttribute('readonly', '')
-  textarea.style.position = 'fixed'
-  textarea.style.opacity = '0'
-  document.body.append(textarea)
-  textarea.select()
-  let copied = false
+  let textarea: HTMLTextAreaElement | null = null
   try {
-    copied = document.execCommand('copy')
+    textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.append(textarea)
+    textarea.select()
+    return document.execCommand('copy')
+  } catch {
+    return false
   } finally {
-    textarea.remove()
+    textarea?.remove()
   }
-  return copied
 }
 
 export async function copyCurrentMissionLink() {

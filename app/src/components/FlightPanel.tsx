@@ -18,6 +18,9 @@ export function FlightPanel({ now }: FlightPanelProps) {
   const approvalRankingSource = useMissionStore(
     (state) => state.approvalRankingSource,
   )
+  const approvalRankingStale = useMissionStore(
+    (state) => state.approvalRankingStale,
+  )
   const policies = useMissionStore((state) => state.policies)
   const readySince = useMissionStore((state) => state.readySince)
   const sessionId = useMissionStore((state) => state.sessionId)
@@ -50,7 +53,7 @@ export function FlightPanel({ now }: FlightPanelProps) {
           <div>
             <p>
               {approvalRankingSource === 'server'
-                ? 'Server delay-ranked'
+                ? `Server delay-ranked${approvalRankingStale ? ' · ranking may be stale' : ''}`
                 : approvalRankingSource === 'fixture'
                   ? 'Fixture estimate-ranked'
                   : 'Waiting for server ranking'}
