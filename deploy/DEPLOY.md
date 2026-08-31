@@ -6,7 +6,7 @@ Human-account steps run in the owner's browser (Render/Vercel dashboards). Secre
 
 ## 1. Create the Render service
 
-Render dashboard → **New → Blueprint** → select this repo → it reads `deploy/render.yaml`. Before first deploy confirm:
+Render dashboard → **New → Blueprint** → select this repo → it reads the repo-root `render.yaml`. Before first deploy confirm:
 
 - Plan: starter (one bounded instance, autoscaling off — spend control).
 - Disk `mg-data` mounted at `/data` (SQLite + bridge state + target repo live there).
@@ -18,7 +18,7 @@ Deploy. Note the service URL, e.g. `https://missiongraph.onrender.com`.
 
 ## 2. Point the frontend at the VM
 
-Vercel dashboard → missiongraph project → Settings → Environment Variables → set the server-origin build variable (see `app/src/transport` for the exact `VITE_*` name) to the Render URL → redeploy. Without it the page stays in labeled fixture mode.
+Vercel dashboard → missiongraph project → Settings → Environment Variables → set `VITE_MG_SERVER` to the Render URL (absolute HTTPS origin) → redeploy. Without it the page stays in labeled fixture mode.
 
 ## 3. Verify the empty server
 
