@@ -42,7 +42,20 @@ const childSourceVariables = new Set([
   "HTTPS_PROXY",
   "NO_PROXY",
 ]);
-const scopedWorkerVariables = new Set(["MG_REPORT_URL", "MG_REPORTER_CONFIG", "MG_WORKER_ACTOR"]);
+const scopedWorkerVariables = new Set(["MG_REPORT_URL", "MG_REPORTER_CONFIG", "MG_WORKER_ACTOR", "MG_NODE_ID"]);
+
+export function workerChildEnvironment(
+  config: BridgeConfig,
+  nodeId: string,
+  reporterConfigPath: string,
+): NodeJS.ProcessEnv {
+  return {
+    MG_REPORT_URL: `${config.serverUrl}/api/p/${encodeURIComponent(config.projectId)}/report`,
+    MG_REPORTER_CONFIG: reporterConfigPath,
+    MG_WORKER_ACTOR: `worker:${nodeId}`,
+    MG_NODE_ID: nodeId,
+  };
+}
 
 export function codexChildEnvironment(
   environment: NodeJS.ProcessEnv = {},
@@ -124,11 +137,7 @@ export class CodexClient {
         "--json",
       ],
       this.config.targetRepoPath,
-      {
-        MG_REPORT_URL: `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/report`,
-        MG_REPORTER_CONFIG: reporterConfigPath,
-        MG_WORKER_ACTOR: `worker:${nodeId}`,
-      },
+      workerChildEnvironment(this.config, nodeId, reporterConfigPath),
     );
     void running.completed.catch(() => undefined);
     return running;
@@ -141,11 +150,11 @@ export class CodexClient {
     worktree: string,
     reporterConfigPath: string,
   ): RunningCodex {
-    return this.start(this.workerResumeArgs(threadId, message), worktree, {
-      MG_REPORT_URL: `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/report`,
-      MG_REPORTER_CONFIG: reporterConfigPath,
-      MG_WORKER_ACTOR: `worker:${nodeId}`,
-    });
+    return this.start(
+      this.workerResumeArgs(threadId, message),
+      worktree,
+      workerChildEnvironment(this.config, nodeId, reporterConfigPath),
+    );
   }
 
   private supervisorResumeArgs(threadId: string, message: string): string[] {

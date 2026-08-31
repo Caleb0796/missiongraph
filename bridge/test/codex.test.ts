@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { CodexClient, codexChildEnvironment, retainOutput } from "../src/codex.js";
+import {
+  CodexClient,
+  codexChildEnvironment,
+  retainOutput,
+  workerChildEnvironment,
+} from "../src/codex.js";
+import { workerBrief } from "../src/prompts.js";
 import { config, initializeRepo, TestLogger } from "./helpers.js";
 
 describe("CodexClient", () => {
@@ -36,6 +42,7 @@ describe("CodexClient", () => {
       NODE_EXTRA_CA_CERTS: "/certs/extra.pem",
       HTTPS_PROXY: "http://proxy.test",
       MG_REPORT_URL: "http://127.0.0.1/report",
+      MG_NODE_ID: "node-a",
     });
 
     const root = await mkdtemp(join(tmpdir(), "missiongraph-codex-env-"));
@@ -67,6 +74,25 @@ describe("CodexClient", () => {
       }
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("passes every MissionGraph environment variable referenced by the worker prompt", () => {
+    const bridgeConfig = config("/tmp/missiongraph-worker-environment");
+    const promptVariables = [...new Set(
+      workerBrief("node-a", "Build A.", bridgeConfig.targetRepoPath).match(/\bMG_[A-Z0-9_]+\b/g) ?? [],
+    )].sort();
+    const childVariables = Object.keys(codexChildEnvironment(
+      workerChildEnvironment(bridgeConfig, "node-a", "/tmp/reporter.conf"),
+      {},
+    )).sort();
+
+    expect(childVariables).toEqual(promptVariables);
+    expect(workerChildEnvironment(bridgeConfig, "node-a", "/tmp/reporter.conf")).toEqual({
+      MG_REPORT_URL: `${bridgeConfig.serverUrl}/api/p/${bridgeConfig.projectId}/report`,
+      MG_REPORTER_CONFIG: "/tmp/reporter.conf",
+      MG_WORKER_ACTOR: "worker:node-a",
+      MG_NODE_ID: "node-a",
+    });
   });
 
   it("retains only the newest two megabytes of child output", () => {
