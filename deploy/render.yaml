@@ -1,0 +1,42 @@
+# Render blueprint: one web service runs the event-sourced server (always) and the
+# Codex bridge (env-gated). Apply via the Render dashboard ("New > Blueprint").
+services:
+  - type: web
+    name: missiongraph
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile
+    dockerContext: .
+    plan: starter
+    autoDeploy: false
+    healthCheckPath: /api/health
+    disk:
+      name: mg-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: REPORTER_TOKEN
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: https://missiongraph.vercel.app
+      - key: DB_PATH
+        value: /data/missiongraph.sqlite
+      # Set after importing the real-run seed (see deploy/DEPLOY.md step 4):
+      - key: SEED_PROJECT_ID
+        sync: false
+      # Flagship fleet (step 5) — leave BRIDGE_ENABLED=0 until the seed is in place:
+      - key: BRIDGE_ENABLED
+        value: "0"
+      - key: MG_PROJECT_ID
+        sync: false
+      - key: MG_VISITOR_TOKEN
+        sync: false
+      - key: MG_TARGET_REPO_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      # Confirm the model available to the API key ON the VM before enabling the
+      # bridge (`codex -m <model> exec 'say ok'`); do not assume ChatGPT-account models.
+      - key: MG_CODEX_MODEL
+        sync: false
+      - key: MG_CODEX_EFFORT
+        value: medium

@@ -1,0 +1,59 @@
+# Production deployment (Render VM + Vercel frontend)
+
+Two deployables: the **Vercel frontend** (already live at https://missiongraph.vercel.app) and the **Render web service** (event-sourced server + env-gated Codex bridge, one Docker image, persistent disk).
+
+Human-account steps run in the owner's browser (Render/Vercel dashboards). Secrets are entered ONLY in dashboard env fields — never in git, shell history, or chat.
+
+## 1. Create the Render service
+
+Render dashboard → **New → Blueprint** → select this repo → it reads `deploy/render.yaml`. Before first deploy confirm:
+
+- Plan: starter (one bounded instance, autoscaling off — spend control).
+- Disk `mg-data` mounted at `/data` (SQLite + bridge state + target repo live there).
+- `REPORTER_TOKEN` auto-generated (this is the supervisor-scope secret).
+- `ALLOWED_ORIGINS=https://missiongraph.vercel.app` (CORS is fail-closed).
+- Account-level: set a monthly hard budget / lowest spend alert.
+
+Deploy. Note the service URL, e.g. `https://missiongraph.onrender.com`.
+
+## 2. Point the frontend at the VM
+
+Vercel dashboard → missiongraph project → Settings → Environment Variables → set the server-origin build variable (see `app/src/transport` for the exact `VITE_*` name) to the Render URL → redeploy. Without it the page stays in labeled fixture mode.
+
+## 3. Verify the empty server
+
+```sh
+curl -s https://<render-url>/api/health
+```
+
+Then load the Vercel URL: first visit should clone a project (fixture seed for now) and show LIVE.
+
+## 4. Import the real-run seed (C5)
+
+From the machine holding the real-run project (local dev box):
+
+```sh
+# export locally (visitor token of the real project)
+curl -s -H "x-mg-token: $LOCAL_TOKEN" \
+  "http://127.0.0.1:31337/api/p/$LOCAL_PROJECT/export" > seed.json
+
+# import on the VM (supervisor bearer = the Render REPORTER_TOKEN, read from env)
+curl -s -X POST -H "content-type: application/json" \
+  -H "authorization: Bearer $RENDER_REPORTER_TOKEN" \
+  --data-binary @seed.json \
+  "https://<render-url>/api/import-seed"
+```
+
+Response gives `project_id`. Set `SEED_PROJECT_ID=<project_id>` in Render env → redeploy. Every fresh visitor now clones the real mission history.
+
+## 5. Enable the flagship fleet (optional until demo week)
+
+Clone one flagship mission (POST `/api/clone-demo`), keep its `project`/`token`. In Render env set: `BRIDGE_ENABLED=1`, `MG_PROJECT_ID`, `MG_VISITOR_TOKEN`, `MG_TARGET_REPO_URL` (a public demo repo the workers may modify — use a throwaway fork), `OPENAI_API_KEY` (project-scoped key with a **hard spend cap**; NEVER a ChatGPT login on the VM), `MG_CODEX_MODEL` (verify availability first: shell into the instance and run `codex -m <model> exec 'say ok'`). Redeploy.
+
+Supervisor policy stays at two automatic critical-path workers + one explicit-dispatch slot (GOAL_PLAN §13); do not raise it for the public demo.
+
+## 6. Judging-window checklist
+
+- VM + frontend stay up through **Sep 21**; suspend the service after judging.
+- Test the exact judge path daily from a fresh Chrome profile (flag on) AND the ChatGPT built-in browser: clone → chips → catch-up → approve-under-policy → idle radar.
+- `--dry-run` is for transport validation only and must never point at the seed or flagship database.
