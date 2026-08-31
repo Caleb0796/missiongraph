@@ -1,4 +1,4 @@
-# CONTRACTS.md — frozen interfaces v1.4 (2026-08-30)
+# CONTRACTS.md — frozen interfaces v1.5 (2026-08-31)
 
 **FROZEN.** Every track builds against these. No session edits this file; propose changes in PROGRESS.md notes → the orchestrator (Claude) amends and bumps the version. TypeScript-ish notation; code generates types from here.
 
@@ -96,6 +96,7 @@ Cursor state is maintained per browser client by the wrapper; `graph_digest(sinc
 - Reporter credential issuance (v1.3): `POST /api/p/:project/reporter-credentials` — auth: the supervisor-scope bearer token; body `{actor: "worker:<node_id>" | "supervisor"}`; response `{token, actor, expires}` (project+actor-bound, 15-min TTL, renewable by re-calling). The bridge mints one per worker spawn and embeds it in the worker brief.
 - JOURNAL_NOTE via reporter (v1.3): `/report` ACCEPTS `JOURNAL_NOTE` when the authenticated actor is `supervisor` (this is the §5b `note` action's transport); workers may not journal.
 - Worker node binding (v1.4): a `worker:<node_id>` reporter credential may report node-scoped events (`NODE_STATE_CHANGED`, `PAUSE_ACKED`, `WORKER_LOG`, `HANDOFF_FILED`, `DEVIATION_NOTED`, `APPROVAL_CREATED`) ONLY for its own node: `payload.node_id` MUST equal the credential's bound node id, else 403. Supervisor-scope credentials are exempt from node binding.
+- Seed pipeline (v1.5, C5 real-run seeds): `GET /api/p/:project/export` (visitor token) → `{v:1, events: Ev[]}` — the project's full raw event stream, original `ts` preserved. `POST /api/import-seed` (supervisor bearer) body `{v:1, events}` → `{project_id}` — loads the stream as a new project (seqs reassigned in order, `ts` preserved, no credential material in either direction). `POST /api/clone-demo` clones from the project named by env `SEED_PROJECT_ID` when set (falling back to the built-in fixture seed when unset or missing); existing clone semantics (time anchoring, id remapping, selection cleanup) apply to both sources.
 
 ## 5. Supervisor envelope delivery (server → codex supervisor) — v1.1, probe-verified
 
@@ -129,6 +130,7 @@ interface SupervisorDecision {
 Worker sessions get their own thread ids; the server tracks `node_id → {thread_id, worktree}`. Workers report via the reporter API (§4), never through the supervisor.
 
 ## Changelog
+- v1.5 (2026-08-31): seed pipeline for C5 real-run seeds — project export endpoint, supervisor-auth import-seed endpoint, SEED_PROJECT_ID-driven clone-demo source.
 - v1.4 (2026-08-30): from the M3 adversarial review — worker reporter credentials are node-bound (403 on cross-node reports); single-bridge-daemon deployment invariant + state-file lock; at-least-once delivery semantics with idempotent §5b actions.
 - v1.3 (2026-08-30): from S5's integration gaps — reporter-credential issuance endpoint; JOURNAL_NOTE accepted from supervisor via /report.
 - v1.2 (2026-08-30): from the M2 adversarial review — atomic batch mutations, ALLOWED_ORIGINS CORS, client clone persistence, 409 surface-don't-retry, cursor-bound op_token + native-UI confirm parity.
