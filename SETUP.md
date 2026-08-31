@@ -76,13 +76,15 @@ sh -c 'set -eu
   set -a
   . bridge/.env.bridge
   set +a
+  dry_state_dir=$(mktemp -d "${TMPDIR:-/tmp}/missiongraph-dry-run.XXXXXX")
+  export MG_BRIDGE_STATE="$dry_state_dir/state.json"
   visitor_header=bridge/.env.visitor-header
   (umask 077; printf "x-mg-token: %s\n" "$MG_VISITOR_TOKEN" > "$visitor_header")
   (cd server && pnpm install --frozen-lockfile && pnpm build)
   (cd bridge && pnpm install --frozen-lockfile && pnpm build)
   (cd server && pnpm start) &
   server_pid=$!
-  trap '\''kill "$server_pid" 2>/dev/null || true; rm -f "$visitor_header"'\'' EXIT INT TERM
+  trap '\''kill "$server_pid" 2>/dev/null || true; rm -f "$visitor_header" "$MG_BRIDGE_STATE" "$MG_BRIDGE_STATE.lock" "$MG_BRIDGE_STATE.lock.takeover"; rmdir "$dry_state_dir" 2>/dev/null || true'\'' EXIT INT TERM
   attempts=0
   until curl --fail --silent --show-error --header @"$visitor_header" "$MG_SERVER_URL/api/p/$MG_PROJECT_ID/snapshot" >/dev/null 2>&1; do
     attempts=$((attempts + 1))
@@ -92,7 +94,7 @@ sh -c 'set -eu
   (cd bridge && pnpm start -- --dry-run)'
 ```
 
-`--dry-run` replaces Codex with `bridge/mock-codex.mjs`; server, SSE, FIFO, decision parsing, worktree creation, reporter writes, and state persistence remain real. Every dry-run reporter journal write is visibly prefixed `DRY-RUN SIMULATION:`. Use `--dry-run` only with a throwaway project and throwaway database; it still appends simulation records and creates worktrees. Remove `--dry-run` to run real Codex sessions (verified end-to-end 2026-08-30, PROGRESS.md M3). The bridge disables configured MCP servers with `-c mcp_servers={}` and gives every child ignored stdin. Supervisor starts and resumes are read-only with no network override; worker starts and resumes use workspace-write plus the probed network override. Codex child environments are allowlisted and never inherit the reporter master credential or visitor token.
+`--dry-run` replaces Codex with `bridge/mock-codex.mjs`; server, SSE, FIFO, decision parsing, worktree creation, reporter writes, and state persistence remain real. The command above isolates lifecycle state in a fresh temporary directory. The bridge also refuses `--dry-run` when the resolved state file records live or idle worker threads. Every dry-run reporter journal write is visibly prefixed `DRY-RUN SIMULATION:`. Use `--dry-run` only with a throwaway project and throwaway database; it still appends simulation records and creates worktrees. Remove `--dry-run` to run real Codex sessions (verified end-to-end 2026-08-30, PROGRESS.md M3). The bridge disables configured MCP servers with `-c mcp_servers={}` and gives every child ignored stdin. Supervisor starts and resumes are read-only with no network override; worker starts and resumes use workspace-write plus the probed network override. Codex child environments inherit only `PATH`, `HOME`, `CODEX_*`, `OPENAI_*`, custom-CA variables, and standard proxy variables; worker reporting variables are added explicitly. They never inherit `REPORTER_TOKEN` or any parent `MG_*` value.
 
 ## VM spend controls
 
@@ -106,4 +108,4 @@ Before deploying the server and bridge to a VM:
 
 ## Codex lifecycle
 
-The bridge persists the supervisor `thread_id` and resumes it across bridge restarts. An exclusive state lock enforces one bridge daemon per project/state file. Envelope delivery and cooperative worker commands use one-at-a-time `codex exec resume` turns. Worker briefs require queued→running→review/failed transitions, log tails, a version-1 `HANDOFF_FILED`, and one `APPROVAL_CREATED`; workers commit in isolated worktrees and never auto-merge. On shutdown the bridge terminates tracked children with SIGTERM, waits up to 10 seconds, then uses SIGKILL if necessary.
+The bridge persists the supervisor `thread_id` and resumes it across bridge restarts. Worker records follow resumable threads: `spawning` while launch metadata is established, `live` while a Codex process is running, and `idle` after a normal turn leaves its `thread_id` ready for rebrief or retry guidance. `dead` records retain their thread id so a later rebrief can still attempt `codex exec resume`. An exclusive state lock enforces one bridge daemon per project/state file. Envelope delivery and cooperative worker commands use one-at-a-time `codex exec resume` turns. Worker briefs require queued→running→review/failed transitions, log tails, a version-1 `HANDOFF_FILED`, and one `APPROVAL_CREATED`; workers commit in isolated worktrees and never auto-merge. On shutdown the bridge terminates tracked children with SIGTERM, waits up to 10 seconds, then uses SIGKILL if necessary; PID actions require the persisted OS process start time to match.
