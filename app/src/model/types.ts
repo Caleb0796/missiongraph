@@ -13,6 +13,7 @@ export interface TaskNode {
   estimate_min: number
   tags: string[]
   state: NodeState
+  parent_id?: string
 }
 
 export interface Handoff {

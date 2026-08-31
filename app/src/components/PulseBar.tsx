@@ -14,6 +14,7 @@ interface PulseBarProps {
   connectionMode: ConnectionMode
   connectionMessage: string
   linkErrorHasStoredIdentity: boolean
+  contextualToolsDegraded: boolean
 }
 
 function Stat({ label, value, tone }: { label: string; value: number; tone: string }) {
@@ -39,6 +40,7 @@ export function PulseBar({
   connectionMode,
   connectionMessage,
   linkErrorHasStoredIdentity,
+  contextualToolsDegraded,
 }: PulseBarProps) {
   return (
     <header className="pulse-bar">
@@ -83,6 +85,14 @@ export function PulseBar({
       </div>
 
       <div className="flex items-center gap-3">
+        {contextualToolsDegraded && (
+          <span
+            className="offline-badge"
+            title="Context tools will retry after the next selection change."
+          >
+            Agent context limited
+          </span>
+        )}
         {connectionMode === 'fixture' && (
           <span className="offline-badge" title={connectionMessage}>
             Dev fixture projection

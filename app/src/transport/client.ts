@@ -28,6 +28,7 @@ import {
   type ClientIdentity,
   type IdentitySource,
 } from './client-logic'
+import { SettledDebouncer } from './settled-debounce'
 
 const SESSION_KEY = 'missiongraph.session-id'
 const IDENTITY_KEY = 'missiongraph.visitor-identity'
@@ -78,6 +79,7 @@ interface MutationContext {
   cursor: string
   sessionId: string
   idemKey: string
+  staleMode: 'error' | 'silent'
 }
 
 interface StreamStamp {
@@ -120,14 +122,11 @@ const serverConfiguration = (() => {
     }
   }
 })()
-const debounceTimers = new Map<
-  string,
-  {
-    timer: number
-    context: MutationContext
-    resolve: (cursor: number) => void
-  }
->()
+const mutationDebouncer = new SettledDebouncer<number>({
+  setTimeout: (callback, milliseconds) =>
+    window.setTimeout(callback, milliseconds),
+  clearTimeout: (timer) => window.clearTimeout(timer as number),
+})
 let identity: ActiveIdentity | null = null
 let identityEpoch = 0
 let socket: WebSocket | null = null
@@ -320,7 +319,9 @@ function calibrateClock(
     .setClockSkew(estimateClockSkew(serverTimestamp, receivedAt))
 }
 
-function captureMutationContext(): MutationContext {
+function captureMutationContext(
+  staleMode: MutationOptions['staleMode'] = 'error',
+): MutationContext {
   const state = useMissionStore.getState()
   const candidate = identity
   return {
@@ -331,6 +332,7 @@ function captureMutationContext(): MutationContext {
     cursor: state.cursor,
     sessionId: state.sessionId,
     idemKey: crypto.randomUUID(),
+    staleMode,
   }
 }
 
@@ -894,7 +896,9 @@ async function postMutation<T extends EvType>(
       'stale_mutation',
       'The graph changed concurrently; the live snapshot was refreshed.',
     )
-    useMissionStore.getState().showToast(error.message, 'error')
+    if (context.staleMode === 'error') {
+      useMissionStore.getState().showToast(error.message, 'error')
+    }
     throw error
   }
   const result = await mutationJsonResponse<MutationResponse>(
@@ -963,7 +967,9 @@ async function postMutationBatch(
       'stale_mutation',
       'The graph changed concurrently; the live snapshot was refreshed.',
     )
-    useMissionStore.getState().showToast(error.message, 'error')
+    if (context.staleMode === 'error') {
+      useMissionStore.getState().showToast(error.message, 'error')
+    }
     throw error
   }
   const result = await mutationJsonResponse<BatchMutationResponse>(
@@ -1001,10 +1007,10 @@ function enqueueMutation<T extends EvType>(
 export function prepareMutation<T extends EvType>(
   type: T,
   payload: EventPayloadMap[T],
-  options: Pick<MutationOptions, 'actor'> = {},
+  options: Pick<MutationOptions, 'actor' | 'staleMode'> = {},
 ) {
   const actor = options.actor ?? 'human'
-  const context = captureMutationContext()
+  const context = captureMutationContext(options.staleMode)
   return () => enqueueMutation(type, payload, actor, context)
 }
 
@@ -1014,30 +1020,27 @@ export function mutate<T extends EvType>(
   options: MutationOptions = {},
 ): Promise<number> {
   const actor = options.actor ?? 'human'
-  const context = captureMutationContext()
   if (options.debounceKey) {
-    const previous = debounceTimers.get(options.debounceKey)
-    if (previous) {
-      window.clearTimeout(previous.timer)
-      previous.resolve(Number(previous.context.cursor))
-    }
-    return new Promise((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        debounceTimers.delete(options.debounceKey!)
-        enqueueMutation(type, payload, actor, context).then(resolve, reject)
-      }, 260)
-      debounceTimers.set(options.debounceKey!, { timer, context, resolve })
-    })
+    return mutationDebouncer.schedule(
+      options.debounceKey,
+      300,
+      Number(useMissionStore.getState().cursor),
+      () => {
+        const context = captureMutationContext(options.staleMode)
+        return enqueueMutation(type, payload, actor, context)
+      },
+    )
   }
+  const context = captureMutationContext(options.staleMode)
   return enqueueMutation(type, payload, actor, context)
 }
 
 export function mutateBatch(
   batch: MutationBatchItem[],
-  options: Pick<MutationOptions, 'actor'> = {},
+  options: Pick<MutationOptions, 'actor' | 'staleMode'> = {},
 ): Promise<number[]> {
   const actor = options.actor ?? 'human'
-  const context = captureMutationContext()
+  const context = captureMutationContext(options.staleMode)
   const queued = mutationQueue.then(() =>
     postMutationBatch(batch, actor, context),
   )
@@ -1046,6 +1049,24 @@ export function mutateBatch(
     () => undefined,
   )
   return queued
+}
+
+export function prepareBatchMutation(
+  batch: MutationBatchItem[],
+  options: Pick<MutationOptions, 'actor' | 'staleMode'> = {},
+) {
+  const actor = options.actor ?? 'human'
+  const context = captureMutationContext(options.staleMode)
+  return () => {
+    const queued = mutationQueue.then(() =>
+      postMutationBatch(batch, actor, context),
+    )
+    mutationQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    )
+    return queued
+  }
 }
 
 function sharedIdentityFromUrl(): ClientIdentity | null {

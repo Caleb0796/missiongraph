@@ -1,24 +1,31 @@
 import {
   approvalQueueFromRanking,
+  activeFailedNodes,
   approvalsForNode,
-  getBlastRadius,
+  contextualToolNamesForState,
   getCriticalPath,
   getDisplayState,
   isNonIdle,
-  isPreviewStale,
+  isSplitParent,
   remainingPathWeight,
   wouldCreateCycle,
 } from '../model/graph'
 import type { EdgeKind, GraphEdge, MissionEvent, TaskNode } from '../model/types'
-import { currentCriticalPath, useMissionStore } from '../store/mission-store'
+import {
+  currentCriticalPath,
+  useMissionStore,
+  type StructuralPlanInput,
+} from '../store/mission-store'
 import {
   loadChangesSince,
   mutate,
   mutateBatch,
+  prepareBatchMutation,
   prepareMutation,
   type MutationBatchItem,
 } from '../transport/client'
 import type { ToolDefinition, ToolOutcome } from './registry'
+import { buildSplitPlan, type SplitSubtask } from './split'
 
 interface SeedTask {
   temp_id: string
@@ -28,15 +35,6 @@ interface SeedTask {
   estimate: number
   tags: string[]
 }
-
-interface PendingOperation {
-  key: string
-  cursor: string
-  ids: string[]
-  apply: () => Promise<ToolOutcome>
-}
-
-const pendingOperations = new Map<string, PendingOperation>()
 
 function object(value: unknown, label = 'input') {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -67,6 +65,19 @@ function number(value: unknown, label: string) {
     throw new Error(`${label} must be a positive number.`)
   }
   return value
+}
+
+function boundedNumber(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+) {
+  const parsed = number(value, label)
+  if (parsed < minimum || parsed > maximum) {
+    throw new Error(`${label} must be between ${minimum} and ${maximum}.`)
+  }
+  return parsed
 }
 
 function strings(value: unknown, label: string) {
@@ -101,20 +112,34 @@ function approval(id: string) {
 
 function preview(
   key: string,
-  ids: string[],
-  apply: () => Promise<ToolOutcome>,
+  recompute: () => StructuralPlanInput,
 ): ToolOutcome {
-  const opToken = crypto.randomUUID()
-  const state = useMissionStore.getState()
-  pendingOperations.set(opToken, { key, cursor: state.cursor, ids, apply })
+  const staged = useMissionStore
+    .getState()
+    .stageStructural(key, recompute)
   return {
     data: {
       summary:
         'This structural change needs confirmation because it touches active or depended-on work.',
     },
     preview: {
-      op_token: opToken,
-      blast_radius: getBlastRadius(ids, state.nodes, state.edges),
+      op_token: staged.opToken,
+      blast_radius: staged.blastRadius,
+      ...(staged.proposal
+        ? {
+            proposal: {
+              children: staged.proposal.children,
+              edge_remap: staged.proposal.edgeRemap.map((remap) => ({
+                edge_id: remap.edgeId,
+                upstream: remap.upstream,
+                upstream_title: remap.upstreamTitle,
+                downstream: remap.downstream,
+                downstream_title: remap.downstreamTitle,
+                kind: remap.kind,
+              })),
+            },
+          }
+        : {}),
     },
   }
 }
@@ -124,20 +149,43 @@ async function confirmed(
   inputs: Record<string, unknown>,
   ids: string[],
   needsPreview: boolean,
-  apply: () => Promise<ToolOutcome>,
+  prepare: () => () => Promise<ToolOutcome>,
+  title = 'Confirm structural change',
+  recompute: () => StructuralPlanInput & {
+    prepare: () => () => Promise<ToolOutcome>
+  } = () => ({ title, ids, prepare }),
 ) {
-  if (!needsPreview) return apply()
-  if (inputs.confirm !== true) return preview(key, ids, apply)
+  if (!needsPreview) return prepare()()
+  if (inputs.confirm !== true) return preview(key, recompute)
   const token = string(inputs.op_token, 'op_token')
-  const pending = pendingOperations.get(token)
-  if (!pending || pending.key !== key) {
-    throw new Error('op_token is missing, expired, or does not match this operation.')
-  }
-  pendingOperations.delete(token)
-  if (isPreviewStale(pending.cursor, useMissionStore.getState().cursor)) {
-    const fresh = preview(key, ids, apply)
+  const result = await useMissionStore
+    .getState()
+    .confirmStructuralToken(key, token)
+  if (!result.applied && result.preview) {
     return {
-      ...fresh,
+      data: {
+        summary:
+          'The graph changed after this preview. Review the refreshed blast radius before confirming again.',
+      },
+      preview: {
+        op_token: result.preview.opToken,
+        blast_radius: result.preview.blastRadius,
+        ...(result.preview.proposal
+          ? {
+              proposal: {
+                children: result.preview.proposal.children,
+                edge_remap: result.preview.proposal.edgeRemap.map((remap) => ({
+                  edge_id: remap.edgeId,
+                  upstream: remap.upstream,
+                  upstream_title: remap.upstreamTitle,
+                  downstream: remap.downstream,
+                  downstream_title: remap.downstreamTitle,
+                  kind: remap.kind,
+                })),
+              },
+            }
+          : {}),
+      },
       error: {
         code: 'preview_stale',
         message:
@@ -145,7 +193,7 @@ async function confirmed(
       },
     }
   }
-  return pending.apply()
+  return result.value as ToolOutcome
 }
 
 function pathBetween(from: string, to: string) {
@@ -185,6 +233,46 @@ const confirmProperties = {
     type: 'string',
     description: 'The operation token returned by the matching preview.',
   },
+}
+
+const splitSubtasksSchema = {
+  type: 'array',
+  minItems: 2,
+  items: {
+    type: 'object',
+    properties: {
+      temp_id: {
+        type: 'string',
+        description: 'A unique ID local to this split proposal.',
+      },
+      title: { type: 'string' },
+      brief: { type: 'string' },
+      estimate: { type: 'number', exclusiveMinimum: 0 },
+      tags: { type: 'array', items: { type: 'string' } },
+      deps: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Prerequisite temp_id values inside this split.',
+      },
+    },
+    required: ['temp_id', 'title', 'brief', 'estimate', 'tags', 'deps'],
+    additionalProperties: false,
+  },
+}
+
+function splitSubtasks(value: unknown) {
+  if (!Array.isArray(value)) throw new Error('subtasks must be an array.')
+  return value.map((item, index): SplitSubtask => {
+    const subtask = object(item, `subtasks[${index}]`)
+    return {
+      temp_id: string(subtask.temp_id, `subtasks[${index}].temp_id`),
+      title: string(subtask.title, `subtasks[${index}].title`),
+      brief: string(subtask.brief, `subtasks[${index}].brief`),
+      estimate: number(subtask.estimate, `subtasks[${index}].estimate`),
+      tags: strings(subtask.tags, `subtasks[${index}].tags`),
+      deps: strings(subtask.deps, `subtasks[${index}].deps`),
+    }
+  })
 }
 
 const planSeed: ToolDefinition = {
@@ -396,6 +484,128 @@ const addTask: ToolDefinition = {
   },
 }
 
+async function executeSplit(
+  id: string,
+  subtasks: SplitSubtask[],
+  inputs: Record<string, unknown>,
+  actor: 'human' | 'browser_agent',
+) {
+  const parent = node(id)
+  const recompute = (): StructuralPlanInput & {
+    prepare: () => () => Promise<ToolOutcome>
+  } => {
+    const state = useMissionStore.getState()
+    const currentParent = state.nodes.find((candidate) => candidate.id === id)
+    if (!currentParent) throw new Error(`Task ${id} does not exist.`)
+    if (isSplitParent(currentParent)) {
+      throw new Error(`Task ${id} is already a split parent.`)
+    }
+    const plan = buildSplitPlan(currentParent, subtasks, state.edges)
+    const titles = new Map(
+      [...state.nodes, ...plan.children].map((candidate) => [
+        candidate.id,
+        candidate.title,
+      ]),
+    )
+    const prepare = () => {
+      const applyBatch = prepareBatchMutation(plan.batch, {
+        actor,
+        staleMode: 'silent',
+      })
+      return async (): Promise<ToolOutcome> => {
+        const seqs = await applyBatch()
+        const seqSet = new Set(seqs)
+        const splitEvent = useMissionStore
+          .getState()
+          .events.find(
+            (event): event is Extract<MissionEvent, { type: 'TASK_SPLIT' }> =>
+              event.type === 'TASK_SPLIT' && seqSet.has(event.seq),
+          )
+        const children = splitEvent?.payload.children ?? plan.children
+        const store = useMissionStore.getState()
+        store.setHighlights(children.map((child) => child.id))
+        store.requestCamera([
+          currentParent.id,
+          ...children.map((child) => child.id),
+        ])
+        return {
+          data: {
+            summary: `Split “${currentParent.title}” into ${children.length} linked tasks in one atomic graph rewire.`,
+            parent_id: currentParent.id,
+            children: children.map((child) => ({
+              id: child.id,
+              title: child.title,
+            })),
+            event_types: plan.batch.map((item) => item.type),
+          },
+        }
+      }
+    }
+    return {
+      title: `Split ${currentParent.title}`,
+      ids: [id],
+      ...(currentParent.state === 'running'
+        ? {
+            notice:
+              'this task is still executing — the supervisor will re-brief its worker after the split',
+          }
+        : {}),
+      proposal: {
+        children: plan.children.map((child) => ({
+          id: child.id,
+          title: child.title,
+        })),
+        edgeRemap: plan.edgeRemap.map((remap) => ({
+          edgeId: remap.edgeId,
+          upstream: remap.upstream,
+          upstreamTitle: titles.get(remap.upstream) ?? remap.upstream,
+          downstream: remap.downstream,
+          downstreamTitle: titles.get(remap.downstream) ?? remap.downstream,
+          kind: remap.kind,
+        })),
+      },
+      prepare,
+    }
+  }
+  return confirmed(
+    `split:${id}`,
+    inputs,
+    [id],
+    true,
+    () => recompute().prepare() as () => Promise<ToolOutcome>,
+    `Split ${parent.title}`,
+    recompute,
+  )
+}
+
+const splitTask: ToolDefinition = {
+  name: 'split_task',
+  description:
+    'Preview and atomically split a task, remapping prerequisites to entry children and dependents from terminal children.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: { type: 'string' },
+      subtasks: splitSubtasksSchema,
+      ...confirmProperties,
+    },
+    required: ['id', 'subtasks'],
+    additionalProperties: false,
+  },
+  execute(inputs) {
+    return executeSplit(
+      string(inputs.id, 'id'),
+      splitSubtasks(inputs.subtasks),
+      inputs,
+      'browser_agent',
+    )
+  },
+}
+
+export function previewNativeSplit(id: string, subtasks: SplitSubtask[]) {
+  return executeSplit(id, subtasks, {}, 'human')
+}
+
 const link: ToolDefinition = {
   name: 'link',
   description: 'Add a dependency or advisory conflict relationship between two tasks.',
@@ -433,17 +643,13 @@ const link: ToolDefinition = {
     }
     const edgeId = crypto.randomUUID()
     const key = `link:${upstream}:${downstream}:${kind}`
-    const applyMutation = prepareMutation(
-      'EDGE_ADDED',
-      { edge_id: edgeId, upstream, downstream, kind },
-      { actor: 'browser_agent' },
-    )
-    return confirmed(
-      key,
-      inputs,
-      [upstream, downstream],
-      isNonIdle(upstreamNode) || isNonIdle(downstreamNode),
-      async () => {
+    const prepare = () => {
+      const applyMutation = prepareMutation(
+        'EDGE_ADDED',
+        { edge_id: edgeId, upstream, downstream, kind },
+        { actor: 'browser_agent' },
+      )
+      return async (): Promise<ToolOutcome> => {
         await applyMutation()
         return {
           data: {
@@ -454,7 +660,14 @@ const link: ToolDefinition = {
             edge_id: edgeId,
           },
         }
-      },
+      }
+    }
+    return confirmed(
+      key,
+      inputs,
+      [upstream, downstream],
+      isNonIdle(upstreamNode) || isNonIdle(downstreamNode),
+      prepare,
     )
   },
 }
@@ -474,17 +687,13 @@ const unlink: ToolDefinition = {
     const edge = state.edges.find((item) => item.edge_id === edgeId)
     if (!edge) throw new Error(`Edge ${edgeId} does not exist.`)
     const touched = [node(edge.upstream), node(edge.downstream)]
-    const applyMutation = prepareMutation(
-      'EDGE_REMOVED',
-      { edge_id: edgeId },
-      { actor: 'browser_agent' },
-    )
-    return confirmed(
-      `unlink:${edgeId}`,
-      inputs,
-      touched.map((item) => item.id),
-      touched.some(isNonIdle),
-      async () => {
+    const prepare = () => {
+      const applyMutation = prepareMutation(
+        'EDGE_REMOVED',
+        { edge_id: edgeId },
+        { actor: 'browser_agent' },
+      )
+      return async (): Promise<ToolOutcome> => {
         await applyMutation()
         return {
           data: {
@@ -492,7 +701,14 @@ const unlink: ToolDefinition = {
             edge_id: edgeId,
           },
         }
-      },
+      }
+    }
+    return confirmed(
+      `unlink:${edgeId}`,
+      inputs,
+      touched.map((item) => item.id),
+      touched.some(isNonIdle),
+      prepare,
     )
   },
 }
@@ -536,28 +752,35 @@ const remove: ToolDefinition = {
     const hasIncidentEdge = useMissionStore
       .getState()
       .edges.some((edge) => edge.upstream === nodeId || edge.downstream === nodeId)
-    const applyMutation = prepareMutation(
-      'TASK_REMOVED',
-      { node_id: nodeId, tombstone: true },
-      { actor: 'browser_agent' },
-    )
+    const prepare = () => {
+      const applyMutation = prepareMutation(
+        'TASK_REMOVED',
+        { node_id: nodeId, tombstone: true },
+        { actor: 'browser_agent' },
+      )
+      return async (): Promise<ToolOutcome> => {
+        await applyMutation()
+        return {
+          data: {
+            summary: `Tombstoned and removed “${target.title}”.`,
+            node_id: nodeId,
+          },
+        }
+      }
+    }
     return confirmed(
       `remove:${nodeId}`,
       inputs,
       [nodeId],
       isNonIdle(target) || hasIncidentEdge,
-      async () => {
-        await applyMutation()
-        return {
-          data: { summary: `Tombstoned and removed “${target.title}”.`, node_id: nodeId },
-        }
-      },
+      prepare,
     )
   },
 }
 
 function digestData() {
   const state = useMissionStore.getState()
+  const activeNodes = state.nodes.filter((current) => !isSplitParent(current))
   const counts = {
     ready: 0,
     blocked: 0,
@@ -567,11 +790,11 @@ function digestData() {
     failed: 0,
     paused: 0,
   }
-  for (const current of state.nodes) {
+  for (const current of activeNodes) {
     const display = getDisplayState(current, state.nodes, state.edges)
     counts[display as keyof typeof counts]++
   }
-  const critical = getCriticalPath(state.nodes, state.edges)
+  const critical = getCriticalPath(activeNodes, state.edges)
   const pendingApprovals = approvalQueueFromRanking(
     state.approvals,
     state.approvalRanking,
@@ -583,7 +806,7 @@ function digestData() {
       summary: item.summary,
       delay_impact_min: item.delayImpactMin,
     }))
-  const ready = state.nodes
+  const ready = activeNodes
     .filter(
       (current) =>
         getDisplayState(current, state.nodes, state.edges) === 'ready' &&
@@ -600,18 +823,26 @@ function digestData() {
         left.id.localeCompare(right.id),
     )
   return {
-    summary: `The graph has ${state.nodes.length} tasks; ${counts.running} are running, ${counts.review} await review, ${counts.failed} failed, and ${counts.done} are done.`,
+    summary: `The graph has ${activeNodes.length} active tasks and ${state.nodes.length - activeNodes.length} split-parent history records; ${counts.running} are running, ${counts.review} await review, ${counts.failed} failed, and ${counts.done} are done.`,
     counts_by_state: counts,
     critical_path: {
       node_ids: critical.nodeIds,
       edge_ids: critical.edgeIds,
       eta_min: critical.eta,
     },
-    tasks: state.nodes.map((current) => ({
+    tasks: activeNodes.map((current) => ({
       id: current.id,
       title: current.title,
       state: getDisplayState(current, state.nodes, state.edges),
     })),
+    split_parents: state.nodes
+      .filter(isSplitParent)
+      .map((current) => ({
+        id: current.id,
+        title: current.title,
+        child_ids:
+          (current as TaskNode & { child_ids?: string[] }).child_ids ?? [],
+      })),
     edges: state.edges,
     pending_approvals: pendingApprovals,
     approval_ordering_source:
@@ -901,6 +1132,52 @@ const retryWithGuidance: ToolDefinition = {
   },
 }
 
+const setNodeRunState: ToolDefinition = {
+  name: 'set_node_run_state',
+  description: 'Request a cooperative pause or resume for one active task.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: { type: 'string' },
+      state: { type: 'string', enum: ['pause', 'resume'] },
+    },
+    required: ['id', 'state'],
+    additionalProperties: false,
+  },
+  async execute(inputs) {
+    const id = string(inputs.id, 'id')
+    const target = node(id)
+    if (isSplitParent(target)) {
+      throw new Error('A split-parent history record cannot run or pause.')
+    }
+    const state = string(inputs.state, 'state')
+    if (!['pause', 'resume'].includes(state)) {
+      throw new Error('state must be pause or resume.')
+    }
+    if (state === 'pause' && target.state !== 'running') {
+      throw new Error('Only a running task can be asked to pause.')
+    }
+    if (state === 'resume' && target.state !== 'paused') {
+      throw new Error('Only a paused task can be asked to resume.')
+    }
+    await mutate(
+      state === 'pause' ? 'PAUSE_REQUESTED' : 'RESUME_REQUESTED',
+      { node_id: id },
+      { actor: 'browser_agent' },
+    )
+    return {
+      data: {
+        summary:
+          state === 'pause'
+            ? `Asked “${target.title}” to pause at a safe point.`
+            : `Asked “${target.title}” to resume.`,
+        node_id: id,
+        requested_state: state,
+      },
+    }
+  },
+}
+
 const getNode: ToolDefinition = {
   name: 'get_node',
   description: 'Return the complete human-readable dossier for a task or relationship.',
@@ -917,6 +1194,9 @@ const getNode: ToolDefinition = {
     const task = state.nodes.find((item) => item.id === id)
     if (task) {
       const itemApprovals = approvalsForNode(state.approvals, id)
+      const splitParent = task.parent_id
+        ? state.nodes.find((candidate) => candidate.id === task.parent_id)
+        : undefined
       return {
         data: {
           summary: `“${task.title}” is ${getDisplayState(task, state.nodes, state.edges)}: ${task.brief}`,
@@ -926,6 +1206,14 @@ const getNode: ToolDefinition = {
           decision_trail: itemApprovals,
           annotations: state.annotations[id] ?? [],
           worker_log_tail: state.workerLogs[id] ?? [],
+          split_history: splitParent
+            ? {
+                parent_id: splitParent.id,
+                parent_title: splitParent.title,
+                parent_handoff: state.handoffs[splitParent.id] ?? null,
+                summary: `This task was split from “${splitParent.title}”; the parent dossier preserves its earlier work and decisions.`,
+              }
+            : null,
         },
       }
     }
@@ -933,6 +1221,11 @@ const getNode: ToolDefinition = {
     if (!edge) throw new Error(`Task or edge ${id} does not exist.`)
     const upstream = node(edge.upstream)
     const downstream = node(edge.downstream)
+    const splitParent = state.edgeLineage[id]
+      ? state.nodes.find(
+          (candidate) => candidate.id === state.edgeLineage[id].parent_id,
+        )
+      : undefined
     return {
       data: {
         summary:
@@ -941,6 +1234,13 @@ const getNode: ToolDefinition = {
             : `“${upstream.title}” and “${downstream.title}” have an advisory work conflict.`,
         edge,
         annotations: state.annotations[id] ?? [],
+        split_history: splitParent
+          ? {
+              parent_id: splitParent.id,
+              parent_title: splitParent.title,
+              summary: `This relationship was reattached when “${splitParent.title}” was split.`,
+            }
+          : null,
       },
     }
   },
@@ -1068,9 +1368,236 @@ const highlightPath: ToolDefinition = {
   },
 }
 
+const explainOverlay: ToolDefinition = {
+  name: 'explain_overlay',
+  description: 'Place a temporary, anchored explanatory callout on one task.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      id: { type: 'string' },
+      text: { type: 'string' },
+      ttl: {
+        type: 'number',
+        minimum: 1,
+        maximum: 60,
+        description: 'Seconds before the callout disappears.',
+      },
+    },
+    required: ['id', 'text', 'ttl'],
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: true },
+  execute(inputs) {
+    const id = string(inputs.id, 'id')
+    const target = node(id)
+    const text = string(inputs.text, 'text')
+    const ttl = boundedNumber(inputs.ttl, 'ttl', 1, 60)
+    const store = useMissionStore.getState()
+    store.showExplainOverlay(id, text, ttl)
+    store.requestCamera([id])
+    return {
+      data: {
+        summary: `Placed an explanation on “${target.title}” for ${ttl} seconds.`,
+        node_id: id,
+      },
+    }
+  },
+}
+
+const journalNote: ToolDefinition = {
+  name: 'journal_note',
+  description: 'Record a durable project-level decision or rewire note.',
+  inputSchema: {
+    type: 'object',
+    properties: { text: { type: 'string' } },
+    required: ['text'],
+    additionalProperties: false,
+  },
+  async execute(inputs) {
+    const text = string(inputs.text, 'text')
+    await mutate('JOURNAL_NOTE', { text }, { actor: 'browser_agent' })
+    return { data: { summary: `Recorded in the project journal: ${text}` } }
+  },
+}
+
+const getJournal: ToolDefinition = {
+  name: 'get_journal',
+  description: 'Read project-level decisions and rewire notes after an optional cursor.',
+  inputSchema: {
+    type: 'object',
+    properties: { since: { type: 'string', pattern: '^\\d+$' } },
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: true },
+  execute(inputs) {
+    const since =
+      inputs.since === undefined ? 0 : Number(string(inputs.since, 'since'))
+    if (!Number.isInteger(since) || since < 0) {
+      throw new Error('since must be a numeric cursor string.')
+    }
+    const entries = useMissionStore
+      .getState()
+      .journal.filter((entry) => entry.seq > since)
+    return {
+      data: {
+        summary:
+          entries.length === 0
+            ? 'No project journal entries match this cursor.'
+            : `${entries.length} project journal ${entries.length === 1 ? 'entry' : 'entries'} matched.`,
+        entries,
+      },
+    }
+  },
+}
+
+function notApplicable(name: string, reason: string): ToolOutcome {
+  return {
+    data: {
+      label: 'not_applicable',
+      tool: name,
+      applicable: false,
+      summary: reason,
+    },
+  }
+}
+
+function selectedNode() {
+  const state = useMissionStore.getState()
+  return state.nodes.find(
+    (candidate) =>
+      candidate.id === state.selectedId && !isSplitParent(candidate),
+  )
+}
+
+const dispatchSelected: ToolDefinition = {
+  name: 'dispatch_selected',
+  description: 'Dispatch the currently selected ready, unassigned task.',
+  inputSchema: {
+    type: 'object',
+    properties: { brief_override: { type: 'string' } },
+    additionalProperties: false,
+  },
+  async execute(inputs, options) {
+    const selected = selectedNode()
+    if (!selected) {
+      return notApplicable('dispatch_selected', 'Select a task before dispatching it.')
+    }
+    const state = useMissionStore.getState()
+    if (
+      getDisplayState(selected, state.nodes, state.edges) !== 'ready' ||
+      (selected as TaskNode & { assigned?: boolean }).assigned
+    ) {
+      return notApplicable(
+        'dispatch_selected',
+        `“${selected.title}” is not ready and unassigned.`,
+      )
+    }
+    return dispatch.execute(
+      { id: selected.id, brief_override: inputs.brief_override },
+      options,
+    )
+  },
+}
+
+const explainSelected: ToolDefinition = {
+  name: 'explain_selected',
+  description: 'Read the complete dossier for the currently selected task or edge.',
+  inputSchema: emptySchema,
+  annotations: { readOnlyHint: true },
+  execute(inputs, options) {
+    const state = useMissionStore.getState()
+    const selectedId = state.selectedId
+    if (!selectedId) {
+      return notApplicable('explain_selected', 'Select a task or edge to explain it.')
+    }
+    const selectedTask = state.nodes.find(
+      (candidate) => candidate.id === selectedId,
+    )
+    if (selectedTask && isSplitParent(selectedTask)) {
+      return notApplicable(
+        'explain_selected',
+        'Retired split parents are not contextual action targets.',
+      )
+    }
+    return getNode.execute({ ...inputs, id: selectedId }, options)
+  },
+}
+
+const annotateSelected: ToolDefinition = {
+  name: 'annotate_selected',
+  description: 'Attach durable context to the currently selected task.',
+  inputSchema: {
+    type: 'object',
+    properties: { note: { type: 'string' } },
+    required: ['note'],
+    additionalProperties: false,
+  },
+  execute(inputs, options) {
+    const selected = selectedNode()
+    if (!selected) {
+      return notApplicable('annotate_selected', 'Select a task before annotating it.')
+    }
+    return annotate.execute(
+      { target_id: selected.id, note: inputs.note },
+      options,
+    )
+  },
+}
+
+const splitSelected: ToolDefinition = {
+  name: 'split_selected',
+  description: 'Preview and atomically split the currently selected task.',
+  inputSchema: {
+    type: 'object',
+    properties: { subtasks: splitSubtasksSchema, ...confirmProperties },
+    required: ['subtasks'],
+    additionalProperties: false,
+  },
+  execute(inputs) {
+    const selected = selectedNode()
+    if (!selected) {
+      return notApplicable('split_selected', 'Select a task before splitting it.')
+    }
+    return executeSplit(
+      selected.id,
+      splitSubtasks(inputs.subtasks),
+      inputs,
+      'browser_agent',
+    )
+  },
+}
+
+const reviewFailures: ToolDefinition = {
+  name: 'review_failures',
+  description: 'Summarize failed tasks and focus them on the canvas without mutating.',
+  inputSchema: emptySchema,
+  annotations: { readOnlyHint: true },
+  execute() {
+    const store = useMissionStore.getState()
+    const failed = activeFailedNodes(store.nodes)
+    if (failed.length === 0) {
+      return notApplicable('review_failures', 'No tasks are currently failed.')
+    }
+    const ids = failed.map((candidate) => candidate.id)
+    store.setHighlights(ids)
+    store.requestCamera(ids)
+    return {
+      data: {
+        summary: `${failed.length} failed ${failed.length === 1 ? 'task needs' : 'tasks need'} review.`,
+        tasks: failed.map((candidate) => ({
+          id: candidate.id,
+          title: candidate.title,
+          log_tail: store.workerLogs[candidate.id]?.slice(-5) ?? [],
+        })),
+      },
+    }
+  },
+}
+
 export const missionTools: ToolDefinition[] = [
   planSeed,
   addTask,
+  splitTask,
   link,
   unlink,
   annotate,
@@ -1083,9 +1610,33 @@ export const missionTools: ToolDefinition[] = [
   reject,
   dispatch,
   retryWithGuidance,
+  setNodeRunState,
   getNode,
   getCriticalPathTool,
   getSelection,
   focus,
   highlightPath,
+  explainOverlay,
+  journalNote,
+  getJournal,
 ]
+
+export const contextualMissionTools: ToolDefinition[] = [
+  dispatchSelected,
+  explainSelected,
+  annotateSelected,
+  splitSelected,
+  reviewFailures,
+]
+
+export function contextualToolsForCurrentState() {
+  const state = useMissionStore.getState()
+  const byName = new Map(
+    contextualMissionTools.map((definition) => [definition.name, definition]),
+  )
+  return contextualToolNamesForState(
+    state.nodes,
+    state.edges,
+    state.selectedId,
+  ).flatMap((name) => byName.get(name) ?? [])
+}

@@ -19,6 +19,7 @@ import {
   getEventNodeId,
   humanizeIdleAge,
   idleRadar,
+  isSplitParent,
   type DisplayState,
 } from '../model/graph'
 import { useMissionStore } from '../store/mission-store'
@@ -74,6 +75,7 @@ function MissionBoard() {
   const positions = useMissionStore((state) => state.positions)
   const selectedId = useMissionStore((state) => state.selectedId)
   const highlightedIds = useMissionStore((state) => state.highlightedIds)
+  const explainOverlays = useMissionStore((state) => state.explainOverlays)
   const readySince = useMissionStore((state) => state.readySince)
   const approvals = useMissionStore((state) => state.approvals)
   const cameraRequest = useMissionStore((state) => state.cameraRequest)
@@ -84,9 +86,14 @@ function MissionBoard() {
     (state) => state.linkErrorHasStoredIdentity,
   )
   const projectId = useMissionStore((state) => state.projectId)
+  const topologyRevision = useMissionStore((state) => state.topologyRevision)
   const toast = useMissionStore((state) => state.toast)
   const structuralPreview = useMissionStore((state) => state.structuralPreview)
+  const contextualToolsDegraded = useMissionStore(
+    (state) => state.contextualToolsDegraded,
+  )
   const hydratePositions = useMissionStore((state) => state.hydratePositions)
+  const relayoutPositions = useMissionStore((state) => state.relayoutPositions)
   const moveNode = useMissionStore((state) => state.moveNode)
   const connectNodes = useMissionStore((state) => state.connectNodes)
   const removeSelected = useMissionStore((state) => state.removeSelected)
@@ -102,8 +109,17 @@ function MissionBoard() {
     Record<string, { width: number; height: number }>
   >({})
   const [replaying, setReplaying] = useState(false)
+  const [relayouting, setRelayouting] = useState(false)
+  const [layoutRetry, setLayoutRetry] = useState(0)
   const [now, setNow] = useState(() => Date.now())
   const hasLaidOut = useRef(false)
+  const layoutRequest = useRef<{
+    projectId: string | null
+    revision: number
+    signature: string
+  } | null>(null)
+  const relayoutTimer = useRef<number | null>(null)
+  const layoutDebounce = useRef<number | null>(null)
   const { fitView, setCenter } = useReactFlow<TaskFlowNode, Edge>()
   const criticalPath = useMemo(
     () => getCriticalPath(nodes, edges),
@@ -168,6 +184,7 @@ function MissionBoard() {
             dragPositions[node.id] ??
             positions[node.id] ?? { x: (index % 3) * 320, y: Math.floor(index / 3) * 190 },
           selected: selectedId === node.id,
+          className: relayouting ? 'mission-flow-node--relayouting' : undefined,
           ...(nodeDims[node.id] ? { measured: nodeDims[node.id] } : {}),
           data: {
             title: node.title,
@@ -187,6 +204,17 @@ function MissionBoard() {
                 : undefined,
             critical: criticalPath.nodeIds.includes(node.id),
             highlighted: highlightedIds.includes(node.id),
+            previewStale:
+              structuralPreview?.blastRadius.stale.includes(node.id) ?? false,
+            previewPausing:
+              structuralPreview?.blastRadius.pausing.includes(node.id) ?? false,
+            recordType:
+              (node as typeof node & { record_type?: 'task' | 'group' })
+                .record_type ?? 'task',
+            pauseRequested:
+              (node as typeof node & { pause_requested?: boolean })
+                .pause_requested ?? false,
+            overlayText: explainOverlays[node.id]?.text,
           },
         }
       }),
@@ -195,13 +223,16 @@ function MissionBoard() {
       approvals,
       dragPositions,
       edges,
+      explainOverlays,
       highlightedIds,
       idleNodeIds,
       nodeDims,
       nodes,
       positions,
+      relayouting,
       readySince,
       selectedId,
+      structuralPreview,
       correctedNow,
     ],
   )
@@ -213,25 +244,113 @@ function MissionBoard() {
 
   useEffect(() => {
     hasLaidOut.current = false
+    layoutRequest.current = null
+    const resetRelayouting = window.setTimeout(() => setRelayouting(false), 0)
+    if (relayoutTimer.current !== null) {
+      window.clearTimeout(relayoutTimer.current)
+      relayoutTimer.current = null
+    }
+    if (layoutDebounce.current !== null) {
+      window.clearTimeout(layoutDebounce.current)
+      layoutDebounce.current = null
+    }
+    return () => window.clearTimeout(resetRelayouting)
   }, [projectId])
 
   useEffect(() => {
+    if (connectionMode === 'loading' || nodes.length === 0) {
+      return
+    }
+    const signature = `${nodes.map((node) => node.id).sort().join(',')}|${edges
+      .map((edge) => `${edge.edge_id}:${edge.upstream}:${edge.downstream}`)
+      .sort()
+      .join(',')}`
+    const firstLayout = !hasLaidOut.current
     if (
-      connectionMode === 'loading' ||
-      hasLaidOut.current ||
-      nodes.length === 0
+      !firstLayout &&
+      layoutRequest.current?.projectId === projectId &&
+      layoutRequest.current.revision === topologyRevision &&
+      layoutRequest.current.signature === signature
     ) {
       return
     }
     hasLaidOut.current = true
-    void createLayout(
-      nodes.map((node) => node.id),
-      flowEdges,
-    ).then((layout) => {
-      hydratePositions(layout)
-      window.setTimeout(() => void fitView({ padding: 0.16, duration: 280 }), 0)
-    })
-  }, [connectionMode, fitView, flowEdges, hydratePositions, nodes])
+    const scheduledRevision = topologyRevision
+    const scheduledProjectId = projectId
+    layoutRequest.current = {
+      projectId: scheduledProjectId,
+      revision: scheduledRevision,
+      signature,
+    }
+    const isCurrentLayout = () =>
+      useMissionStore.getState().topologyRevision === scheduledRevision &&
+      useMissionStore.getState().projectId === scheduledProjectId
+    const layout = () => {
+      if (!firstLayout) setRelayouting(true)
+      void createLayout(
+        nodes.map((node) => node.id),
+        flowEdges,
+      ).then((positions) => {
+        if (!isCurrentLayout()) {
+          if (
+            layoutRequest.current?.projectId === scheduledProjectId &&
+            layoutRequest.current.revision === scheduledRevision
+          ) {
+            layoutRequest.current = null
+            setLayoutRetry((current) => current + 1)
+          }
+          return
+        }
+        if (firstLayout) hydratePositions(positions)
+        else relayoutPositions(positions)
+        window.setTimeout(() => {
+          if (isCurrentLayout()) {
+            void fitView({
+              padding: 0.16,
+              duration: firstLayout ? 280 : 520,
+            })
+          }
+        }, 0)
+        if (relayoutTimer.current !== null) {
+          window.clearTimeout(relayoutTimer.current)
+        }
+        relayoutTimer.current = window.setTimeout(() => {
+          if (!isCurrentLayout()) return
+          setRelayouting(false)
+          relayoutTimer.current = null
+        }, 560)
+      })
+    }
+    if (firstLayout) layout()
+    else {
+      if (layoutDebounce.current !== null) {
+        window.clearTimeout(layoutDebounce.current)
+      }
+      layoutDebounce.current = window.setTimeout(() => {
+        layoutDebounce.current = null
+        layout()
+      }, 80)
+    }
+  }, [
+    connectionMode,
+    edges,
+    fitView,
+    flowEdges,
+    hydratePositions,
+    layoutRetry,
+    nodes,
+    projectId,
+    relayoutPositions,
+    topologyRevision,
+  ])
+
+  useEffect(
+    () => () => {
+      if (relayoutTimer.current !== null) window.clearTimeout(relayoutTimer.current)
+      if (layoutDebounce.current !== null) window.clearTimeout(layoutDebounce.current)
+    },
+    [],
+  )
 
   useEffect(() => {
     if (!cameraRequest) return
@@ -371,6 +490,7 @@ function MissionBoard() {
       blocked: 0,
     }
     for (const node of nodes) {
+      if (isSplitParent(node)) continue
       base[getDisplayState(node, nodes, edges)]++
     }
     return base
@@ -391,6 +511,7 @@ function MissionBoard() {
         connectionMode={connectionMode}
         connectionMessage={connectionMessage}
         linkErrorHasStoredIdentity={linkErrorHasStoredIdentity}
+        contextualToolsDegraded={contextualToolsDegraded}
       />
       <div className="canvas-stage">
         <ReactFlow<TaskFlowNode, Edge>
@@ -435,14 +556,48 @@ function MissionBoard() {
           <section className="structural-confirm" role="dialog" aria-modal="true">
             <p className="structural-confirm-kicker">Blast-radius preview</p>
             <h2>{structuralPreview.title}</h2>
-            <p>
-              Context may become stale for{' '}
-              {structuralPreview.blastRadius.stale
-                .map(
-                  (id) =>
-                    nodes.find((node) => node.id === id)?.title ?? 'removed work',
-                )
-                .join(', ')}.
+            {structuralPreview.notice && <p>{structuralPreview.notice}.</p>}
+            {structuralPreview.proposal && (
+              <div className="structural-confirm-plan">
+                <p>
+                  Children:{' '}
+                  {structuralPreview.proposal.children
+                    .map((child) => child.title)
+                    .join(', ')}.
+                </p>
+                {structuralPreview.proposal.edgeRemap.length > 0 ? (
+                  <ul>
+                    {structuralPreview.proposal.edgeRemap.map((remap) => (
+                      <li key={remap.edgeId}>
+                        {remap.kind === 'depends' ? 'Dependency' : 'Conflict'}{' '}
+                        {remap.edgeId} reattaches as{' '}
+                        {remap.upstreamTitle}{' '}
+                        {remap.kind === 'depends' ? '→' : '↔'}{' '}
+                        {remap.downstreamTitle}.
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>No existing relationships need reattachment.</p>
+                )}
+              </div>
+            )}
+            {structuralPreview.blastRadius.stale.length > 0 ? (
+              <p>
+                Context may become stale for{' '}
+                {structuralPreview.blastRadius.stale
+                  .map(
+                    (id) =>
+                      nodes.find((node) => node.id === id)?.title ?? 'removed work',
+                  )
+                  .join(', ')}.
+              </p>
+            ) : (
+              <p>No already-briefed downstream work will become stale.</p>
+            )}
+            <p className="structural-confirm-token">
+              Preview bound at cursor {structuralPreview.baseCursor} · token{' '}
+              {structuralPreview.opToken.slice(0, 8)}…
             </p>
             {structuralPreview.blastRadius.pausing.length > 0 && (
               <p>

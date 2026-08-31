@@ -1,5 +1,6 @@
 import type {
   Approval,
+  EventPayloadMap,
   GraphDigest,
   GraphEdge,
   MissionEvent,
@@ -23,6 +24,182 @@ export interface CriticalPath {
 }
 
 export const IDLE_THRESHOLD_MS = 10 * 60_000
+
+export function isSplitParent(node: TaskNode) {
+  return (node as TaskNode & { record_type?: string }).record_type === 'group'
+}
+
+export function activeFailedNodes(nodes: TaskNode[]) {
+  return nodes.filter(
+    (node) => node.state === 'failed' && !isSplitParent(node),
+  )
+}
+
+export type ContextualToolName =
+  | 'dispatch_selected'
+  | 'explain_selected'
+  | 'annotate_selected'
+  | 'split_selected'
+  | 'review_failures'
+
+export function contextualToolNamesForState(
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+  selectedId: string | null,
+) {
+  const selected = nodes.find(
+    (node) => node.id === selectedId && !isSplitParent(node),
+  )
+  const selectedEdge = edges.some((edge) => edge.edge_id === selectedId)
+  const names: ContextualToolName[] = []
+  if (selected || selectedEdge) names.push('explain_selected')
+  if (selected) {
+    names.push('annotate_selected', 'split_selected')
+    if (
+      getDisplayState(selected, nodes, edges) === 'ready' &&
+      !(selected as TaskNode & { assigned?: boolean }).assigned
+    ) {
+      names.push('dispatch_selected')
+    }
+  }
+  if (activeFailedNodes(nodes).length > 0) names.push('review_failures')
+  return names
+}
+
+export function foldTaskSplit(
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+  payload: EventPayloadMap['TASK_SPLIT'],
+) {
+  const incident = new Map(
+    edges
+      .filter(
+        (edge) =>
+          edge.upstream === payload.parent_id ||
+          edge.downstream === payload.parent_id,
+      )
+      .map((edge) => [edge.edge_id, edge]),
+  )
+  const remapped = payload.edge_remap.flatMap(({ edge_id, new_target }) => {
+    const edge = incident.get(edge_id)
+    if (!edge) return []
+    return [
+      {
+        ...edge,
+        upstream:
+          edge.upstream === payload.parent_id ? new_target : edge.upstream,
+        downstream:
+          edge.downstream === payload.parent_id ? new_target : edge.downstream,
+      },
+    ]
+  })
+  const remappedIds = new Set(payload.edge_remap.map((remap) => remap.edge_id))
+  return {
+    nodes: [
+      ...nodes.map((node) =>
+        node.id === payload.parent_id
+          ? ({
+              ...node,
+              record_type: 'group',
+              child_ids: payload.children.map((child) => child.id),
+              availability: null,
+              ready_since: null,
+              assigned: true,
+              pause_requested: false,
+            } as TaskNode)
+          : node,
+      ),
+      ...payload.children.map(
+        (child) =>
+          ({
+            ...child,
+            parent_id: payload.parent_id,
+            record_type: 'task',
+            child_ids: [],
+            availability: null,
+            ready_since: null,
+            assigned: child.state !== 'queued',
+            ever_started: child.state !== 'queued',
+            pause_requested: false,
+          }) as TaskNode,
+      ),
+    ],
+    edges: [
+      ...edges.filter(
+        (edge) =>
+          edge.upstream !== payload.parent_id &&
+          edge.downstream !== payload.parent_id,
+      ),
+      ...remapped,
+    ],
+    removedEdgeIds: [...incident.keys()].filter(
+      (edgeId) => !remappedIds.has(edgeId),
+    ),
+  }
+}
+
+export interface EdgeLineageEntry {
+  parent_id: string
+  seq: number
+}
+
+export type EdgeLineage = Record<string, EdgeLineageEntry>
+
+function edgeParentId(edge: GraphEdge, nodes: TaskNode[]) {
+  const byId = new Map(nodes.map((node) => [node.id, node]))
+  const upstreamParent = byId.get(edge.upstream)?.parent_id
+  const downstreamParent = byId.get(edge.downstream)?.parent_id
+  return upstreamParent === downstreamParent
+    ? upstreamParent
+    : upstreamParent ?? downstreamParent
+}
+
+export function pruneEdgeLineage(
+  lineage: EdgeLineage,
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+  limit = 500,
+) {
+  const edgeIds = new Set(edges.map((edge) => edge.edge_id))
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  return Object.fromEntries(
+    Object.entries(lineage)
+      .filter(
+        ([edgeId, entry]) =>
+          edgeIds.has(edgeId) && nodeIds.has(entry.parent_id),
+      )
+      .sort(
+        ([leftId, left], [rightId, right]) =>
+          left.seq - right.seq || leftId.localeCompare(rightId),
+      )
+      .slice(-limit),
+  )
+}
+
+export function foldEdgeLineage(
+  current: EdgeLineage,
+  event: MissionEvent,
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+) {
+  const next = { ...current }
+  if (event.type === 'TASK_SPLIT') {
+    event.payload.edge_remap.forEach((remap) => {
+      next[remap.edge_id] = {
+        parent_id: event.payload.parent_id,
+        seq: event.seq,
+      }
+    })
+  }
+  if (event.type === 'EDGE_ADDED') {
+    const parentId = edgeParentId(event.payload, nodes)
+    if (parentId) {
+      next[event.payload.edge_id] = { parent_id: parentId, seq: event.seq }
+    }
+  }
+  if (event.type === 'EDGE_REMOVED') delete next[event.payload.edge_id]
+  return pruneEdgeLineage(next, nodes, edges)
+}
 
 export function getDisplayState(
   node: TaskNode,
@@ -48,7 +225,8 @@ export function getCriticalPath(
   nodes: TaskNode[],
   edges: GraphEdge[],
 ): CriticalPath {
-  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  const activeNodes = nodes.filter((node) => !isSplitParent(node))
+  const nodeById = new Map(activeNodes.map((node) => [node.id, node]))
   const outgoing = new Map<string, GraphEdge[]>()
 
   for (const edge of edges) {
@@ -97,7 +275,7 @@ export function getCriticalPath(
   }
 
   let best = { eta: 0, path: [] as string[] }
-  for (const node of [...nodes].sort((left, right) => left.id.localeCompare(right.id))) {
+  for (const node of [...activeNodes].sort((left, right) => left.id.localeCompare(right.id))) {
     const candidate = longestFrom(node.id)
     const candidateKey = candidate.path.join('/')
     const bestKey = best.path.join('/')
@@ -190,7 +368,15 @@ export function getBlastRadius(
       }
     }
   }
-  const stale = [...reached]
+  const stale = [...reached].filter((id) => {
+    const target = nodes.find((node) => node.id === id) as
+      | (TaskNode & { assigned?: boolean; ever_started?: boolean })
+      | undefined
+    return Boolean(
+      target &&
+        (target.assigned || target.ever_started || target.state !== 'queued'),
+    )
+  })
   return {
     stale,
     pausing: stale.filter(
