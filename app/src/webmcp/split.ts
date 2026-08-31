@@ -15,6 +15,7 @@ export interface SplitPlan {
   children: TaskNode[]
   entryIds: string[]
   terminalIds: string[]
+  edgeLineage: Record<string, string[]>
 }
 
 export function buildSplitPlan(
@@ -91,20 +92,23 @@ export function buildSplitPlan(
       },
     },
   ]
+  const edgeLineage: Record<string, string[]> = {}
 
   for (const { edge, targets } of remapTargets) {
     batch.push({ type: 'EDGE_REMOVED', payload: { edge_id: edge.edge_id } })
-    for (const target of targets) {
+    targets.forEach((target, index) => {
+      const edgeId = index === 0 ? edge.edge_id : crypto.randomUUID()
+      if (edgeId !== edge.edge_id) edgeLineage[edgeId] = [edge.edge_id]
       batch.push({
         type: 'EDGE_ADDED',
         payload: {
-          edge_id: crypto.randomUUID(),
+          edge_id: edgeId,
           upstream: edge.upstream === parent.id ? target : edge.upstream,
           downstream: edge.downstream === parent.id ? target : edge.downstream,
           kind: edge.kind,
         },
       })
-    }
+    })
   }
   for (const subtask of subtasks) {
     for (const dependency of subtask.deps) {
@@ -120,5 +124,5 @@ export function buildSplitPlan(
     }
   }
 
-  return { batch, children, entryIds, terminalIds }
+  return { batch, children, entryIds, terminalIds, edgeLineage }
 }

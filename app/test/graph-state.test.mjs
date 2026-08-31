@@ -2,11 +2,15 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  activeFailedNodes,
+  annotationsForTarget,
   approvalQueueFromRanking,
   approvalsForNode,
   boundedHistory,
+  contextualToolNamesForState,
   eventTargetsNode,
   fixtureRankedPendingApprovals,
+  foldTaskSplit,
   getBlastRadius,
   humanizeIdleAge,
   idleRadar,
@@ -193,5 +197,130 @@ test('approval queue consumes server ranking instead of local path weight', () =
       ['serverFirst', 90],
       ['locallyLong', 10],
     ],
+  )
+})
+
+test('TASK_SPLIT fold remaps incident edges exactly and preserves durable lineage', () => {
+  const nodes = [task('upstream', 'done'), task('parent'), task('downstream')]
+  const edges = [
+    {
+      edge_id: 'incoming',
+      upstream: 'upstream',
+      downstream: 'parent',
+      kind: 'depends',
+    },
+    {
+      edge_id: 'outgoing',
+      upstream: 'parent',
+      downstream: 'downstream',
+      kind: 'depends',
+    },
+    {
+      edge_id: 'untouched',
+      upstream: 'upstream',
+      downstream: 'downstream',
+      kind: 'conflicts',
+    },
+  ]
+  const children = [task('entry'), task('terminal')]
+  const folded = foldTaskSplit(nodes, edges, {
+    parent_id: 'parent',
+    children,
+    edge_remap: [
+      { edge_id: 'incoming', new_target: 'entry' },
+      { edge_id: 'outgoing', new_target: 'terminal' },
+    ],
+  })
+  assert.deepEqual(
+    folded.edges.sort((left, right) => left.edge_id.localeCompare(right.edge_id)),
+    [
+      {
+        edge_id: 'incoming',
+        upstream: 'upstream',
+        downstream: 'entry',
+        kind: 'depends',
+      },
+      {
+        edge_id: 'outgoing',
+        upstream: 'terminal',
+        downstream: 'downstream',
+        kind: 'depends',
+      },
+      {
+        edge_id: 'untouched',
+        upstream: 'upstream',
+        downstream: 'downstream',
+        kind: 'conflicts',
+      },
+    ],
+  )
+  assert.equal(
+    folded.nodes.find((node) => node.id === 'parent').record_type,
+    'group',
+  )
+  assert.equal(
+    folded.nodes.find((node) => node.id === 'entry').parent_id,
+    'parent',
+  )
+  const cappedEvents = boundedHistory(
+    Array.from({ length: 205 }, (_, index) => ({ seq: index + 1 })),
+  )
+  assert.equal(cappedEvents[0].seq, 6)
+  assert.equal(
+    folded.nodes.find((node) => node.id === 'entry').parent_id,
+    'parent',
+  )
+})
+
+test('edge dossiers follow remap annotation lineage and active failures exclude groups', () => {
+  const inherited = {
+    actor: 'human',
+    note: 'Preserve this rationale.',
+    ts: '2026-08-30T10:00:00.000Z',
+  }
+  const current = {
+    actor: 'browser_agent',
+    note: 'Annotated after remap.',
+    ts: '2026-08-30T10:01:00.000Z',
+  }
+  assert.deepEqual(
+    annotationsForTarget(
+      { predecessor: [inherited], replacement: [current] },
+      { replacement: ['predecessor'] },
+      'replacement',
+    ),
+    [current, inherited],
+  )
+  assert.deepEqual(
+    activeFailedNodes([
+      task('failed-child', 'failed'),
+      task('failed-parent', 'failed', { record_type: 'group' }),
+      task('done', 'done'),
+    ]).map((node) => node.id),
+    ['failed-child'],
+  )
+  assert.deepEqual(
+    activeFailedNodes([
+      task('failed-parent', 'failed', { record_type: 'group' }),
+    ]),
+    [],
+  )
+})
+
+test('splitting the last failed task unregisters failure and selection aliases', () => {
+  const failed = task('failed', 'failed')
+  assert.ok(
+    contextualToolNamesForState([failed], [], 'failed').includes(
+      'review_failures',
+    ),
+  )
+  const folded = foldTaskSplit([failed], [], {
+    parent_id: 'failed',
+    children: [task('retry-a'), task('retry-b')],
+    edge_remap: [],
+  })
+  assert.deepEqual(
+    contextualToolNamesForState(folded.nodes, folded.edges, 'failed'),
+    [],
   )
 })

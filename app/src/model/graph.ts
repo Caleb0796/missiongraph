@@ -1,7 +1,9 @@
 import type {
   Approval,
+  EventPayloadMap,
   GraphDigest,
   GraphEdge,
+  GraphSnapshotState,
   MissionEvent,
   TaskNode,
 } from './types'
@@ -26,6 +28,124 @@ export const IDLE_THRESHOLD_MS = 10 * 60_000
 
 export function isSplitParent(node: TaskNode) {
   return (node as TaskNode & { record_type?: string }).record_type === 'group'
+}
+
+export function activeFailedNodes(nodes: TaskNode[]) {
+  return nodes.filter(
+    (node) => node.state === 'failed' && !isSplitParent(node),
+  )
+}
+
+export type ContextualToolName =
+  | 'dispatch_selected'
+  | 'explain_selected'
+  | 'annotate_selected'
+  | 'split_selected'
+  | 'review_failures'
+
+export function contextualToolNamesForState(
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+  selectedId: string | null,
+) {
+  const selected = nodes.find(
+    (node) => node.id === selectedId && !isSplitParent(node),
+  )
+  const selectedEdge = edges.some((edge) => edge.edge_id === selectedId)
+  const names: ContextualToolName[] = []
+  if (selected || selectedEdge) names.push('explain_selected')
+  if (selected) {
+    names.push('annotate_selected', 'split_selected')
+    if (
+      getDisplayState(selected, nodes, edges) === 'ready' &&
+      !(selected as TaskNode & { assigned?: boolean }).assigned
+    ) {
+      names.push('dispatch_selected')
+    }
+  }
+  if (activeFailedNodes(nodes).length > 0) names.push('review_failures')
+  return names
+}
+
+export function foldTaskSplit(
+  nodes: TaskNode[],
+  edges: GraphEdge[],
+  payload: EventPayloadMap['TASK_SPLIT'],
+) {
+  const incident = new Map(
+    edges
+      .filter(
+        (edge) =>
+          edge.upstream === payload.parent_id ||
+          edge.downstream === payload.parent_id,
+      )
+      .map((edge) => [edge.edge_id, edge]),
+  )
+  const remapped = payload.edge_remap.flatMap(({ edge_id, new_target }) => {
+    const edge = incident.get(edge_id)
+    if (!edge) return []
+    return [
+      {
+        ...edge,
+        upstream:
+          edge.upstream === payload.parent_id ? new_target : edge.upstream,
+        downstream:
+          edge.downstream === payload.parent_id ? new_target : edge.downstream,
+      },
+    ]
+  })
+  const remappedIds = new Set(payload.edge_remap.map((remap) => remap.edge_id))
+  return {
+    nodes: [
+      ...nodes.map((node) =>
+        node.id === payload.parent_id
+          ? ({
+              ...node,
+              record_type: 'group',
+              child_ids: payload.children.map((child) => child.id),
+              availability: null,
+              ready_since: null,
+              assigned: true,
+              pause_requested: false,
+            } as TaskNode)
+          : node,
+      ),
+      ...payload.children.map(
+        (child) =>
+          ({
+            ...child,
+            parent_id: payload.parent_id,
+            record_type: 'task',
+            child_ids: [],
+            availability: null,
+            ready_since: null,
+            assigned: child.state !== 'queued',
+            ever_started: child.state !== 'queued',
+            pause_requested: false,
+          }) as TaskNode,
+      ),
+    ],
+    edges: [
+      ...edges.filter(
+        (edge) =>
+          edge.upstream !== payload.parent_id &&
+          edge.downstream !== payload.parent_id,
+      ),
+      ...remapped,
+    ],
+    removedEdgeIds: [...incident.keys()].filter(
+      (edgeId) => !remappedIds.has(edgeId),
+    ),
+  }
+}
+
+export function annotationsForTarget(
+  annotations: GraphSnapshotState['annotations'],
+  edgeLineage: Record<string, string[]>,
+  targetId: string,
+) {
+  const targetIds = [targetId, ...(edgeLineage[targetId] ?? [])]
+  return targetIds.flatMap((id) => annotations[id] ?? [])
 }
 
 export function getDisplayState(

@@ -60,12 +60,19 @@ test('split planner emits one TASK_SPLIT batch with correctly directed edge rema
     plan.batch.filter((item) => item.type === 'EDGE_REMOVED').length,
     2,
   )
+  assert.equal(
+    plan.batch.filter((item) => item.type === 'PAUSE_REQUESTED').length,
+    0,
+  )
   const added = plan.batch
     .filter((item) => item.type === 'EDGE_ADDED')
     .map((item) => item.payload)
   assert.ok(
     added.some(
-      (edge) => edge.upstream === 'auth' && edge.downstream === entry,
+      (edge) =>
+        edge.edge_id === 'auth-payments' &&
+        edge.upstream === 'auth' &&
+        edge.downstream === entry,
     ),
   )
   assert.ok(

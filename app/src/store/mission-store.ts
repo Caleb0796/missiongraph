@@ -8,6 +8,7 @@ import {
   boundedHistory,
   describeEvent,
   fixtureRankedPendingApprovals,
+  foldTaskSplit,
   getBlastRadius,
   getCriticalPath,
   isNonIdle,
@@ -56,6 +57,14 @@ interface StructuralPreview {
   opToken: string
   baseCursor: string
   blastRadius: { stale: string[]; pausing: string[] }
+  notice?: string
+}
+
+export interface StructuralPlanInput {
+  title: string
+  ids: string[]
+  notice?: string
+  prepare: () => () => Promise<unknown>
 }
 
 interface ExplainOverlay {
@@ -74,6 +83,7 @@ export type ConnectionMode = 'loading' | 'live' | 'fixture' | 'link-error'
 export interface MutationOptions {
   actor?: 'human' | 'browser_agent'
   debounceKey?: string
+  staleMode?: 'error' | 'silent'
 }
 
 export type MutationSender = <T extends EvType>(
@@ -101,6 +111,7 @@ interface MissionState {
   approvalRankingStale: boolean
   policies: GraphSnapshotState['policies']
   annotations: GraphSnapshotState['annotations']
+  edgeLineage: Record<string, string[]>
   handoffs: Record<string, Handoff>
   deviations: GraphSnapshotState['deviations']
   workerLogs: Record<string, string[]>
@@ -111,6 +122,8 @@ interface MissionState {
   cameraRequest: CameraRequest | null
   toast: Toast | null
   structuralPreview: StructuralPreview | null
+  contextualToolsDegraded: boolean
+  topologyRevision: number
   readySince: Record<string, string>
   projectId: string | null
   cursor: string
@@ -145,9 +158,7 @@ interface MissionState {
   removeSelected: () => void
   stageStructural: (
     key: string,
-    title: string,
-    ids: string[],
-    prepare: () => () => Promise<unknown>,
+    recompute: () => StructuralPlanInput,
   ) => StructuralPreview
   confirmStructuralToken: (
     key: string,
@@ -161,6 +172,8 @@ interface MissionState {
   dispatch: (nodeId: string) => void
   setNodeRunState: (nodeId: string, state: 'pause' | 'resume') => void
   setHighlights: (ids: string[]) => void
+  recordEdgeLineage: (lineage: Record<string, string[]>) => void
+  setContextualToolsDegraded: (degraded: boolean) => void
   requestCamera: (ids: string[]) => void
   showExplainOverlay: (id: string, text: string, ttlSeconds: number) => void
   showToast: (message: string, tone?: Toast['tone'], caption?: string) => void
@@ -216,6 +229,15 @@ function mutationErrorWasNotified(error: unknown) {
   )
 }
 
+function mutationWasStale(error: unknown) {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    error.code === 'stale_mutation'
+  )
+}
+
 function reportMutationError(error: unknown, state: MissionState) {
   if (mutationErrorWasNotified(error)) return
   state.showToast(
@@ -246,15 +268,15 @@ function fixtureState() {
         tombstones.push(event.payload.node_id)
         break
       case 'TASK_SPLIT': {
-        const parent = nodeById.get(event.payload.parent_id)
-        if (parent) {
-          nodeById.set(parent.id, {
-            ...parent,
-            record_type: 'group',
-            child_ids: event.payload.children.map((child) => child.id),
-          } as TaskNode)
-        }
-        event.payload.children.forEach((child) => nodeById.set(child.id, child))
+        const folded = foldTaskSplit(
+          [...nodeById.values()],
+          [...edgeById.values()],
+          event.payload,
+        )
+        nodeById.clear()
+        folded.nodes.forEach((node) => nodeById.set(node.id, node))
+        edgeById.clear()
+        folded.edges.forEach((edge) => edgeById.set(edge.edge_id, edge))
         break
       }
       case 'EDGE_ADDED':
@@ -265,7 +287,13 @@ function fixtureState() {
         break
       case 'NODE_STATE_CHANGED': {
         const node = nodeById.get(event.payload.node_id)
-        if (node) nodeById.set(node.id, { ...node, state: event.payload.to })
+        if (node) {
+          nodeById.set(node.id, {
+            ...node,
+            state: event.payload.to,
+            pause_requested: false,
+          } as TaskNode)
+        }
         break
       }
       case 'APPROVED': {
@@ -365,6 +393,7 @@ function fixtureState() {
     approvalRankingStale: false,
     policies,
     annotations,
+    edgeLineage: {},
     handoffs,
     deviations,
     workerLogs,
@@ -375,8 +404,19 @@ function fixtureState() {
 const initial = fixtureState()
 
 function snapshotToView(snapshot: GraphSnapshotState) {
+  const parentByChild = new Map<string, string>()
+  Object.values(snapshot.nodes).forEach((node) => {
+    if (node.record_type === 'group') {
+      node.child_ids.forEach((childId) => parentByChild.set(childId, node.id))
+    }
+  })
   return {
-    nodes: Object.values(snapshot.nodes),
+    nodes: Object.values(snapshot.nodes).map((node) => ({
+      ...node,
+      ...(parentByChild.has(node.id)
+        ? { parent_id: parentByChild.get(node.id) }
+        : {}),
+    })),
     edges: Object.values(snapshot.edges).map((edge) => ({
       edge_id: edge.id,
       upstream: edge.upstream,
@@ -421,6 +461,16 @@ function eventChange(
   }
 }
 
+function topologyKey(nodes: TaskNode[], edges: GraphEdge[]) {
+  return `${nodes
+    .map((node) => node.id)
+    .sort()
+    .join(',')}|${edges
+    .map((edge) => `${edge.edge_id}:${edge.upstream}:${edge.downstream}`)
+    .sort()
+    .join(',')}`
+}
+
 export const useMissionStore = create<MissionState>((set, get) => ({
   ...initial,
   events: shortyEvents,
@@ -431,6 +481,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   cameraRequest: null,
   toast: null,
   structuralPreview: null,
+  contextualToolsDegraded: false,
+  topologyRevision: 0,
   readySince: shortyReadySince,
   projectId: null,
   cursor: '0',
@@ -465,11 +517,17 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       }
       const firstLiveSnapshot =
         projectChanged || state.connectionMode === 'fixture'
+      const topologyChanged =
+        projectChanged ||
+        topologyKey(state.nodes, state.edges) !==
+          topologyKey(view.nodes, view.edges)
       const selectedExists =
         view.nodes.some((node) => node.id === state.selectedId) ||
         view.edges.some((edge) => edge.edge_id === state.selectedId)
       return {
         ...view,
+        edgeLineage: projectChanged ? {} : state.edgeLineage,
+        topologyRevision: state.topologyRevision + (topologyChanged ? 1 : 0),
         projectId,
         cursor,
         events: firstLiveSnapshot ? [] : state.events,
@@ -483,7 +541,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           : state.approvalRankingStale,
         structuralPreview: projectChanged ? null : state.structuralPreview,
         explainOverlays: projectChanged ? {} : state.explainOverlays,
-        selectedId: selectedExists ? state.selectedId : null,
+        selectedId:
+          projectChanged || !selectedExists ? null : state.selectedId,
         connectionMode: 'live',
         connectionMessage: 'Live server',
         linkErrorHasStoredIdentity: false,
@@ -532,32 +591,13 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         tombstones = [...tombstones, event.payload.node_id]
         if (selectedId === event.payload.node_id) selectedId = null
         break
-      case 'TASK_SPLIT':
-        nodes = [
-          ...nodes.map((node) =>
-            node.id === event.payload.parent_id
-              ? ({
-                  ...node,
-                  record_type: 'group',
-                  child_ids: event.payload.children.map((child) => child.id),
-                  assigned: true,
-                  pause_requested: false,
-                } as TaskNode)
-              : node,
-          ),
-          ...event.payload.children.map(
-            (child) =>
-              ({
-                ...child,
-                record_type: 'task',
-                child_ids: [],
-                assigned: false,
-                ever_started: false,
-                pause_requested: false,
-              }) as TaskNode,
-          ),
-        ]
+      case 'TASK_SPLIT': {
+        const folded = foldTaskSplit(nodes, edges, event.payload)
+        nodes = folded.nodes
+        edges = folded.edges
+        if (folded.removedEdgeIds.includes(selectedId ?? '')) selectedId = null
         break
+      }
       case 'EDGE_ADDED':
         edges = [...edges, event.payload]
         break
@@ -650,6 +690,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
                   ['running', 'review', 'done', 'failed'].includes(
                     event.payload.to,
                   ),
+                pause_requested: false,
               }
             : node,
         )
@@ -718,9 +759,6 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         ].slice(-200)
         break
       case 'SELECTION_CHANGED':
-        if (event.payload.client_id === state.sessionId) {
-          selectedId = event.payload.selected[0] ?? null
-        }
         break
     }
 
@@ -762,6 +800,13 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       journal,
       selectedId,
       readySince,
+      topologyRevision:
+        state.topologyRevision +
+        (['TASK_ADDED', 'TASK_REMOVED', 'TASK_SPLIT', 'EDGE_ADDED', 'EDGE_REMOVED'].includes(
+          event.type,
+        )
+          ? 1
+          : 0),
       cursor: String(event.seq),
       events: boundedHistory([
         ...state.events.filter((item) => item.seq !== event.seq),
@@ -854,6 +899,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       linkErrorHasStoredIdentity: false,
       structuralPreview: null,
       explainOverlays: {},
+      selectedId: null,
+      topologyRevision: get().topologyRevision + 1,
     })
   },
   setConnectionMode(connectionMode, connectionMessage) {
@@ -912,7 +959,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       downstream,
       kind: 'depends',
     } as const
-    const prepare = () => prepareStoreMutation('EDGE_ADDED', payload)
+    const prepare = () =>
+      prepareStoreMutation('EDGE_ADDED', payload, { staleMode: 'silent' })
     const touched = state.nodes.filter(
       (node) => node.id === upstream || node.id === downstream,
     )
@@ -920,11 +968,13 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       const ids = [upstream, downstream]
       const operation = structuralConfirmation.stage({
         key: `link:${upstream}:${downstream}`,
-        title: 'Add dependency',
-        ids,
         cursor: state.cursor,
         projectId: state.projectId,
-        prepare,
+        recompute: () => ({
+          title: 'Add dependency',
+          ids,
+          apply: prepare(),
+        }),
       })
       set({
         structuralPreview: {
@@ -933,6 +983,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           opToken: operation.opToken,
           baseCursor: operation.baseCursor,
           blastRadius: getBlastRadius(ids, state.nodes, state.edges),
+          notice: operation.notice,
         },
       })
       return true
@@ -952,9 +1003,14 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           prepareStoreMutation('TASK_REMOVED', {
             node_id: node.id,
             tombstone: true,
-          })
+          }, { staleMode: 'silent' })
       : edge
-        ? () => prepareStoreMutation('EDGE_REMOVED', { edge_id: edge.edge_id })
+        ? () =>
+            prepareStoreMutation(
+              'EDGE_REMOVED',
+              { edge_id: edge.edge_id },
+              { staleMode: 'silent' },
+            )
         : null
     if (!prepare) return
     const ids = node ? [node.id] : [edge!.upstream, edge!.downstream]
@@ -972,11 +1028,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       const title = node ? `Remove ${node.title}` : 'Remove relationship'
       const operation = structuralConfirmation.stage({
         key: node ? `remove:${node.id}` : `unlink:${edge!.edge_id}`,
-        title,
-        ids,
         cursor: state.cursor,
         projectId: state.projectId,
-        prepare,
+        recompute: () => ({ title, ids, apply: prepare() }),
       })
       set({
         structuralPreview: {
@@ -985,28 +1039,36 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           opToken: operation.opToken,
           baseCursor: operation.baseCursor,
           blastRadius: getBlastRadius(ids, state.nodes, state.edges),
+          notice: operation.notice,
         },
       })
       return
     }
     void prepare()().catch((error: unknown) => reportMutationError(error, get()))
   },
-  stageStructural(key, title, ids, prepare) {
+  stageStructural(key, recompute) {
     const state = get()
     const operation = structuralConfirmation.stage({
       key,
-      title,
-      ids,
       cursor: state.cursor,
       projectId: state.projectId,
-      prepare,
+      recompute: () => {
+        const plan = recompute()
+        return {
+          title: plan.title,
+          ids: plan.ids,
+          ...(plan.notice ? { notice: plan.notice } : {}),
+          apply: plan.prepare(),
+        }
+      },
     })
     const structuralPreview = {
       title: operation.title,
       key: operation.key,
       opToken: operation.opToken,
       baseCursor: operation.baseCursor,
-      blastRadius: getBlastRadius(ids, state.nodes, state.edges),
+      blastRadius: getBlastRadius(operation.ids, state.nodes, state.edges),
+      notice: operation.notice,
     }
     set({ structuralPreview })
     return structuralPreview
@@ -1016,8 +1078,12 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     const result = await structuralConfirmation.confirm(
       key,
       opToken,
-      state.cursor,
-      state.projectId,
+      { cursor: state.cursor, projectId: state.projectId },
+      () => {
+        const latest = get()
+        return { cursor: latest.cursor, projectId: latest.projectId }
+      },
+      mutationWasStale,
     )
     if (!result.applied) {
       const pending = result.operation
@@ -1025,8 +1091,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         title: pending.title,
         key: pending.key,
         opToken: pending.opToken,
-        baseCursor: state.cursor,
-        blastRadius: getBlastRadius(pending.ids, state.nodes, state.edges),
+        baseCursor: pending.baseCursor,
+        blastRadius: getBlastRadius(pending.ids, get().nodes, get().edges),
+        notice: pending.notice,
       }
       set({ structuralPreview })
       return { applied: false, preview: structuralPreview }
@@ -1060,7 +1127,11 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     void sendMutation('SELECTION_CHANGED', {
       client_id: sessionId,
       selected: id ? [id] : [],
-    }).catch((error: unknown) => reportMutationError(error, get()))
+    }, { debounceKey: 'selection', staleMode: 'silent' }).catch(
+      (error: unknown) => {
+        if (!mutationWasStale(error)) reportMutationError(error, get())
+      },
+    )
   },
   approve(nodeId, policyRef) {
     const approval = Object.values(get().approvals).find(
@@ -1100,6 +1171,21 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
   setHighlights(highlightedIds) {
     set({ highlightedIds })
+  },
+  recordEdgeLineage(lineage) {
+    set((state) => ({
+      edgeLineage: Object.fromEntries(
+        Object.entries({ ...state.edgeLineage, ...lineage }).map(
+          ([edgeId, ancestors]) => [
+            edgeId,
+            [...new Set(ancestors.flatMap((id) => [id, ...(state.edgeLineage[id] ?? [])]))],
+          ],
+        ),
+      ),
+    }))
+  },
+  setContextualToolsDegraded(contextualToolsDegraded) {
+    set({ contextualToolsDegraded })
   },
   requestCamera(nodeIds) {
     set({ cameraRequest: { id: crypto.randomUUID(), nodeIds } })

@@ -1,5 +1,10 @@
 import { useMemo, useState } from 'react'
-import { describeEvent, eventTargetsNode, getDisplayState } from '../model/graph'
+import {
+  annotationsForTarget,
+  describeEvent,
+  eventTargetsNode,
+  getDisplayState,
+} from '../model/graph'
 import type { GraphEdge, MissionEvent, TaskNode } from '../model/types'
 import { useMissionStore } from '../store/mission-store'
 import { previewNativeSplit } from '../webmcp/tools'
@@ -31,6 +36,7 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
   const showToast = useMissionStore((state) => state.showToast)
   const approvals = useMissionStore((state) => state.approvals)
   const annotations = useMissionStore((state) => state.annotations)
+  const edgeLineage = useMissionStore((state) => state.edgeLineage)
   const handoffs = useMissionStore((state) => state.handoffs)
   const storedDeviations = useMissionStore((state) => state.deviations)
   const workerLogs = useMissionStore((state) => state.workerLogs)
@@ -102,16 +108,6 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
       )
     : undefined
   const displayState = node ? getDisplayState(node, nodes, edges) : undefined
-  const splitOrigin = node
-    ? events.find(
-        (event): event is Extract<MissionEvent, { type: 'TASK_SPLIT' }> =>
-          event.type === 'TASK_SPLIT' &&
-          event.payload.children.some((child) => child.id === node.id),
-      )
-    : undefined
-  const splitParent = splitOrigin
-    ? nodes.find((candidate) => candidate.id === splitOrigin.payload.parent_id)
-    : undefined
   const runtimeNode = node as
     | (TaskNode & {
         record_type?: 'task' | 'group'
@@ -119,6 +115,9 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
         pause_requested?: boolean
       })
     | undefined
+  const splitParent = runtimeNode?.parent_id
+    ? nodes.find((candidate) => candidate.id === runtimeNode.parent_id)
+    : undefined
 
   function previewSplit() {
     if (!node) return
@@ -250,7 +249,11 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
                 ? `${downstream?.title} cannot finish its intended work until ${upstream?.title} has delivered the prerequisite.`
                 : `${upstream?.title} and ${downstream?.title} touch overlapping implementation areas. They may proceed in parallel, but their workers should coordinate before handoff.`}
             </p>
-            {(annotations[edge.edge_id] ?? []).map((annotation) => (
+            {annotationsForTarget(
+              annotations,
+              edgeLineage,
+              edge.edge_id,
+            ).map((annotation) => (
               <ProseRecord key={`${annotation.ts}-${annotation.note}`}>
                 {annotation.note}
               </ProseRecord>

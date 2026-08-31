@@ -3,12 +3,20 @@ export interface StructuralOperationSnapshot {
   opToken: string
   title: string
   ids: string[]
+  notice?: string
   baseCursor: string
   projectId: string | null
 }
 
+export interface StructuralOperationPlan {
+  title: string
+  ids: string[]
+  notice?: string
+  apply: () => Promise<unknown>
+}
+
 interface PendingStructuralOperation extends StructuralOperationSnapshot {
-  prepare: () => () => Promise<unknown>
+  recompute: () => StructuralOperationPlan
   apply: () => Promise<unknown>
 }
 
@@ -22,6 +30,7 @@ function snapshot(operation: PendingStructuralOperation) {
     opToken: operation.opToken,
     title: operation.title,
     ids: [...operation.ids],
+    ...(operation.notice ? { notice: operation.notice } : {}),
     baseCursor: operation.baseCursor,
     projectId: operation.projectId,
   }
@@ -35,22 +44,23 @@ export class StructuralConfirmationController {
     this.makeToken = makeToken
   }
 
-  stage(
-    operation: Omit<StructuralOperationSnapshot, 'opToken' | 'baseCursor'> & {
-      cursor: string
-      prepare: () => () => Promise<unknown>
-    },
-  ) {
-    const apply = operation.prepare()
+  stage(operation: {
+    key: string
+    cursor: string
+    projectId: string | null
+    recompute: () => StructuralOperationPlan
+  }) {
+    const plan = operation.recompute()
     this.pending = {
       key: operation.key,
       opToken: this.makeToken(),
-      title: operation.title,
-      ids: [...operation.ids],
+      title: plan.title,
+      ids: [...plan.ids],
+      ...(plan.notice ? { notice: plan.notice } : {}),
       baseCursor: operation.cursor,
       projectId: operation.projectId,
-      prepare: operation.prepare,
-      apply,
+      recompute: operation.recompute,
+      apply: plan.apply,
     }
     return snapshot(this.pending)
   }
@@ -59,28 +69,47 @@ export class StructuralConfirmationController {
     this.pending = null
   }
 
+  private rebind(pending: PendingStructuralOperation, cursor: string) {
+    const plan = pending.recompute()
+    pending.opToken = this.makeToken()
+    pending.title = plan.title
+    pending.ids = [...plan.ids]
+    pending.notice = plan.notice
+    pending.baseCursor = cursor
+    pending.apply = plan.apply
+    return { applied: false, operation: snapshot(pending) } as const
+  }
+
   async confirm(
     key: string,
     opToken: string,
-    cursor: string,
-    projectId: string | null,
+    context: { cursor: string; projectId: string | null },
+    readContext: () => { cursor: string; projectId: string | null },
+    isStaleError: (error: unknown) => boolean,
   ): Promise<StructuralOperationResult> {
     const pending = this.pending
     if (!pending || pending.key !== key || pending.opToken !== opToken) {
       throw new Error('op_token is missing, expired, or does not match this operation.')
     }
-    if (pending.projectId !== projectId) {
+    if (pending.projectId !== context.projectId) {
       this.pending = null
       throw new Error('The project changed after this preview. Start the operation again.')
     }
-    if (pending.baseCursor !== cursor) {
-      const apply = pending.prepare()
-      pending.opToken = this.makeToken()
-      pending.baseCursor = cursor
-      pending.apply = apply
-      return { applied: false, operation: snapshot(pending) }
+    if (pending.baseCursor !== context.cursor) {
+      return this.rebind(pending, context.cursor)
     }
-    this.pending = null
-    return { applied: true, value: await pending.apply() }
+    try {
+      const value = await pending.apply()
+      if (this.pending === pending) this.pending = null
+      return { applied: true, value }
+    } catch (error) {
+      if (!isStaleError(error)) throw error
+      const latest = readContext()
+      if (pending.projectId !== latest.projectId) {
+        this.pending = null
+        throw new Error('The project changed after this preview. Start the operation again.')
+      }
+      return this.rebind(pending, latest.cursor)
+    }
   }
 }
