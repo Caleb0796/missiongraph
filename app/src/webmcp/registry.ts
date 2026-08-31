@@ -1,6 +1,7 @@
 import { TransportError } from '../transport/client'
 import { toolCursorForProject } from '../transport/client-logic'
 import { useMissionStore } from '../store/mission-store'
+import { DynamicToolController } from './dynamic-tools'
 
 export type ModelContextNamespace = 'document' | 'navigator'
 export type DynamicToolsTier = 'abort-controller' | 'provide-context' | 'none'
@@ -105,7 +106,12 @@ const helloMissionGraph: ToolDefinition = {
 
 let initialization: Promise<RegistryStatus> | undefined
 let definitions: ToolDefinition[] = [helloMissionGraph]
+let coreDefinitions: ToolDefinition[] = [helloMissionGraph]
+let contextualDefinitions: ToolDefinition[] = []
+let currentContextualDefinitions: () => ToolDefinition[] = () => []
 let clientCursor: { projectId: string | null; cursor: string } | null = null
+let dynamicController: DynamicToolController<ModelContextTool> | null = null
+let unsubscribeContext: (() => void) | null = null
 
 export function getWebMcpRuntime(): WebMcpRuntime | null {
   if (document.modelContext) {
@@ -219,18 +225,34 @@ async function bootstrapWebMcp(): Promise<RegistryStatus> {
     dynamicToolsTier = 'none'
   }
 
-  const tools = definitions.map(wrapTool)
-  if (
-    dynamicToolsTier === 'provide-context' &&
-    runtime.modelContext.provideContext
-  ) {
-    await runtime.modelContext.provideContext({ tools })
-  } else {
+  const coreTools = coreDefinitions.map(wrapTool)
+  if (dynamicToolsTier !== 'provide-context') {
     const existing = new Set(registeredTools.map((tool) => tool.name))
-    for (const tool of tools) {
+    const initialTools =
+      dynamicToolsTier === 'none'
+        ? [...coreTools, ...contextualDefinitions.map(wrapTool)]
+        : coreTools
+    for (const tool of initialTools) {
       if (!existing.has(tool.name)) await runtime.modelContext.registerTool(tool)
+      existing.add(tool.name)
     }
   }
+
+  dynamicController = new DynamicToolController(
+    runtime.modelContext,
+    dynamicToolsTier,
+    coreTools,
+  )
+  await refreshContextualTools()
+  unsubscribeContext = useMissionStore.subscribe((state, previous) => {
+    if (
+      state.selectedId !== previous.selectedId ||
+      state.nodes !== previous.nodes ||
+      state.edges !== previous.edges
+    ) {
+      void refreshContextualTools()
+    }
+  })
 
   console.info(
     `[MissionGraph] WebMCP namespace=${runtime.namespace}; dynamic-tools tier=${dynamicToolsTier}`,
@@ -238,10 +260,41 @@ async function bootstrapWebMcp(): Promise<RegistryStatus> {
   return { namespace: runtime.namespace, dynamicToolsTier }
 }
 
-export function initializeWebMcp(coreDefinitions: ToolDefinition[] = []) {
-  definitions = [helloMissionGraph, ...coreDefinitions]
+export interface ContextualToolConfiguration {
+  all: ToolDefinition[]
+  current: () => ToolDefinition[]
+}
+
+export function initializeWebMcp(
+  tools: ToolDefinition[] = [],
+  contextual: ContextualToolConfiguration = { all: [], current: () => [] },
+) {
+  coreDefinitions = [helloMissionGraph, ...tools]
+  contextualDefinitions = contextual.all
+  currentContextualDefinitions = contextual.current
+  definitions = [...coreDefinitions, ...contextualDefinitions]
   initialization ??= bootstrapWebMcp()
   return initialization
+}
+
+export async function refreshContextualTools() {
+  if (!dynamicController) return
+  const unique = [
+    ...new Map(
+      currentContextualDefinitions().map((definition) => [
+        definition.name,
+        definition,
+      ]),
+    ).values(),
+  ]
+  await dynamicController.update(unique.map(wrapTool))
+}
+
+export function disposeWebMcpRegistry() {
+  unsubscribeContext?.()
+  unsubscribeContext = null
+  dynamicController?.dispose()
+  dynamicController = null
 }
 
 export async function executeToolDirect(

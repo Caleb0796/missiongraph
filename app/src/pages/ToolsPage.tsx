@@ -6,7 +6,11 @@ import {
   getWebMcpRuntime,
   initializeWebMcp,
 } from '../webmcp/registry'
-import { missionTools } from '../webmcp/tools'
+import {
+  contextualMissionTools,
+  contextualToolsForCurrentState,
+  missionTools,
+} from '../webmcp/tools'
 
 function prettyResult(value: string | null) {
   if (value === null) return 'Tool returned null.'
@@ -52,7 +56,10 @@ export function ToolsPage() {
       if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
         throw new Error('Tool input must be a JSON object.')
       }
-      await initializeWebMcp(missionTools)
+      await initializeWebMcp(missionTools, {
+        all: contextualMissionTools,
+        current: contextualToolsForCurrentState,
+      })
       const runtime = getWebMcpRuntime()
       if (runtime) {
         const tools = await runtime.modelContext.getTools()
@@ -92,7 +99,7 @@ export function ToolsPage() {
           <a href="/">Close</a>
         </header>
         <div className="tool-console-status">
-          {missionTools.length} M4 tools · {connectionMode}
+          {missionTools.length} M5 core tools · {connectionMode}
         </div>
         <label className="tool-console-label" htmlFor="tool-name">
           Registered tool

@@ -4,12 +4,21 @@ import { CompatPage } from './pages/CompatPage'
 import { ToolsPage } from './pages/ToolsPage'
 import { initializeMissionClient } from './transport/client'
 import { initializeWebMcp } from './webmcp/registry'
-import { missionTools } from './webmcp/tools'
+import {
+  contextualMissionTools,
+  contextualToolsForCurrentState,
+  missionTools,
+} from './webmcp/tools'
 
 function App() {
   useEffect(() => {
     if (window.location.pathname !== '/compat') {
-      void initializeMissionClient().then(() => initializeWebMcp(missionTools))
+      void initializeMissionClient().then(() =>
+        initializeWebMcp(missionTools, {
+          all: contextualMissionTools,
+          current: contextualToolsForCurrentState,
+        }),
+      )
     }
   }, [])
 
