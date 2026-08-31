@@ -65,12 +65,12 @@ pnpm dev
 
 ## Testing
 
-121 tests across the three packages (CI runs them on every push):
+146 tests across the three packages (CI runs them on every push):
 
 ```sh
-cd server && pnpm test   # 30 — event store, reducer (22 event types), digest ranking, HTTP auth/CORS/batch atomicity, seed pipeline round-trip
-cd bridge && pnpm test   # 41 — decision validation, action ledger crash replay, PID-identity kill safety, lock takeover races, credential renewal, dry-run integration against a real server
-cd app    && pnpm test   # 50 — tool envelope contract, identity-epoch fencing, reconnect/re-clone paths, split preview/confirm, and a real-server HTTP regression driving plan→preview→confirm end-to-end
+cd server && pnpm test   # 36 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, and nonce-bound human-presence capabilities
+cd bridge && pnpm test   # 41 — decision validation, crash replay, PID/lock safety, credential renewal, and a human-confirmed dispatch integration against the real server
+cd app    && pnpm test   # 69 — tool envelopes, identity fencing/recovery, split confirmation, S2 policy/action dialogs, late WebMCP injection, tier detection, and real-server HTTP paths
 ```
 
 Beyond unit/integration tests, every milestone went through an **adversarial review loop** (independent reviewer session → findings → fix round → fix-verification round) and a **live functional arbitration** on the real stack — 50+ P1/P2 findings found and closed this way, with the full trail in [PROGRESS.md](PROGRESS.md).

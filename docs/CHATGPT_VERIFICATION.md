@@ -33,9 +33,9 @@ After opening `https://missiongraph.vercel.app/` in your browser, click **Site t
 6. List the MissionGraph tools **you yourself can discover** through your WebMCP integration — tool names only, plus the total count.
 7. Call `graph_digest` (no arguments or `{}`). Report: two-sentence summary of what this mission is about based on the returned narrative, and the exact `cursor` value.
 8. Call `list_ready`. Report which tasks it says are ready to start.
-9. Call `state_policy` with a policy text like: `{"text": "Approve changes under 50 lines with green tests during this verification session."}` (adapt the input to the tool's schema if it differs). Report `ok` and the new cursor.
-10. Call `annotate` targeting any task node, with the note `ChatGPT built-in browser verification pass`. Report `ok` and the new cursor.
-11. Call `graph_digest` again with `{"since": "<the cursor you saw in step 7>"}`. Confirm your policy and annotation events appear in `changes_since`.
+9. Call `state_policy` with `{"text": "Approve changes under 50 lines with green tests during this verification session."}` (adapt only if the discovered schema differs). The expected tool response is `ok:true` with `data.status:"pending_human_confirmation"`, a `draft_id`, `allowed_actions`, `max_uses`, and `expires_at`; it must **not** contain a `policy_ref` or raw capability, and its cursor may remain unchanged because staging appends no event. Report those fields and ask the human to inspect the visible **Human policy confirmation** dialog on the MissionGraph canvas (exact policy text/hash, project, session, approve/reject actions, use limit, and expiry), then click **Confirm**. Wait for the human to say confirmation finished. Call `graph_digest` with `{"since":"<the cursor returned by state_policy>"}`, find the resulting `POLICY_STATED` event, and report its `policy_ref` plus the new cursor. If the dialog is absent, denied, expired, or confirmation does not produce `POLICY_STATED`, report B9 as failed and stop before approval.
+10. Call `list_pending_approvals`, choose one pending approval, then call `approve` with its `id`, the confirmed `policy_ref` from step 9, and a short verification rationale. Report the approval tool's `ok`, `approval_id`, and new cursor. In that result's `changes_since`, confirm the `APPROVED` event has `authorization.capability_ref` equal to the policy ref and a non-empty `authorization.use_nonce`; report those values, but do not expect or expose the raw capability token. This verifies that the confirmed multi-use policy grant consumed one nonce-bound use without another confirmation dialog.
+11. Call `graph_digest` again with `{"since": "<the cursor you saw in step 7>"}`. Confirm both the human-attributed `POLICY_STATED` event and the browser-agent `APPROVED` event appear in `changes_since`, including the approval's capability reference and use nonce.
 12. OPTIONAL (only if steps 6–11 all succeeded): call `split_task` on any QUEUED task with two subtasks per its schema, WITHOUT `confirm`. Report whether you received a `preview` containing `op_token` and `blast_radius`. Then STOP — do NOT send the confirm call.
 
 ### Act C — report (fill exactly)
@@ -52,8 +52,11 @@ B6 tools discovered by agent: <count>
 B7 graph_digest: <ok/fail>  cursor: <...>
    mission summary: <2 sentences>
 B8 list_ready: <ok/fail>  ready tasks: <...>
-B9 state_policy: <ok/fail>  cursor: <...>
-B10 annotate: <ok/fail>  cursor: <...>
+B9 state_policy staged: <ok/fail>  draft_id: <...>  cursor: <...>
+   no policy_ref/capability in tool response: <yes/no>
+   human confirmation: <confirmed/denied/absent/expired>  policy_ref from POLICY_STATED: <...>  cursor after confirmation: <...>
+B10 policy-backed approve: <ok/fail/skipped-no-pending>  approval_id: <...>  cursor: <...>
+   capability_ref matches policy_ref: <yes/no>  use_nonce present: <yes/no>
 B11 own events visible in changes_since: <yes/no>
 B12 split preview (optional): <received op_token+blast_radius / skipped / fail>
 ERRORS (verbatim, any step): <none / paste>
@@ -68,8 +71,10 @@ ERRORS (verbatim, any step): <none / paste>
 | A2 | 无 enable 横幅；namespace ∈ {document, navigator}（记录实际值）；tier ∈ {abort-controller, provide-context, fallback} |
 | A3/A4 | hello 在列，readOnlyHint true；返回为可解析 JSON 字符串，`ok:true` 且 `env.api` 与 namespace 一致 |
 | B6 | agent 侧发现 ≥ 20 个工具（全量 24；上下文工具依选中状态注册，允许缺席） |
-| B7–B10 | 每次调用 `ok:true` 且 cursor 单调递增 |
-| B11 | 步骤 9/10 的事件出现在 `changes_since`（数字游标补课闭环成立） |
+| B7/B8 | 每次调用 `ok:true`；只读调用允许 cursor 不变 |
+| B9 | `state_policy` 返回 `ok:true` + `pending_human_confirmation` + `draft_id`，不泄露 `policy_ref`/capability；人类在可见 UI 中核对并确认后才出现 human-attributed `POLICY_STATED`，agent 从该事件取得 `policy_ref`，cursor 才前进 |
+| B10 | `approve` 返回 `ok:true`，无需第二次弹窗；对应 `APPROVED` 事件的 `authorization.capability_ref` 匹配已确认 policy，且有非空唯一 `use_nonce`（原始 capability 不出现在工具结果/事件中）。若确实无 pending approval，标记 `skipped-no-pending` 并原样报告，不伪造 PASS |
+| B11 | 步骤 9 的 `POLICY_STATED` 与步骤 10 的 `APPROVED` 均出现在 `changes_since`（数字游标补课闭环成立） |
 | B12（加分） | 收到 `preview.op_token` + `blast_radius` 且未确认（两步协议在真 agent 手上成立） |
 
 任一 A 项失败或 B6/B7 失败 = C6 红灯，停止提交流程回报编排者。B8–B12 个别失败 = 黄灯，带原始错误回报判定。验证通过后：结果记入 PROGRESS.md 的 M0 ChatGPT 行并提交。
