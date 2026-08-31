@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "track/**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [server, bridge, app]
+    name: ${{ matrix.package }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ${{ matrix.package }}/pnpm-lock.yaml
+      - name: Install
+        working-directory: ${{ matrix.package }}
+        run: pnpm install --frozen-lockfile
+      # app's real-server regression spins up the actual server package in-process
+      - name: Install server deps for cross-package tests
+        if: matrix.package == 'app'
+        working-directory: server
+        run: pnpm install --frozen-lockfile
+      - name: Test
+        working-directory: ${{ matrix.package }}
+        run: pnpm test
+      - name: Build
+        working-directory: ${{ matrix.package }}
+        run: pnpm build
+      - name: Lint
+        if: matrix.package == 'app'
+        working-directory: app
+        run: pnpm lint
