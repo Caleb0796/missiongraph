@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  RegistrationScope,
   RegistryLifecycle,
   missionClientReadiness,
 } from '../src/webmcp/registry-lifecycle.ts'
@@ -241,4 +242,62 @@ test('mission-client readiness distinguishes ready and failed execution gates', 
     state: 'failed',
     error: failure,
   })
+})
+
+test('cleanup added after scope disposal executes immediately', async () => {
+  const scope = new RegistrationScope()
+  await scope.dispose()
+  let cleaned = false
+
+  scope.addCleanup(() => {
+    cleaned = true
+  })
+
+  assert.equal(cleaned, true)
+  await scope.dispose()
+})
+
+test('dispose during bootstrap serializes immediate reinitialization', async () => {
+  let releaseFirst
+  let signalFirst
+  const firstStarted = new Promise((resolve) => {
+    signalFirst = resolve
+  })
+  let calls = 0
+  let concurrency = 0
+  let maxConcurrency = 0
+  const active = new Set()
+  const lifecycle = new RegistryLifecycle({
+    getRuntime: () => ({}),
+    async bootstrap(_runtime, scope) {
+      calls++
+      const probe = `probe-${calls}`
+      concurrency++
+      maxConcurrency = Math.max(maxConcurrency, concurrency)
+      active.add(probe)
+      if (calls === 1) {
+        signalFirst()
+        await new Promise((resolve) => {
+          releaseFirst = resolve
+        })
+      }
+      scope.addCleanup(() => active.delete(probe))
+      concurrency--
+      return { namespace: 'document' }
+    },
+  })
+
+  const first = lifecycle.initialize()
+  await firstStarted
+  const disposal = lifecycle.dispose()
+  const reinitialized = lifecycle.initialize()
+  releaseFirst()
+  await disposal
+  await first
+  await reinitialized
+
+  assert.equal(maxConcurrency, 1)
+  assert.deepEqual([...active], ['probe-2'])
+  await lifecycle.dispose()
+  assert.deepEqual([...active], [])
 })

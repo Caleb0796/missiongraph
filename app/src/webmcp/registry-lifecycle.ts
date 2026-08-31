@@ -6,22 +6,45 @@ type Cleanup = () => Promise<void> | void
 
 export class RegistrationScope {
   private cleanups: Cleanup[] = []
+  private readonly runningCleanups = new Set<Promise<void>>()
+  private disposed = false
+  private failure: unknown
 
   addCleanup(cleanup: Cleanup) {
-    this.cleanups.push(cleanup)
+    if (!this.disposed) {
+      this.cleanups.push(cleanup)
+      return
+    }
+    void this.runCleanup(cleanup)
   }
 
   async dispose() {
+    this.disposed = true
     const cleanups = this.cleanups.splice(0).reverse()
-    let failure: unknown
     for (const cleanup of cleanups) {
-      try {
-        await cleanup()
-      } catch (error) {
-        failure ??= error
-      }
+      await this.runCleanup(cleanup)
     }
-    if (failure) throw failure
+    while (this.runningCleanups.size > 0) {
+      await Promise.all([...this.runningCleanups])
+    }
+    if (this.failure) throw this.failure
+  }
+
+  private runCleanup(cleanup: Cleanup) {
+    let result: Promise<void> | void
+    try {
+      result = cleanup()
+    } catch (error) {
+      this.failure ??= error
+      return Promise.resolve()
+    }
+    const running = Promise.resolve(result)
+      .catch((error: unknown) => {
+        this.failure ??= error
+      })
+      .finally(() => this.runningCleanups.delete(running))
+    this.runningCleanups.add(running)
+    return running
   }
 }
 
@@ -71,6 +94,7 @@ export class RegistryLifecycle<Runtime, Active extends object> {
   private readonly listeners = new Set<() => void>()
   private status: RegistryLifecycleStatus<Active> = { state: 'waiting' }
   private initialization: Promise<RegistryLifecycleStatus<Active>> | null = null
+  private disposal: Promise<void> | null = null
   private activeScope: RegistrationScope | null = null
   private pendingScope: RegistrationScope | null = null
   private pollTimer: ReturnType<typeof globalThis.setTimeout> | null = null
@@ -92,7 +116,10 @@ export class RegistryLifecycle<Runtime, Active extends object> {
     return () => this.listeners.delete(listener)
   }
 
-  initialize() {
+  initialize(): Promise<RegistryLifecycleStatus<Active>> {
+    if (this.disposal) {
+      return this.disposal.then(() => this.initialize())
+    }
     if (this.status.state === 'active' && this.initialization) {
       return this.initialization
     }
@@ -131,22 +158,43 @@ export class RegistryLifecycle<Runtime, Active extends object> {
     )
   }
 
-  async dispose() {
+  dispose() {
+    if (this.disposal) return this.disposal
+    const disposal = this.performDisposal().finally(() => {
+      if (this.disposal === disposal) this.disposal = null
+    })
+    this.disposal = disposal
+    return disposal
+  }
+
+  private async performDisposal() {
     this.generation++
     this.clearPoller()
     this.fastDelayIndex = 0
     this.pollElapsedMs = 0
-    this.initialization = null
+    const initialization = this.initialization
     const scopes = [this.pendingScope, this.activeScope].filter(
       (scope): scope is RegistrationScope => scope !== null,
     )
-    this.pendingScope = null
-    this.activeScope = null
-    const cleanupResults = await Promise.allSettled(
+    const initialCleanup = await Promise.allSettled(
       scopes.map((scope) => scope.dispose()),
     )
+    if (initialization) await Promise.allSettled([initialization])
+    const finalScopes = [
+      ...new Set(
+        [...scopes, this.pendingScope, this.activeScope].filter(
+          (scope): scope is RegistrationScope => scope !== null,
+        ),
+      ),
+    ]
+    const finalCleanup = await Promise.allSettled(
+      finalScopes.map((scope) => scope.dispose()),
+    )
+    if (this.initialization === initialization) this.initialization = null
+    this.pendingScope = null
+    this.activeScope = null
     this.setStatus({ state: 'waiting' })
-    const failed = cleanupResults.find(
+    const failed = [...initialCleanup, ...finalCleanup].find(
       (result): result is PromiseRejectedResult => result.status === 'rejected',
     )
     if (failed) throw failed.reason

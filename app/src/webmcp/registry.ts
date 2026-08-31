@@ -152,6 +152,13 @@ function errorShape(error: unknown) {
   if (error instanceof TransportError) {
     return { code: error.code, message: error.message }
   }
+  if (
+    error instanceof Error &&
+    'code' in error &&
+    typeof error.code === 'string'
+  ) {
+    return { code: error.code, message: error.message }
+  }
   if (error instanceof Error) {
     return { code: 'invalid_input', message: error.message }
   }
@@ -390,10 +397,17 @@ export async function refreshContextualTools(retryDegraded = false) {
 export async function disposeWebMcpRegistry() {
   unsubscribeContext?.()
   unsubscribeContext = null
-  dynamicController?.dispose()
+  const activeDynamicController = dynamicController
   dynamicController = null
   try {
-    await registryLifecycle.dispose()
+    const cleanupResults = await Promise.allSettled([
+      activeDynamicController?.dispose() ?? Promise.resolve(),
+      registryLifecycle.dispose(),
+    ])
+    const failed = cleanupResults.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    )
+    if (failed) throw failed.reason
   } finally {
     useMissionStore.getState().setContextualToolsDegraded(false)
     definitions = [helloMissionGraph]

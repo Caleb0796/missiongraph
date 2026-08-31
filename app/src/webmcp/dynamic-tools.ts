@@ -38,6 +38,8 @@ interface DynamicToolControllerOptions {
   onStatus?: (status: DynamicToolStatus) => void
 }
 
+const syncCancelled = Symbol('dynamic tool sync cancelled')
+
 function uniqueTools<T extends NamedTool>(tools: T[]) {
   return [...new Map(tools.map((tool) => [tool.name, tool])).values()]
 }
@@ -137,6 +139,10 @@ export class DynamicToolController<T extends NamedTool> {
   private readonly dynamicControllers = new Map<string, AbortController>()
   private readonly appliedTools = new Map<string, T>()
   private syncing: Promise<void> | null = null
+  private disposePromise: Promise<void> | null = null
+  private readonly retryCancellations = new Set<() => void>()
+  private generation = 0
+  private disposed = false
   private degraded = false
   private readonly target: DynamicRegistrationTarget<T>
   private readonly tier: DynamicRegistrationTier
@@ -163,6 +169,7 @@ export class DynamicToolController<T extends NamedTool> {
   }
 
   update(tools: T[], retryDegraded = false) {
+    if (this.disposed) return this.disposePromise ?? Promise.resolve()
     this.latest = uniqueTools(tools)
     this.requestedRevision++
     if (this.degraded && !retryDegraded) return Promise.resolve()
@@ -174,30 +181,56 @@ export class DynamicToolController<T extends NamedTool> {
   }
 
   dispose() {
-    this.dynamicControllers.forEach((controller) => controller.abort())
-    this.dynamicControllers.clear()
-    this.appliedTools.clear()
+    if (this.disposePromise) return this.disposePromise
+    this.disposed = true
+    this.generation++
+    this.retryCancellations.forEach((cancel) => cancel())
+    this.retryCancellations.clear()
+    this.disposePromise = this.finishDisposal()
+    return this.disposePromise
   }
 
   private startSync() {
-    this.syncing ??= this.sync().finally(() => {
-      this.syncing = null
+    if (this.syncing) return this.syncing
+    const generation = this.generation
+    const syncing = this.sync(generation).finally(() => {
+      if (this.syncing === syncing) this.syncing = null
     })
+    this.syncing = syncing
     return this.syncing
   }
 
-  private async sync() {
-    while (this.appliedRevision !== this.requestedRevision) {
+  private async finishDisposal() {
+    await this.syncing
+    this.dynamicControllers.forEach((controller) => controller.abort())
+    this.dynamicControllers.clear()
+    this.appliedTools.clear()
+    if (this.tier === 'provide-context') {
+      await this.target.provideContext?.({ tools: uniqueTools(this.coreTools) })
+    }
+  }
+
+  private isCurrent(generation: number) {
+    return !this.disposed && generation === this.generation
+  }
+
+  private async sync(generation: number) {
+    while (
+      this.isCurrent(generation) &&
+      this.appliedRevision !== this.requestedRevision
+    ) {
       const revision = this.requestedRevision
       const tools = this.latest
       const signature = tools.map((tool) => tool.name).join('\u0000')
       try {
         if (signature !== this.appliedSignature) {
-          await this.apply(tools)
+          await this.apply(tools, generation)
+          if (!this.isCurrent(generation)) return
           this.appliedSignature = signature
         }
         this.appliedRevision = revision
       } catch (error) {
+        if (error === syncCancelled || !this.isCurrent(generation)) return
         this.degraded = true
         this.appliedRevision = this.requestedRevision
         this.onStatus({ degraded: true, error })
@@ -206,29 +239,59 @@ export class DynamicToolController<T extends NamedTool> {
     }
   }
 
-  private async retry(operation: () => Promise<void> | void) {
+  private async retry(
+    operation: () => Promise<void> | void,
+    generation: number,
+  ) {
     let lastError: unknown
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
+      if (!this.isCurrent(generation)) throw syncCancelled
       try {
         await operation()
+        if (!this.isCurrent(generation)) throw syncCancelled
         return
       } catch (error) {
+        if (error === syncCancelled || !this.isCurrent(generation)) {
+          throw syncCancelled
+        }
         lastError = error
         if (attempt < this.maxAttempts) {
-          await this.delay(50 * 2 ** (attempt - 1))
+          await this.waitForRetry(50 * 2 ** (attempt - 1), generation)
         }
       }
     }
     throw lastError
   }
 
-  private async apply(tools: T[]) {
+  private waitForRetry(milliseconds: number, generation: number) {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false
+      const finish = (error?: unknown) => {
+        if (settled) return
+        settled = true
+        this.retryCancellations.delete(cancel)
+        if (error) reject(error)
+        else resolve()
+      }
+      const cancel = () => finish(syncCancelled)
+      this.retryCancellations.add(cancel)
+      void this.delay(milliseconds).then(
+        () => finish(),
+        (error: unknown) => finish(error),
+      )
+      if (!this.isCurrent(generation)) cancel()
+    })
+  }
+
+  private async apply(tools: T[], generation: number) {
     if (this.tier === 'none') return
     if (this.tier === 'provide-context') {
-      await this.retry(() =>
-        this.target.provideContext?.({
-          tools: uniqueTools([...this.coreTools, ...tools]),
-        }),
+      await this.retry(
+        () =>
+          this.target.provideContext?.({
+            tools: uniqueTools([...this.coreTools, ...tools]),
+          }),
+        generation,
       )
       return
     }
@@ -243,16 +306,23 @@ export class DynamicToolController<T extends NamedTool> {
     for (const tool of tools) {
       if (this.appliedTools.has(tool.name)) continue
       let registeredController: AbortController | null = null
-      await this.retry(async () => {
-        const controller = new AbortController()
-        try {
-          await this.target.registerTool(tool, { signal: controller.signal })
-          registeredController = controller
-        } catch (error) {
-          controller.abort()
-          throw error
-        }
-      })
+      await this.retry(
+        async () => {
+          const controller = new AbortController()
+          try {
+            await this.target.registerTool(tool, { signal: controller.signal })
+            if (!this.isCurrent(generation)) {
+              controller.abort()
+              throw syncCancelled
+            }
+            registeredController = controller
+          } catch (error) {
+            controller.abort()
+            throw error
+          }
+        },
+        generation,
+      )
       this.dynamicControllers.set(tool.name, registeredController!)
       this.appliedTools.set(tool.name, tool)
     }

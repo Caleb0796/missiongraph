@@ -293,3 +293,85 @@ test('fallback tier leaves its always-registered contextual surface untouched', 
   assert.equal(context.provided.length, 0)
   assert.deepEqual([...context.active], [])
 })
+
+test('dispose aborts a registration that completes after disposal starts', async () => {
+  let releaseRegistration
+  const active = new Set()
+  const statuses = []
+  const target = {
+    async registerTool(item, options) {
+      await new Promise((resolve) => {
+        releaseRegistration = resolve
+      })
+      active.add(item.name)
+      options.signal.addEventListener('abort', () => active.delete(item.name), {
+        once: true,
+      })
+    },
+  }
+  const controller = new DynamicToolController(
+    target,
+    'abort-controller',
+    [tool('core')],
+    { onStatus: (status) => statuses.push(status) },
+  )
+  const update = controller.update([tool('split_selected')])
+  await Promise.resolve()
+
+  const disposal = controller.dispose()
+  releaseRegistration()
+  await Promise.all([update, disposal])
+
+  assert.deepEqual([...active], [])
+  assert.deepEqual(statuses, [])
+})
+
+test('dispose cancels retry waits and clears late provide-context writes', async () => {
+  let releaseContext
+  let calls = 0
+  const provided = []
+  const target = {
+    registerTool() {},
+    async provideContext(context) {
+      calls++
+      if (calls === 1) {
+        await new Promise((resolve) => {
+          releaseContext = resolve
+        })
+      }
+      provided.push(context.tools.map((item) => item.name))
+    },
+  }
+  const controller = new DynamicToolController(
+    target,
+    'provide-context',
+    [tool('core')],
+  )
+  const update = controller.update([tool('split_selected')])
+  await Promise.resolve()
+
+  const disposal = controller.dispose()
+  releaseContext()
+  await Promise.all([update, disposal])
+
+  assert.deepEqual(provided, [['core', 'split_selected'], ['core']])
+
+  let retryAttempts = 0
+  const retrying = new DynamicToolController(
+    {
+      registerTool() {
+        retryAttempts++
+        throw new Error('retry me')
+      },
+    },
+    'abort-controller',
+    [tool('core')],
+    { delay: () => new Promise(() => undefined) },
+  )
+  const retryUpdate = retrying.update([tool('annotate_selected')])
+  await Promise.resolve()
+  await Promise.resolve()
+  await retrying.dispose()
+  await retryUpdate
+  assert.equal(retryAttempts, 1)
+})
