@@ -15,6 +15,7 @@ import {
   type Actor,
   type Event,
   type EventInput,
+  type ImportedEvent,
   type ReporterActor,
 } from "./events.js";
 import { fold, GraphValidationError } from "./reducer.js";
@@ -219,6 +220,33 @@ function remapPayload(value: unknown, ids: ReadonlyMap<string, string>, key?: st
   );
 }
 
+function seedImport(value: unknown): ImportedEvent[] {
+  const body = record(value, "body");
+  if (body.v !== 1) throw new EventValidationError("v must be 1");
+  if (!Array.isArray(body.events)) throw new EventValidationError("events must be an array");
+  let sourceProject: string | undefined;
+  return body.events.map((value, index) => {
+    const event = record(value, `events[${index}]`);
+    const allowedKeys = new Set(["seq", "project_id", "ts", "actor", "type", "payload", "idem_key"]);
+    const unexpected = Object.keys(event).find((key) => !allowedKeys.has(key));
+    if (unexpected) throw new EventValidationError(`events[${index}].${unexpected} is not an event field`);
+    if (event.seq !== index + 1) {
+      throw new EventValidationError(`events[${index}].seq must be ${index + 1}`);
+    }
+    if (typeof event.project_id !== "string" || event.project_id.length === 0) {
+      throw new EventValidationError(`events[${index}].project_id must not be empty`);
+    }
+    sourceProject ??= event.project_id;
+    if (event.project_id !== sourceProject) {
+      throw new EventValidationError(`events[${index}].project_id does not match the stream`);
+    }
+    if (typeof event.ts !== "string" || !Number.isFinite(Date.parse(event.ts))) {
+      throw new EventValidationError(`events[${index}].ts must be an ISO 8601 timestamp`);
+    }
+    return { input: parseEventInput(event), ts: event.ts };
+  });
+}
+
 function cloneInputs(events: readonly Event[], now: Date): { input: EventInput; ts: string }[] {
   const ids = collectIds(events);
   const latestTime = events.at(-1) ? Date.parse(events.at(-1)!.ts) : now.getTime();
@@ -238,7 +266,8 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
   if (!supervisorReporterToken) throw new Error("REPORTER_TOKEN is required");
   const now = options.now ?? (() => new Date());
   const id = options.id ?? randomUUID;
-  const seedProjectId = options.seedProjectId ?? process.env.SEED_PROJECT_ID ?? "demo-seed";
+  const configuredSeedProjectId = options.seedProjectId ?? process.env.SEED_PROJECT_ID;
+  const fixtureSeedProjectId = "demo-seed";
   const allowedOrigins = new Set(
     options.allowedOrigins ??
       (process.env.ALLOWED_ORIGINS ?? "")
@@ -388,14 +417,53 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     }
   });
 
+  app.get("/api/p/:project/export", async (request, reply) => {
+    const project = (request.params as { project: string }).project;
+    if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
+    try {
+      return reply.send({ v: 1, events: store.listEvents(project) });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/import-seed", async (request, reply) => {
+    const authorization = textHeader(request.headers.authorization);
+    const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
+    if (!sameSecret(bearer, supervisorReporterToken)) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    try {
+      const imported = seedImport(request.body);
+      const project = id();
+      const token = id();
+      const created = now().toISOString();
+      store.importProject(project, token, created, imported, { reporterToken: id() });
+      return reply.send({ project_id: project, token, cursor: String(imported.length) });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
   app.post("/api/clone-demo", async (_request, reply) => {
     const project = id();
     const token = id();
     const created = now();
     try {
-      const source = store.hasProject(seedProjectId) ? store.listEvents(seedProjectId) : [];
+      let sourceProjectId = fixtureSeedProjectId;
+      if (configuredSeedProjectId) {
+        if (store.hasProject(configuredSeedProjectId)) {
+          sourceProjectId = configuredSeedProjectId;
+        } else {
+          app.log.warn(
+            { seedProjectId: configuredSeedProjectId },
+            "Configured seed project is missing; falling back to the built-in fixture seed",
+          );
+        }
+      }
+      const source = store.hasProject(sourceProjectId) ? store.listEvents(sourceProjectId) : [];
       store.createProject(project, token, created.toISOString(), {
-        seedProjectId,
+        seedProjectId: sourceProjectId,
         reporterToken: id(),
       });
       for (const clone of cloneInputs(source, created)) {

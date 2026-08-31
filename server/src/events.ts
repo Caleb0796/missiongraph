@@ -482,6 +482,11 @@ export interface CreateProjectOptions {
   reporterToken?: string;
 }
 
+export interface ImportedEvent {
+  input: EventInput;
+  ts: string;
+}
+
 export interface CreatedProject extends Project {
   reporter_credential: ReporterCredential;
 }
@@ -641,6 +646,81 @@ export class EventStore {
       this.database.exec("ROLLBACK");
       throw error;
     }
+    return { ...project, reporter_credential: credential };
+  }
+
+  importProject(
+    id: string,
+    visitorToken: string,
+    createdAt: string,
+    imported: readonly ImportedEvent[],
+    options: CreateProjectOptions = {},
+  ): CreatedProject {
+    const project = {
+      id,
+      visitor_token: visitorToken,
+      created_at: createdAt,
+      seed_project_id: options.seedProjectId ?? null,
+    };
+    const credential = reporterCredential(
+      id,
+      "supervisor",
+      options.reporterToken ?? randomUUID(),
+      new Date(Date.parse(createdAt) + reporterCredentialLifetimeMs).toISOString(),
+    );
+    const idemKeys = new Set<string>();
+    const events = imported.map(({ input, ts }, index) => {
+      if (!Number.isFinite(Date.parse(ts))) throw new EventValidationError(`events[${index}].ts is invalid`);
+      if (idemKeys.has(input.idem_key)) {
+        throw new EventValidationError(`events[${index}].idem_key is duplicated`);
+      }
+      idemKeys.add(input.idem_key);
+      return {
+        seq: index + 1,
+        project_id: id,
+        ts,
+        ...input,
+      } as Event;
+    });
+    fold(events);
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          "INSERT INTO projects (id, visitor_token, created_at, seed_project_id) VALUES (?, ?, ?, ?)",
+        )
+        .run(project.id, project.visitor_token, project.created_at, project.seed_project_id);
+      this.database
+        .prepare(
+          "INSERT INTO reporter_credentials (token_hash, project_id, actor, expires_at) VALUES (?, ?, ?, ?)",
+        )
+        .run(reporterTokenHash(credential.token), credential.project_id, credential.actor, credential.expires_at);
+      const insert = this.database.prepare(
+        `INSERT INTO events
+          (project_id, seq, ts, actor, type, payload_json, node_ref, edge_ref, idem_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const event of events) {
+        const { nodeRef, edgeRef } = refs(event as EventInput);
+        insert.run(
+          event.project_id,
+          event.seq,
+          event.ts,
+          event.actor,
+          event.type,
+          JSON.stringify({ v: 1, data: event.payload }),
+          nodeRef,
+          edgeRef,
+          event.idem_key,
+        );
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    for (const event of events) this.events.emit("event", event);
     return { ...project, reporter_credential: credential };
   }
 
