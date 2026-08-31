@@ -12,6 +12,7 @@ interface PulseBarProps {
   onStartFreshMission: () => void
   onOpenStoredMission: () => void
   replaying: boolean
+  replayProgress: { step: number; total: number } | null
   connectionMode: ConnectionMode
   connectionMessage: string
   linkErrorHasStoredIdentity: boolean
@@ -39,6 +40,7 @@ export function PulseBar({
   onStartFreshMission,
   onOpenStoredMission,
   replaying,
+  replayProgress,
   connectionMode,
   connectionMessage,
   linkErrorHasStoredIdentity,
@@ -104,10 +106,11 @@ export function PulseBar({
           type="button"
           className="catch-up-chip"
           onClick={onCatchUp}
-          disabled={replaying}
         >
-          <span className="catch-up-count">6</span>
-          {replaying ? 'Replaying changes' : 'Since you left'}
+          <span className="catch-up-count">{replayProgress?.total ?? 6}</span>
+          {replaying && replayProgress
+            ? `Replaying changes · ${replayProgress.step}/${replayProgress.total}`
+            : 'Since you left'}
         </button>
         <div className={`live-indicator live-indicator--${connectionMode}`}>
           <span className="live-dot" />

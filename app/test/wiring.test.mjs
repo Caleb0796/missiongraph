@@ -409,6 +409,35 @@ test('M5 visual wiring exposes blast radius, relayout, split ancestry, and pause
   assert.match(canvas, /setLayoutRetry\(\(current\) => current \+ 1\)/)
 })
 
+test('canvas gates first paint and replays changes with visible cancellable pacing', async () => {
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  const pulse = await source('../src/components/PulseBar.tsx')
+  const styles = await source('../src/index.css')
+  assert.match(canvas, /const prelayout = layoutReadyFor\?\.projectId !== projectId/)
+  assert.match(canvas, /setLayoutReadyFor\(\{ projectId: scheduledProjectId \}\)/)
+  assert.match(canvas, /duration: firstLayout \? 0 : 520/)
+  assert.match(canvas, /canvas--prelayout/)
+  assert.match(styles, /canvas--prelayout \.react-flow__node \{ pointer-events: none; opacity: 0; \}/)
+  assert.match(styles, /canvas--prelayout \.mission-node--running::after \{ animation-play-state: paused; \}/)
+  const replay = canvas.slice(
+    canvas.indexOf('async function replayCatchUp()'),
+    canvas.indexOf('async function copyMissionLink()'),
+  )
+  assert.match(replay, /async function replayCatchUp\(\) \{\s*cancelReplay\(\)/)
+  assert.match(replay, /duration: reducedMotion \? 0 : 420/)
+  assert.match(replay, /await waitForReplay\(420\)/)
+  assert.match(replay, /await waitForReplay\(900\)/)
+  assert.match(canvas, /canvas--replaying/)
+  assert.match(canvas, /mission-flow-node--replay-focus/)
+  assert.match(styles, /canvas--replaying \.react-flow__node,/)
+  assert.match(styles, /mission-flow-node--replay-focus/)
+  assert.match(pulse, /Replaying changes · \$\{replayProgress\.step\}\/\$\{replayProgress\.total\}/)
+  assert.match(canvas, /onPointerDownCapture=\{cancelReplay\}/)
+  assert.match(canvas, /replayWaitCancel\.current\?\.\(\)/)
+  assert.match(canvas, /setViewport\(getViewport\(\), \{ duration: 0 \}\)/)
+  assert.doesNotMatch(pulse, /disabled=\{replaying\}/)
+})
+
 test('selection settling, project clearing, and cosmetic 409 handling preserve local intent', async () => {
   const store = await source('../src/store/mission-store.ts')
   const client = await source('../src/transport/client.ts')

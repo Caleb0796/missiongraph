@@ -142,8 +142,15 @@ function MissionBoard() {
     Record<string, { width: number; height: number }>
   >({})
   const [replaying, setReplaying] = useState(false)
+  const [replayProgress, setReplayProgress] = useState<{
+    step: number
+    total: number
+  } | null>(null)
   const [relayouting, setRelayouting] = useState(false)
   const [layoutRetry, setLayoutRetry] = useState(0)
+  const [layoutReadyFor, setLayoutReadyFor] = useState<{
+    projectId: string | null
+  } | null>(null)
   const [now, setNow] = useState(() => Date.now())
   const [firstRunOpen, setFirstRunOpen] = useState(false)
   const [firstRunMenuOpen, setFirstRunMenuOpen] = useState(false)
@@ -156,7 +163,11 @@ function MissionBoard() {
   } | null>(null)
   const relayoutTimer = useRef<number | null>(null)
   const layoutDebounce = useRef<number | null>(null)
-  const { fitView, setCenter } = useReactFlow<TaskFlowNode, Edge>()
+  const replayGeneration = useRef(0)
+  const replayActive = useRef(false)
+  const replayWaitCancel = useRef<(() => void) | null>(null)
+  const { fitView, getViewport, setCenter, setViewport } =
+    useReactFlow<TaskFlowNode, Edge>()
   const criticalPath = useMemo(
     () => getCriticalPath(nodes, edges),
     [edges, nodes],
@@ -168,6 +179,36 @@ function MissionBoard() {
         idleRadar(nodes, edges, readySince, correctedNow).map((node) => node.id),
       ),
     [correctedNow, edges, nodes, readySince],
+  )
+  const prelayout = layoutReadyFor?.projectId !== projectId
+
+  const cancelReplay = useCallback(() => {
+    if (!replayActive.current) return
+    replayActive.current = false
+    replayGeneration.current += 1
+    replayWaitCancel.current?.()
+    replayWaitCancel.current = null
+    void setViewport(getViewport(), { duration: 0 })
+    setHighlights([])
+    setReplayProgress(null)
+    setReplaying(false)
+  }, [getViewport, setHighlights, setViewport])
+
+  const waitForReplay = useCallback(
+    (duration: number) =>
+      new Promise<void>((resolve) => {
+        let timer = 0
+        const finish = () => {
+          window.clearTimeout(timer)
+          if (replayWaitCancel.current === finish) {
+            replayWaitCancel.current = null
+          }
+          resolve()
+        }
+        timer = window.setTimeout(finish, duration)
+        replayWaitCancel.current = finish
+      }),
+    [],
   )
 
   const flowEdges: Edge[] = useMemo(
@@ -220,7 +261,15 @@ function MissionBoard() {
             dragPositions[node.id] ??
             positions[node.id] ?? { x: (index % 3) * 320, y: Math.floor(index / 3) * 190 },
           selected: selectedId === node.id,
-          className: relayouting ? 'mission-flow-node--relayouting' : undefined,
+          className:
+            [
+              relayouting ? 'mission-flow-node--relayouting' : '',
+              replaying && highlightedIds.includes(node.id)
+                ? 'mission-flow-node--replay-focus'
+                : '',
+            ]
+              .filter(Boolean)
+              .join(' ') || undefined,
           ...(nodeDims[node.id] ? { measured: nodeDims[node.id] } : {}),
           data: {
             title: node.title,
@@ -266,6 +315,7 @@ function MissionBoard() {
       nodes,
       positions,
       relayouting,
+      replaying,
       readySince,
       selectedId,
       structuralPreview,
@@ -287,6 +337,7 @@ function MissionBoard() {
   }, [connectionMode, projectId])
 
   useEffect(() => {
+    cancelReplay()
     hasLaidOut.current = false
     layoutRequest.current = null
     const resetRelayouting = window.setTimeout(() => setRelayouting(false), 0)
@@ -299,7 +350,7 @@ function MissionBoard() {
       layoutDebounce.current = null
     }
     return () => window.clearTimeout(resetRelayouting)
-  }, [projectId])
+  }, [cancelReplay, projectId])
 
   useEffect(() => {
     if (connectionMode === 'loading' || nodes.length === 0) {
@@ -311,14 +362,12 @@ function MissionBoard() {
       .join(',')}`
     const firstLayout = !hasLaidOut.current
     if (
-      !firstLayout &&
       layoutRequest.current?.projectId === projectId &&
       layoutRequest.current.revision === topologyRevision &&
       layoutRequest.current.signature === signature
     ) {
       return
     }
-    hasLaidOut.current = true
     const scheduledRevision = topologyRevision
     const scheduledProjectId = projectId
     layoutRequest.current = {
@@ -349,10 +398,17 @@ function MissionBoard() {
         else relayoutPositions(positions)
         window.setTimeout(() => {
           if (isCurrentLayout()) {
-            void fitView({
+            const fitting = fitView({
               padding: 0.16,
-              duration: firstLayout ? 280 : 520,
+              duration: firstLayout ? 0 : 520,
             })
+            if (firstLayout) {
+              void fitting.then(() => {
+                if (!isCurrentLayout()) return
+                hasLaidOut.current = true
+                setLayoutReadyFor({ projectId: scheduledProjectId })
+              })
+            }
           }
         }, 0)
         if (relayoutTimer.current !== null) {
@@ -392,6 +448,11 @@ function MissionBoard() {
     () => () => {
       if (relayoutTimer.current !== null) window.clearTimeout(relayoutTimer.current)
       if (layoutDebounce.current !== null) window.clearTimeout(layoutDebounce.current)
+      replayActive.current = false
+      replayGeneration.current += 1
+      replayWaitCancel.current?.()
+      replayWaitCancel.current = null
+      useMissionStore.getState().setHighlights([])
     },
     [],
   )
@@ -473,8 +534,10 @@ function MissionBoard() {
   )
 
   async function replayCatchUp() {
-    if (replaying) return
-    setReplaying(true)
+    cancelReplay()
+    const generation = replayGeneration.current + 1
+    replayGeneration.current = generation
+    replayActive.current = true
     const reducedMotion = window.matchMedia(
       '(prefers-reduced-motion: reduce)',
     ).matches
@@ -486,21 +549,36 @@ function MissionBoard() {
       .filter((id, index, all) => all.indexOf(id) === index)
       .slice(-6)
 
-    for (const nodeId of recentNodeIds) {
+    setReplayProgress(
+      recentNodeIds.length > 0
+        ? { step: 1, total: recentNodeIds.length }
+        : null,
+    )
+    setReplaying(recentNodeIds.length > 0)
+
+    for (const [index, nodeId] of recentNodeIds.entries()) {
+      if (replayGeneration.current !== generation) return
+      setReplayProgress({ step: index + 1, total: recentNodeIds.length })
       setHighlights([nodeId])
       const point = positions[nodeId]
       if (point) {
         void setCenter(point.x + 122, point.y + 71, {
           zoom: 0.95,
-          duration: reducedMotion ? 0 : 240,
+          duration: reducedMotion ? 0 : 420,
         })
       }
       if (!reducedMotion) {
-        await new Promise((resolve) => window.setTimeout(resolve, 310))
+        await waitForReplay(420)
+        if (replayGeneration.current !== generation) return
+        await waitForReplay(900)
       }
     }
-    setHighlights([])
-    setReplaying(false)
+    if (replayGeneration.current === generation) {
+      replayActive.current = false
+      setHighlights([])
+      setReplayProgress(null)
+      setReplaying(false)
+    }
   }
 
   async function copyMissionLink() {
@@ -575,6 +653,7 @@ function MissionBoard() {
         onStartFreshMission={() => void startFreshMissionCopy()}
         onOpenStoredMission={() => void openStoredMission()}
         replaying={replaying}
+        replayProgress={replayProgress}
         connectionMode={connectionMode}
         connectionMessage={connectionMessage}
         linkErrorHasStoredIdentity={linkErrorHasStoredIdentity}
@@ -622,7 +701,10 @@ function MissionBoard() {
           </section>
         )}
       </div>
-      <div className="canvas-stage">
+      <div
+        className={`canvas-stage${prelayout ? ' canvas--prelayout' : ''}${replaying ? ' canvas--replaying' : ''}`}
+        onPointerDownCapture={cancelReplay}
+      >
         <ReactFlow<TaskFlowNode, Edge>
           nodes={flowNodes}
           edges={flowEdges}
