@@ -12,7 +12,11 @@ You are verifying a WebMCP-enabled web application called **MissionGraph** using
 
 ### Act 0 — environment gate (do this FIRST)
 
-State which application and browsing surface you are: you must be the **ChatGPT app's built-in browser** (the WebMCP Challenge's judging surface). If you are any other embedded browser — the Codex app, a generic webview, a headless fetch — STOP here and report only: `ENVIRONMENT MISMATCH: <what you are>`. Do not proceed to Act A, because a WebMCP-absent result from a non-ChatGPT surface is meaningless for this verification.
+Per OpenAI's site-tools documentation (learn.chatgpt.com/docs/webmcp), WebMCP in the ChatGPT/Codex desktop app's built-in browser requires ALL of: (a) the latest app version, (b) the conversation model set to **GPT-5.6 Sol or Terra** — **Luna has WebMCP disabled**, (c) **Settings > Browser > Permissions > "Enable site tools" turned ON**, (d) not an Enterprise/Edu workspace. Report which model you are running as and whether site tools are enabled. If any requirement is unmet, STOP and report only: `ENVIRONMENT NOT READY: <which requirement>`.
+
+### Act A′ — official Site tools panel (authoritative check)
+
+After opening `https://missiongraph.vercel.app/` in your browser, click **Site tools** in the browser's address bar. Report exactly what it shows: the tool count and read/write split (e.g. "3 read, 7 write tools"), and the first ten tool names listed under **Available site tools**. This panel is OpenAI's own verification surface and outranks the page's self-test.
 
 ### Act A — compatibility page self-test
 
