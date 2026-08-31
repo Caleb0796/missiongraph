@@ -612,6 +612,37 @@ export interface HumanCapabilityAudit {
   use_nonce: string;
 }
 
+interface HumanDraftRow {
+  id: string;
+  project_id: string;
+  session_id: string;
+  kind: "policy" | "action";
+  actions_json: string;
+  subject_hash: string;
+  display_text: string;
+  policy_text: string | null;
+  max_uses: number;
+  created_at: string;
+  expires_at: string;
+  confirmed_at: string | null;
+  denied_at: string | null;
+}
+
+interface HumanCapabilityRow {
+  ref: string;
+  project_id: string;
+  session_id: string;
+  kind: "policy" | "action";
+  actions_json: string;
+  subject_hash: string;
+  policy_text: string | null;
+  max_uses: number;
+  created_at: string;
+  expires_at: string;
+  confirmed_at: string;
+  request_origin: string;
+}
+
 export class CapabilityError extends Error {
   constructor(readonly code: string, message: string) {
     super(message);
@@ -1029,28 +1060,77 @@ export class EventStore {
     kind: "policy" | "action";
     confirmedAt: string;
     requestOrigin: string;
-    ref: string;
+    token: string;
+  }): HumanCapability {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const capability = this.confirmHumanDraftWithinTransaction(input);
+      this.database.exec("COMMIT");
+      return capability;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  confirmPolicyDraft(input: {
+    projectId: string;
+    sessionId: string;
+    draftId: string;
+    confirmedAt: string;
+    requestOrigin: string;
+    token: string;
+  }): { capability: HumanCapability; event: Event; duplicate: boolean } {
+    if (!this.hasProject(input.projectId)) throw new UnknownProjectError(input.projectId);
+    this.database.exec("BEGIN IMMEDIATE");
+    let result: { capability: HumanCapability; event: Event; duplicate: boolean };
+    try {
+      const capability = this.confirmHumanDraftWithinTransaction({
+        ...input,
+        kind: "policy",
+      });
+      const appended = this.appendWithinTransaction(
+        input.projectId,
+        {
+          actor: "human",
+          type: "POLICY_STATED",
+          payload: {
+            policy_ref: capability.ref,
+            text: capability.policy_text ?? "",
+            scope: "session",
+            session_id: input.sessionId,
+            allowed_actions: ["approve", "reject"],
+            max_uses: capability.max_uses,
+            expires_at: capability.expires_at,
+            confirmed_at: capability.confirmed_at,
+            request_origin: capability.request_origin,
+          },
+          idem_key: `policy-confirm:${input.draftId}`,
+        },
+        { sessionId: input.sessionId, ts: capability.confirmed_at },
+      );
+      result = { capability, ...appended };
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    if (!result.duplicate) this.events.emit("event", result.event);
+    return result;
+  }
+
+  private confirmHumanDraftWithinTransaction(input: {
+    projectId: string;
+    sessionId: string;
+    draftId: string;
+    kind: "policy" | "action";
+    confirmedAt: string;
+    requestOrigin: string;
     token: string;
   }): HumanCapability {
     const row = this.database
       .prepare("SELECT * FROM human_drafts WHERE id = ?")
-      .get(input.draftId) as
-      | {
-          id: string;
-          project_id: string;
-          session_id: string;
-          kind: "policy" | "action";
-          actions_json: string;
-          subject_hash: string;
-          display_text: string;
-          policy_text: string | null;
-          max_uses: number;
-          created_at: string;
-          expires_at: string;
-          confirmed_at: string | null;
-          denied_at: string | null;
-        }
-      | undefined;
+      .get(input.draftId) as HumanDraftRow | undefined;
     if (
       !row ||
       row.project_id !== input.projectId ||
@@ -1060,7 +1140,39 @@ export class EventStore {
       throw new CapabilityError("capability_invalid", "The confirmation draft does not belong to this project session.");
     }
     if (row.confirmed_at) {
-      throw new CapabilityError("capability_replayed", "This confirmation draft was already used.");
+      const existing = this.database
+        .prepare(
+          `SELECT ref, project_id, session_id, kind, actions_json, subject_hash, policy_text,
+                  max_uses, created_at, expires_at, confirmed_at, request_origin
+           FROM human_capabilities WHERE ref = ?`,
+        )
+        .get(input.draftId) as HumanCapabilityRow | undefined;
+      if (
+        !existing ||
+        existing.project_id !== input.projectId ||
+        existing.session_id !== input.sessionId ||
+        existing.kind !== input.kind
+      ) {
+        throw new CapabilityError("capability_replayed", "This confirmation draft was already used.");
+      }
+      this.database
+        .prepare("UPDATE human_capabilities SET token_hash = ? WHERE ref = ?")
+        .run(reporterTokenHash(input.token), existing.ref);
+      return {
+        ref: existing.ref,
+        token: input.token,
+        project_id: existing.project_id,
+        session_id: existing.session_id,
+        kind: existing.kind,
+        actions: JSON.parse(existing.actions_json) as HumanAction[],
+        subject_hash: existing.subject_hash,
+        ...(existing.policy_text === null ? {} : { policy_text: existing.policy_text }),
+        max_uses: existing.max_uses,
+        created_at: existing.created_at,
+        expires_at: existing.expires_at,
+        confirmed_at: existing.confirmed_at,
+        request_origin: existing.request_origin,
+      };
     }
     if (row.denied_at) {
       throw new CapabilityError("capability_denied", "This confirmation draft was denied.");
@@ -1069,7 +1181,7 @@ export class EventStore {
       throw new CapabilityError("capability_expired", "This confirmation draft expired.");
     }
     const capability: HumanCapability = {
-      ref: input.ref,
+      ref: input.draftId,
       token: input.token,
       project_id: row.project_id,
       session_id: row.session_id,
@@ -1083,43 +1195,36 @@ export class EventStore {
       confirmed_at: input.confirmedAt,
       request_origin: input.requestOrigin,
     };
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      const changed = this.database
-        .prepare(
-          "UPDATE human_drafts SET confirmed_at = ? WHERE id = ? AND confirmed_at IS NULL AND denied_at IS NULL",
-        )
-        .run(input.confirmedAt, row.id);
-      if (changed.changes !== 1) {
-        throw new CapabilityError("capability_replayed", "This confirmation draft was already used.");
-      }
-      this.database
-        .prepare(
-          `INSERT INTO human_capabilities
-            (ref, token_hash, project_id, session_id, kind, actions_json, subject_hash,
-             policy_text, max_uses, created_at, expires_at, confirmed_at, request_origin)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          capability.ref,
-          reporterTokenHash(capability.token),
-          capability.project_id,
-          capability.session_id,
-          capability.kind,
-          JSON.stringify(capability.actions),
-          capability.subject_hash,
-          capability.policy_text ?? null,
-          capability.max_uses,
-          capability.created_at,
-          capability.expires_at,
-          capability.confirmed_at,
-          capability.request_origin,
-        );
-      this.database.exec("COMMIT");
-    } catch (error) {
-      this.database.exec("ROLLBACK");
-      throw error;
+    const changed = this.database
+      .prepare(
+        "UPDATE human_drafts SET confirmed_at = ? WHERE id = ? AND confirmed_at IS NULL AND denied_at IS NULL",
+      )
+      .run(input.confirmedAt, row.id);
+    if (changed.changes !== 1) {
+      throw new CapabilityError("capability_replayed", "This confirmation draft was already used.");
     }
+    this.database
+      .prepare(
+        `INSERT INTO human_capabilities
+          (ref, token_hash, project_id, session_id, kind, actions_json, subject_hash,
+           policy_text, max_uses, created_at, expires_at, confirmed_at, request_origin)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        capability.ref,
+        reporterTokenHash(capability.token),
+        capability.project_id,
+        capability.session_id,
+        capability.kind,
+        JSON.stringify(capability.actions),
+        capability.subject_hash,
+        capability.policy_text ?? null,
+        capability.max_uses,
+        capability.created_at,
+        capability.expires_at,
+        capability.confirmed_at,
+        capability.request_origin,
+      );
     return capability;
   }
 
@@ -1151,10 +1256,6 @@ export class EventStore {
         "UPDATE human_drafts SET denied_at = ? WHERE id = ? AND confirmed_at IS NULL AND denied_at IS NULL",
       )
       .run(input.deniedAt, input.draftId);
-  }
-
-  revokeHumanCapability(ref: string): void {
-    this.database.prepare("DELETE FROM human_capabilities WHERE ref = ?").run(ref);
   }
 
   consumeHumanCapability(input: {
@@ -1259,47 +1360,7 @@ export class EventStore {
     this.database.exec("BEGIN IMMEDIATE");
     let result: { event: Event; duplicate: boolean };
     try {
-      const duplicate = this.database
-        .prepare("SELECT * FROM events WHERE project_id = ? AND idem_key = ?")
-        .get(projectId, input.idem_key) as EventRow | undefined;
-      if (duplicate) {
-        result = { event: decodeRow(duplicate), duplicate: true };
-      } else {
-        const currentSeq = this.latestSeq(projectId);
-        if (options.baseSeq !== undefined && options.baseSeq !== currentSeq) {
-          throw new StaleSequenceError(currentSeq);
-        }
-        const event = {
-          seq: currentSeq + 1,
-          project_id: projectId,
-          ts: options.ts ?? new Date().toISOString(),
-          ...input,
-        } as Event;
-        options.authorize?.();
-        reduceEvent(fold(this.listEvents(projectId)), event, {
-          ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
-          ...(options.trustedImport === true ? { replay: true } : {}),
-        });
-        const { nodeRef, edgeRef } = refs(input);
-        this.database
-          .prepare(
-            `INSERT INTO events
-              (project_id, seq, ts, actor, type, payload_json, node_ref, edge_ref, idem_key)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .run(
-            projectId,
-            event.seq,
-            event.ts,
-            event.actor,
-            event.type,
-            JSON.stringify({ v: 1, data: event.payload }),
-            nodeRef,
-            edgeRef,
-            event.idem_key,
-          );
-        result = { event, duplicate: false };
-      }
+      result = this.appendWithinTransaction(projectId, input, options);
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
@@ -1307,6 +1368,57 @@ export class EventStore {
     }
     if (!result.duplicate) this.events.emit("event", result.event);
     return result;
+  }
+
+  private appendWithinTransaction(
+    projectId: string,
+    input: EventInput,
+    options: {
+      baseSeq?: number;
+      ts?: string;
+      sessionId?: string;
+      trustedImport?: boolean;
+      authorize?: () => void;
+    } = {},
+  ): { event: Event; duplicate: boolean } {
+    const duplicate = this.database
+      .prepare("SELECT * FROM events WHERE project_id = ? AND idem_key = ?")
+      .get(projectId, input.idem_key) as EventRow | undefined;
+    if (duplicate) return { event: decodeRow(duplicate), duplicate: true };
+    const currentSeq = this.latestSeq(projectId);
+    if (options.baseSeq !== undefined && options.baseSeq !== currentSeq) {
+      throw new StaleSequenceError(currentSeq);
+    }
+    const event = {
+      seq: currentSeq + 1,
+      project_id: projectId,
+      ts: options.ts ?? new Date().toISOString(),
+      ...input,
+    } as Event;
+    options.authorize?.();
+    reduceEvent(fold(this.listEvents(projectId)), event, {
+      ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+      ...(options.trustedImport === true ? { replay: true } : {}),
+    });
+    const { nodeRef, edgeRef } = refs(input);
+    this.database
+      .prepare(
+        `INSERT INTO events
+          (project_id, seq, ts, actor, type, payload_json, node_ref, edge_ref, idem_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        projectId,
+        event.seq,
+        event.ts,
+        event.actor,
+        event.type,
+        JSON.stringify({ v: 1, data: event.payload }),
+        nodeRef,
+        edgeRef,
+        event.idem_key,
+      );
+    return { event, duplicate: false };
   }
 
   appendBatch(

@@ -465,46 +465,23 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     const confirmedAt = now().toISOString();
     try {
       const sessionId = requiredBrowserSession(store, request, project, confirmedAt);
-      const capability = store.confirmHumanDraft({
+      const result = store.confirmPolicyDraft({
         projectId: project,
         sessionId,
         draftId: draft,
-        kind: "policy",
         confirmedAt,
         requestOrigin: textHeader(request.headers.origin) ?? "same-origin",
-        ref: id(),
         token: id(),
       });
-      try {
-        const result = store.append(project, {
-          actor: "human",
-          type: "POLICY_STATED",
-          payload: {
-            policy_ref: capability.ref,
-            text: capability.policy_text ?? "",
-            scope: "session",
-            session_id: sessionId,
-            allowed_actions: ["approve", "reject"],
-            max_uses: capability.max_uses,
-            expires_at: capability.expires_at,
-            confirmed_at: capability.confirmed_at,
-            request_origin: capability.request_origin,
-          },
-          idem_key: `policy-confirm:${draft}`,
-        }, { sessionId, ts: confirmedAt });
-        return reply.send({
-          policy_ref: capability.ref,
-          capability: capability.token,
-          allowed_actions: capability.actions,
-          max_uses: capability.max_uses,
-          expires_at: capability.expires_at,
-          confirmed_at: capability.confirmed_at,
-          seq: result.event.seq,
-        });
-      } catch (error) {
-        store.revokeHumanCapability(capability.ref);
-        throw error;
-      }
+      return reply.send({
+        policy_ref: result.capability.ref,
+        capability: result.capability.token,
+        allowed_actions: result.capability.actions,
+        max_uses: result.capability.max_uses,
+        expires_at: result.capability.expires_at,
+        confirmed_at: result.capability.confirmed_at,
+        seq: result.event.seq,
+      });
     } catch (error) {
       return errorReply(error, reply);
     }
@@ -573,7 +550,6 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
         kind: "action",
         confirmedAt,
         requestOrigin: textHeader(request.headers.origin) ?? "same-origin",
-        ref: id(),
         token: id(),
       });
       return reply.send({
@@ -645,6 +621,19 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
         const authorize = action
           ? () => {
               const headers = capabilityHeaders(request);
+              if (action === "approve" || action === "reject") {
+                const approvalInput = inputs.find(
+                  (input) => input.type === "APPROVED" || input.type === "REJECTED",
+                );
+                const policyRef = approvalInput && "policy_ref" in approvalInput.payload
+                  ? approvalInput.payload.policy_ref
+                  : undefined;
+                if (policyRef !== headers.ref) {
+                  throw new EventValidationError(
+                    "payload.policy_ref must match the confirmed policy capability",
+                  );
+                }
+              }
               const verifiedSessionId = requiredBrowserSession(
                 store,
                 request,
@@ -678,6 +667,9 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
                   case "APPROVED":
                   case "REJECTED":
                     input.payload.authorization = authorization;
+                    if (input.type === "APPROVED" || input.type === "REJECTED") {
+                      input.payload.policy_ref = audit.ref;
+                    }
                 }
               }
             }

@@ -7,6 +7,11 @@ export interface DigestChange {
   actor: string;
   type: string;
   one_liner: string;
+  policy_ref?: string;
+  authorization?: {
+    capability_ref: string;
+    use_nonce: string;
+  };
 }
 
 export interface Digest {
@@ -162,12 +167,26 @@ export function buildDigest(state: GraphState, events: readonly Event[], since =
   const changes = events
     .filter((event) => event.seq > since)
     .slice(-50)
-    .map((event) => ({
-      seq: event.seq,
-      actor: event.actor,
-      type: event.type,
-      one_liner: oneLiner(event, state),
-    }));
+    .map((event): DigestChange => {
+      const change: DigestChange = {
+        seq: event.seq,
+        actor: event.actor,
+        type: event.type,
+        one_liner: oneLiner(event, state),
+      };
+      if (event.type === "POLICY_STATED") {
+        change.policy_ref = event.payload.policy_ref;
+      } else if (event.type === "APPROVED" || event.type === "REJECTED") {
+        const authorization = event.payload.authorization;
+        if (authorization) {
+          change.authorization = {
+            capability_ref: authorization.capability_ref,
+            use_nonce: authorization.use_nonce,
+          };
+        }
+      }
+      return change;
+    });
   return {
     summary: {
       counts_by_state: counts,

@@ -819,6 +819,147 @@ describe("HTTP and streaming contract", () => {
     expect(store.listEvents("project-b")).toHaveLength(projectBCount);
   });
 
+  it("binds an approval policy_ref to the exact consumed capability", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    seedPendingApproval(store, "project", "a");
+    const { grant: first } = await issuePolicy(app, {
+      project: "project",
+      token: "visitor-token",
+      session: "session-a",
+      proof: "proof-a",
+      text: "Approve green diffs.",
+    });
+    const { grant: second } = await issuePolicy(app, {
+      project: "project",
+      token: "visitor-token",
+      session: "session-a",
+      proof: "proof-a",
+      text: "Approve green diffs.",
+    });
+    const before = store.listEvents("project").length;
+    const mismatched = await app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": first.policy_ref,
+        "x-mg-capability": first.capability,
+        "x-mg-nonce": "same-text-use",
+      },
+      payload: {
+        type: "APPROVED",
+        payload: {
+          approval_id: "approval-a",
+          node_id: "a",
+          policy_ref: second.policy_ref,
+        },
+        idem_key: "mismatched-policy-ref",
+      },
+    });
+
+    expect(mismatched.statusCode).toBe(400);
+    expect(mismatched.json()).toMatchObject({ error: { code: "invalid_event" } });
+    expect(store.listEvents("project")).toHaveLength(before);
+    expect(
+      store.database
+        .prepare("SELECT 1 AS found FROM human_capability_uses WHERE nonce = ?")
+        .get("same-text-use"),
+    ).toBeUndefined();
+
+    const accepted = await app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": first.policy_ref,
+        "x-mg-capability": first.capability,
+        "x-mg-nonce": "same-text-use",
+      },
+      payload: {
+        type: "APPROVED",
+        payload: {
+          approval_id: "approval-a",
+          node_id: "a",
+          policy_ref: first.policy_ref,
+        },
+        idem_key: "matched-policy-ref",
+      },
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(store.listEvents("project").at(-1)?.payload).toMatchObject({
+      policy_ref: first.policy_ref,
+      authorization: { capability_ref: first.policy_ref, use_nonce: "same-text-use" },
+    });
+  });
+
+  it("atomically confirms policy drafts and safely rotates material on retry", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    const staged = await app.inject({
+      method: "POST",
+      url: "/api/p/project/policy-drafts",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+      },
+      payload: { text: "Approve green diffs." },
+    });
+    const { draft_id: draftId } = staged.json<{ draft_id: string }>();
+    const confirm = () =>
+      app.inject({
+        method: "POST",
+        url: `/api/p/project/policy-drafts/${draftId}/confirm`,
+        headers: {
+          "x-mg-token": "visitor-token",
+          "x-mg-session": "session-a",
+          "x-mg-session-proof": "proof-a",
+        },
+      });
+
+    store.database.exec(`
+      CREATE TRIGGER fail_policy_append
+      BEFORE INSERT ON events
+      WHEN NEW.type = 'POLICY_STATED'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected append failure');
+      END
+    `);
+    const failed = await confirm();
+    expect(failed.statusCode).toBe(500);
+    expect(
+      store.database
+        .prepare("SELECT confirmed_at FROM human_drafts WHERE id = ?")
+        .get(draftId),
+    ).toEqual({ confirmed_at: null });
+    expect(
+      store.database
+        .prepare("SELECT 1 AS found FROM human_capabilities WHERE ref = ?")
+        .get(draftId),
+    ).toBeUndefined();
+    expect(store.listEvents("project")).toEqual([]);
+
+    store.database.exec("DROP TRIGGER fail_policy_append");
+    const first = await confirm();
+    const second = await confirm();
+    const firstGrant = first.json<{ policy_ref: string; capability: string; seq: number }>();
+    const secondGrant = second.json<{ policy_ref: string; capability: string; seq: number }>();
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(secondGrant.policy_ref).toBe(firstGrant.policy_ref);
+    expect(secondGrant.seq).toBe(firstGrant.seq);
+    expect(secondGrant.capability).not.toBe(firstGrant.capability);
+    expect(store.listEvents("project").filter((event) => event.type === "POLICY_STATED")).toHaveLength(1);
+  });
+
   it("rejects modified, replayed, and exhausted policy grants without writes", async () => {
     const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
     store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
