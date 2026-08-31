@@ -1,7 +1,7 @@
 import { once } from "node:events";
 
 import WebSocket from "ws";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createServer, type MissionGraphServer, type ServerOptions } from "../src/http.js";
 import { baseHandoff } from "./fixtures.js";
@@ -157,7 +157,181 @@ describe("HTTP and streaming contract", () => {
     expect(store.listEvents("project")).toHaveLength(1);
   });
 
-  it("clones the seed stream with fresh project and node ids", async () => {
+  it("round-trips a reporter-exercised event stream through export and seed import", async () => {
+    let currentTime = new Date("2026-08-30T10:00:00.000Z");
+    const { app, store } = server({ now: () => currentTime });
+    store.createProject("real-project", "visitor-token", currentTime.toISOString());
+    store.append(
+      "real-project",
+      {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: {
+            id: "real-node",
+            title: "Run a real worker",
+            brief: "Capture genuine execution history.",
+            estimate_min: 10,
+            tags: ["seed"],
+            state: "queued",
+          },
+        },
+        idem_key: "real-task",
+      },
+      { ts: currentTime.toISOString() },
+    );
+    const report = (type: string, payload: Record<string, unknown>, idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/p/real-project/report",
+        headers: { authorization: "Bearer reporter-secret" },
+        payload: { actor: "supervisor", type, payload, idem_key: idemKey },
+      });
+    currentTime = new Date("2026-08-30T10:02:30.000Z");
+    expect(
+      (
+        await report(
+          "NODE_STATE_CHANGED",
+          { node_id: "real-node", from: "queued", to: "running", detail: "Real worker started." },
+          "real-running",
+        )
+      ).statusCode,
+    ).toBe(200);
+    currentTime = new Date("2026-08-30T10:07:45.000Z");
+    expect(
+      (
+        await report(
+          "HANDOFF_FILED",
+          {
+            node_id: "real-node",
+            handoff: { ...baseHandoff, summary: "Distinctive real-run seed handoff." },
+          },
+          "real-handoff",
+        )
+      ).statusCode,
+    ).toBe(200);
+
+    const unauthorized = await app.inject({ method: "GET", url: "/api/p/real-project/export" });
+    const exportedResponse = await app.inject({
+      method: "GET",
+      url: "/api/p/real-project/export",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+    const exported = exportedResponse.json<{ v: number; events: Record<string, unknown>[] }>();
+    const originalEvents = store.listEvents("real-project");
+    const fieldNames: string[] = [];
+    const collectFieldNames = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        for (const item of value) collectFieldNames(item);
+      } else if (typeof value === "object" && value !== null) {
+        for (const [key, child] of Object.entries(value)) {
+          fieldNames.push(key);
+          collectFieldNames(child);
+        }
+      }
+    };
+    collectFieldNames(exported);
+
+    const importedResponse = await app.inject({
+      method: "POST",
+      url: "/api/import-seed",
+      headers: { authorization: "Bearer reporter-secret" },
+      payload: exported,
+    });
+    const imported = importedResponse.json<{ project_id: string; token: string; cursor: string }>();
+    const importedEvents = store.listEvents(imported.project_id);
+    const relativeTimes = (events: { ts: string }[]) =>
+      events.map((event) => Date.parse(event.ts) - Date.parse(events[0]?.ts ?? event.ts));
+
+    expect(unauthorized.statusCode).toBe(401);
+    expect(exportedResponse.statusCode).toBe(200);
+    expect(exported).toEqual({ v: 1, events: originalEvents });
+    expect(fieldNames.filter((key) => /token|credential|authorization|secret/i.test(key))).toEqual([]);
+    expect(importedResponse.statusCode).toBe(200);
+    expect(imported).toMatchObject({ token: expect.any(String), cursor: String(originalEvents.length) });
+    expect(imported.project_id).not.toBe("real-project");
+    expect(imported.token).not.toBe("visitor-token");
+    expect(importedEvents).toHaveLength(originalEvents.length);
+    expect(importedEvents.map((event) => event.seq)).toEqual([1, 2, 3]);
+    expect(importedEvents.map((event) => event.type)).toEqual(originalEvents.map((event) => event.type));
+    expect(importedEvents.map((event) => event.actor)).toEqual(originalEvents.map((event) => event.actor));
+    expect(importedEvents.map((event) => event.ts)).toEqual(originalEvents.map((event) => event.ts));
+    expect(relativeTimes(importedEvents)).toEqual(relativeTimes(originalEvents));
+    expect(store.listEvents("real-project")).toEqual(originalEvents);
+    expect(store.tokenMatches(imported.project_id, imported.token)).toBe(true);
+  });
+
+  it("requires the supervisor bearer token to import a seed", async () => {
+    const { app } = server();
+    const withoutBearer = await app.inject({
+      method: "POST",
+      url: "/api/import-seed",
+      payload: { v: 1, events: [] },
+    });
+    const wrongBearer = await app.inject({
+      method: "POST",
+      url: "/api/import-seed",
+      headers: { authorization: "Bearer wrong" },
+      payload: { v: 1, events: [] },
+    });
+
+    expect(withoutBearer.statusCode).toBe(401);
+    expect(wrongBearer.statusCode).toBe(401);
+  });
+
+  it("rejects malformed seed streams without importing a project", async () => {
+    const { app, store } = server();
+    const validTask = {
+      seq: 1,
+      project_id: "source",
+      ts: "2026-08-30T10:00:00.000Z",
+      actor: "human",
+      type: "TASK_ADDED",
+      payload: {
+        node: {
+          id: "task-a",
+          title: "Task A",
+          brief: "Build A.",
+          estimate_min: 10,
+          tags: [],
+          state: "queued",
+        },
+      },
+      idem_key: "task-a",
+    };
+    const invalidEdge = {
+      seq: 2,
+      project_id: "source",
+      ts: "2026-08-30T10:01:00.000Z",
+      actor: "human",
+      type: "EDGE_ADDED",
+      payload: { edge_id: "edge-a-missing", upstream: "task-a", downstream: "missing", kind: "depends" },
+      idem_key: "edge-a-missing",
+    };
+    const malformed = [
+      { v: 2, events: [] },
+      { v: 1, events: {} },
+      { v: 1, events: [validTask, invalidEdge] },
+    ];
+    const before = (store.database.prepare("SELECT COUNT(*) AS count FROM projects").get() as { count: number }).count;
+    const responses = [];
+    for (const payload of malformed) {
+      responses.push(
+        await app.inject({
+          method: "POST",
+          url: "/api/import-seed",
+          headers: { authorization: "Bearer reporter-secret" },
+          payload,
+        }),
+      );
+    }
+    const after = (store.database.prepare("SELECT COUNT(*) AS count FROM projects").get() as { count: number }).count;
+
+    expect(responses.map((response) => response.statusCode)).toEqual([400, 400, 400]);
+    expect(after).toBe(before);
+  });
+
+  it("falls back to the built-in fixture seed when no seed project is configured", async () => {
     const { app, store } = server();
     store.createProject("demo-seed", "seed-token", "2026-08-30T10:00:00.000Z");
     store.append("demo-seed", {
@@ -182,6 +356,92 @@ describe("HTTP and streaming contract", () => {
     expect(body.cursor).toBe("1");
     expect(nodeIds).toHaveLength(1);
     expect(nodeIds).not.toContain("seed-node");
+  });
+
+  it("clones a configured real-run seed without changing the source project", async () => {
+    const { app, store } = server({
+      seedProjectId: "real-seed",
+      now: () => new Date("2026-08-30T12:00:00.000Z"),
+    });
+    store.createProject("demo-seed", "fixture-token", "2026-08-30T09:00:00.000Z");
+    store.append("demo-seed", {
+      actor: "human",
+      type: "JOURNAL_NOTE",
+      payload: { text: "Fixture-only marker." },
+      idem_key: "fixture-marker",
+    });
+    store.createProject("real-seed", "real-token", "2026-08-30T10:00:00.000Z");
+    store.append(
+      "real-seed",
+      {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: {
+            id: "real-node",
+            title: "Real worker task",
+            brief: "This task was completed by a real worker.",
+            estimate_min: 10,
+            tags: ["real-run"],
+            state: "running",
+          },
+        },
+        idem_key: "real-task",
+      },
+      { ts: "2026-08-30T10:00:00.000Z" },
+    );
+    store.append(
+      "real-seed",
+      {
+        actor: "worker:real-node",
+        type: "HANDOFF_FILED",
+        payload: {
+          node_id: "real-node",
+          handoff: { ...baseHandoff, summary: "Distinctive HANDOFF_FILED summary from a real run." },
+        },
+        idem_key: "real-handoff",
+      },
+      { ts: "2026-08-30T10:05:00.000Z" },
+    );
+    const sourceBefore = structuredClone(store.listEvents("real-seed"));
+
+    const clone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const body = clone.json<{ project: string }>();
+    const clonedEvents = store.listEvents(body.project);
+    const handoff = clonedEvents.find((event) => event.type === "HANDOFF_FILED");
+
+    expect(clone.statusCode).toBe(200);
+    expect(clonedEvents.map((event) => event.type)).toEqual(["TASK_ADDED", "HANDOFF_FILED"]);
+    expect(handoff).toMatchObject({
+      payload: { handoff: { summary: "Distinctive HANDOFF_FILED summary from a real run." } },
+    });
+    expect(store.getProject(body.project)?.seed_project_id).toBe("real-seed");
+    expect(store.listEvents("real-seed")).toEqual(sourceBefore);
+  });
+
+  it("warns and falls back to the fixture when the configured seed is missing", async () => {
+    const { app, store } = server({ seedProjectId: "missing-real-seed" });
+    const warning = vi.spyOn(app.log, "warn");
+    store.createProject("demo-seed", "fixture-token", "2026-08-30T10:00:00.000Z");
+    store.append("demo-seed", {
+      actor: "human",
+      type: "JOURNAL_NOTE",
+      payload: { text: "Fixture fallback marker." },
+      idem_key: "fixture-marker",
+    });
+
+    const clone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const body = clone.json<{ project: string }>();
+
+    expect(clone.statusCode).toBe(200);
+    expect(store.listEvents(body.project)).toMatchObject([
+      { type: "JOURNAL_NOTE", payload: { text: "Fixture fallback marker." } },
+    ]);
+    expect(store.getProject(body.project)?.seed_project_id).toBe("demo-seed");
+    expect(warning).toHaveBeenCalledWith(
+      { seedProjectId: "missing-real-seed" },
+      "Configured seed project is missing; falling back to the built-in fixture seed",
+    );
   });
 
   it("anchors the latest cloned seed event at clone time", async () => {
