@@ -12,7 +12,7 @@ Recording frame: the whole ChatGPT desktop window — agent conversation (left p
 
 ### 1. Agent catch-up — 0:20–1:00 (WebMCP Leverage)
 - **Action**: click a first-run chip to copy the prompt; tell the agent **"Catch me up on this mission."** Agent calls `graph_digest`; the camera lens follows its narration.
-- **VO**: "Watch this — I just ask my agent to catch me up. The page has already handed it twenty-plus tools through WebMCP — no extension, no copy-paste. And every answer comes with whatever changed while it was away, so it's never working from a stale picture."
+- **VO**: "Watch this — I just ask my agent to catch me up. The page has already handed it twenty-five always-on tools through WebMCP and can add any of five contextual tools as they become relevant — no extension, no copy-paste. And every answer comes with whatever changed while it was away, so it's never working from a stale picture."
 - **Must be in frame**: the agent's tool-call entries in the conversation pane.
 
 ### 2. Policy grant + live fleet — 1:00–1:55 (Execution + security)
@@ -33,7 +33,7 @@ Recording frame: the whole ChatGPT desktop window — agent conversation (left p
 ## Pre-flight checklist (recording day)
 
 1. ChatGPT app: model **GPT-5.6 Sol or Terra**; Settings → Browser → Permissions → **Enable site tools** ON.
-2. Open https://missiongraph.vercel.app in the built-in browser: no yellow banner; ask the agent to list its MissionGraph tools (expect 20+).
+2. Open https://missiongraph.vercel.app in the built-in browser: no yellow banner; ask the agent to list its MissionGraph tools (expect 25 always-on, with applicable tools drawn from a 5-tool contextual set).
 3. Local stack up for beats 2–3 (server + app + bridge; see SETUP.md); mission URL with project/token ready in a note to paste.
 4. macOS Do Not Disturb on; browser pane zoomed (Cmd+) until node labels are legible at 1080p; window ≈16:9.
 5. Record with QuickTime (or any screen recorder); one take per beat; retakes are cheap.

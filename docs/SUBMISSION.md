@@ -12,7 +12,7 @@ Parallel agent fleets are fast — and illegible. Linear chat loops are legible 
 MissionGraph is a live task-DAG canvas shared by three kinds of minds:
 
 - **You** drag, annotate, dispatch, and approve on the canvas.
-- **Your browser agent** (ChatGPT via WebMCP) plans missions onto the graph, narrates everything you missed, clears approval queues under policies you state in one sentence and visibly confirm (the agent cannot self-authorize — one confirmation mints a nonce-bound, multi-use grant, and every approval records the policy it cited), finds idle work, and re-engineers the graph mid-flight — through 26 WebMCP tools.
+- **Your browser agent** (ChatGPT via WebMCP) plans missions onto the graph, narrates everything you missed, clears approval queues under policies you state in one sentence and visibly confirm (the agent cannot self-authorize — one confirmation mints a nonce-bound, multi-use grant, and every approval records the policy it cited), finds idle work, and re-engineers the graph mid-flight — through 25 always-on WebMCP tools plus 5 contextual tools registered when selection or failure state makes them applicable.
 - **A real Codex worker fleet** executes tasks in isolated git worktrees, reporting lifecycle, logs, and structured handoffs through node-bound short-lived credentials, coordinated by a Codex supervisor whose every scheduling decision is a recorded, auditable turn.
 
 Three scenarios: S1 Genesis (co-planning a paragraph into a DAG), S2 Flight (co-supervision of live workers), S3 Rewire (recording a mid-flight split after previewing its stale/pausing-work blast radius, re-routing edges, and recomputing the critical path). A running worker keeps its original brief until it exits; the supervisor can then re-brief the idle thread.

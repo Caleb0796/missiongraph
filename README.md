@@ -20,7 +20,7 @@ Parallel agent fleets are fast — and illegible. A linear chat loop is legible 
  human ──── canvas UI (React Flow + elkjs) ────┐
                                                │ WS / HTTP (event-sourced)
  browser agent (ChatGPT / any WebMCP client)   │
-   └── 20+ WebMCP tools on document.modelContext ──► server (Node 22 · Fastify · SQLite)
+   └── 25 always-on + up to 5 contextual WebMCP tools ──► server (Node 22 · Fastify · SQLite)
                                                │      append-only event ledger
                                                │      fold reducer · digest ranking
  Codex fleet ── bridge daemon ── SSE + `codex exec resume`
