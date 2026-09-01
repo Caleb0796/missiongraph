@@ -33,7 +33,7 @@ import {
 import { SettledDebouncer } from './settled-debounce'
 import {
   LiveFleetCoordinator,
-  type FleetMetadata,
+  type FleetDispatchMetadata,
   type FleetRequestStatus,
 } from './fleet'
 
@@ -1112,11 +1112,11 @@ async function postMutation<T extends EvType>(
     context,
     'mutation result',
   )
-  await waitForSequence(result.seq, context)
   if (type === 'DISPATCHED') {
     const dispatched = payload as EventPayloadMap['DISPATCHED']
     void liveFleet.dispatch(dispatched.node_id)
   }
+  await waitForSequence(result.seq, context)
   return result.seq
 }
 
@@ -1575,8 +1575,8 @@ export function mutate<T extends EvType>(
   return executeSingleWithPresence(type, payload, actor, context)
 }
 
-export function fleetResultForDispatch(nodeId: string): Promise<FleetMetadata | null> {
-  return liveFleet.dispatch(nodeId)
+export function fleetResultForDispatch(nodeId: string): FleetDispatchMetadata | null {
+  return liveFleet.resultForDispatch(nodeId)
 }
 
 export function mountLiveFleet() {

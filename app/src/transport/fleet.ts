@@ -16,10 +16,23 @@ export interface FleetMetadata {
   position?: number
 }
 
+export interface FleetEnqueueError {
+  code: string
+  reason: string
+}
+
+export interface FleetRejection {
+  status: 'rejected'
+  error: FleetEnqueueError
+}
+
+export type FleetDispatchMetadata = FleetMetadata | FleetRejection
+
 export interface LiveFleetDisplay {
   nodeId: string
   phase: 'queued' | 'starting' | 'degraded'
   position?: number
+  error?: FleetEnqueueError
 }
 
 interface FleetSession {
@@ -59,16 +72,42 @@ interface ActiveFleetRequest {
 }
 
 export function liveFleetDisplayText(display: LiveFleetDisplay) {
-  if (display.phase === 'degraded') return LIVE_FLEET_BUSY_COPY
+  if (display.phase === 'degraded') {
+    if (display.error?.code === 'template_mismatch') {
+      return `Live fleet: task not eligible (${display.error.code}) — ${display.error.reason}`
+    }
+    if (
+      display.error?.code === 'fleet_daily_cap' ||
+      display.error?.code === 'fleet_project_cap'
+    ) {
+      return `Live fleet: capacity unavailable (${display.error.code}) — ${display.error.reason}`
+    }
+    return LIVE_FLEET_BUSY_COPY
+  }
   if (display.phase === 'starting') return 'Live fleet: worker starting'
   return `Live fleet: queued${display.position === undefined ? '' : ` (#${display.position})`}`
 }
 
 export function withFleetMetadata<T extends Record<string, unknown>>(
   data: T,
-  fleet: FleetMetadata | null,
-): T | (T & { fleet: FleetMetadata }) {
+  fleet: FleetDispatchMetadata | null,
+): T | (T & { fleet: FleetDispatchMetadata }) {
   return fleet ? { ...data, fleet } : data
+}
+
+function fleetEnqueueError(error: unknown): FleetEnqueueError {
+  const code =
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof error.code === 'string'
+      ? error.code
+      : 'fleet_unavailable'
+  const reason =
+    error instanceof Error
+      ? error.message
+      : 'The live fleet request could not be created.'
+  return { code, reason }
 }
 
 export function isFleetWorkerEvent(event: MissionEvent) {
@@ -90,7 +129,8 @@ export class LiveFleetCoordinator {
   private readonly cancel: NonNullable<FleetCoordinatorOptions['cancel']>
   private readonly pollMilliseconds: number
   private readonly statusBySession = new Map<string, Promise<FleetStatusResponse>>()
-  private readonly dispatches = new Map<string, Promise<FleetMetadata | null>>()
+  private readonly dispatches = new Map<string, Promise<FleetDispatchMetadata | null>>()
+  private readonly results = new Map<string, FleetDispatchMetadata | null>()
   private session: FleetSession | null = null
   private request: ActiveFleetRequest | null = null
   private timer: unknown = null
@@ -120,6 +160,7 @@ export class LiveFleetCoordinator {
     this.stop(true)
     this.session = session
     this.dispatches.clear()
+    this.results.clear()
     this.generation++
   }
 
@@ -130,6 +171,10 @@ export class LiveFleetCoordinator {
     const pending = this.startDispatch(nodeId)
     this.dispatches.set(nodeId, pending)
     return pending
+  }
+
+  resultForDispatch(nodeId: string) {
+    return this.results.get(nodeId) ?? null
   }
 
   noteLedgerEvent(event: MissionEvent) {
@@ -165,26 +210,44 @@ export class LiveFleetCoordinator {
     )
   }
 
-  private async startDispatch(nodeId: string): Promise<FleetMetadata | null> {
+  private async startDispatch(nodeId: string): Promise<FleetDispatchMetadata | null> {
     const session = this.session
     if (!session) return null
     const generation = this.generation
+    let status: FleetStatusResponse
     try {
-      const status = await this.probe(session)
-      if (!this.isCurrent(session, generation) || !status.enabled) return null
+      status = await this.probe(session)
+    } catch {
+      if (this.isCurrent(session, generation)) this.degrade(nodeId)
+      return null
+    }
+    if (!this.isCurrent(session, generation)) return null
+    if (!status.enabled) {
+      this.results.set(nodeId, null)
+      return null
+    }
+    try {
       const request = await this.transport.create(session, nodeId)
       if (!this.isCurrent(session, generation)) return null
       this.request = { id: request.id, nodeId }
       this.degradationShown = false
       this.showRequest(request, nodeId)
       this.schedulePoll(session, generation)
-      return {
+      const result: FleetMetadata = {
         status: request.status,
         ...(request.position === undefined ? {} : { position: request.position }),
       }
-    } catch {
-      if (this.isCurrent(session, generation)) this.degrade(nodeId)
-      return null
+      this.results.set(nodeId, result)
+      return result
+    } catch (error) {
+      if (!this.isCurrent(session, generation)) return null
+      const rejection: FleetRejection = {
+        status: 'rejected',
+        error: fleetEnqueueError(error),
+      }
+      this.results.set(nodeId, rejection)
+      this.degrade(nodeId, rejection.error)
+      return rejection
     }
   }
 
@@ -231,12 +294,12 @@ export class LiveFleetCoordinator {
     }
   }
 
-  private degrade(nodeId: string) {
+  private degrade(nodeId: string, error?: FleetEnqueueError) {
     this.clearTimer()
     this.request = null
     if (this.degradationShown) return
     this.degradationShown = true
-    this.onDisplay({ nodeId, phase: 'degraded' })
+    this.onDisplay({ nodeId, phase: 'degraded', ...(error ? { error } : {}) })
   }
 
   private clearTimer() {

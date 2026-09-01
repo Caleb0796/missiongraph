@@ -117,6 +117,27 @@ test('fleet-disabled dispatch is byte-compatible and caches the probe per sessio
   assert.deepEqual(calls, [['status', 'project-a', 'session-a']])
 })
 
+test('a hanging fleet probe cannot delay or change the dispatch tool result', () => {
+  const { coordinator } = harness({
+    status: () => new Promise(() => {}),
+  })
+  const current = {
+    summary: 'Dispatched “Task” to the Codex supervisor.',
+    node_id: 'node-a',
+    bypass_cap: true,
+  }
+  const before = JSON.stringify(current)
+
+  void coordinator.dispatch('node-a')
+  const result = withFleetMetadata(
+    current,
+    coordinator.resultForDispatch('node-a'),
+  )
+
+  assert.equal(result, current)
+  assert.equal(JSON.stringify(result), before)
+})
+
 test('fleet metadata is appended only when a request was created', () => {
   const data = { summary: 'dispatch succeeded', node_id: 'node-a' }
   assert.deepEqual(withFleetMetadata(data, { status: 'queued', position: 4 }), {
@@ -133,7 +154,10 @@ test('enqueue errors resolve without failing dispatch and show one honest line',
     transport: {
       status: async () => enabled,
       create: async () => {
-        throw new Error('429 fleet_daily_cap')
+        throw Object.assign(
+          new Error('The fleet has reached its daily request cap.'),
+          { code: 'fleet_daily_cap' },
+        )
       },
       get: async () => {
         throw new Error('not reached')
@@ -143,12 +167,63 @@ test('enqueue errors resolve without failing dispatch and show one honest line',
   })
   direct.activate({ project: 'project-a', token: 'token-a', sessionId: 'session-a' })
 
-  assert.equal(await direct.dispatch('node-a'), null)
-  assert.equal(await direct.dispatch('node-b'), null)
+  assert.deepEqual(await direct.dispatch('node-a'), {
+    status: 'rejected',
+    error: {
+      code: 'fleet_daily_cap',
+      reason: 'The fleet has reached its daily request cap.',
+    },
+  })
+  assert.deepEqual(await direct.dispatch('node-b'), {
+    status: 'rejected',
+    error: {
+      code: 'fleet_daily_cap',
+      reason: 'The fleet has reached its daily request cap.',
+    },
+  })
   assert.deepEqual(displays.filter(Boolean), [
-    { nodeId: 'node-a', phase: 'degraded' },
+    {
+      nodeId: 'node-a',
+      phase: 'degraded',
+      error: {
+        code: 'fleet_daily_cap',
+        reason: 'The fleet has reached its daily request cap.',
+      },
+    },
   ])
-  assert.equal(liveFleetDisplayText(displays.at(-1)), LIVE_FLEET_BUSY_COPY)
+  assert.match(liveFleetDisplayText(displays.at(-1)), /capacity unavailable/i)
+})
+
+test('template mismatch stays non-failing but is explicit in tool data and UI copy', async () => {
+  const reason = 'This dispatched task does not match the fleet template.'
+  const { coordinator, displays } = harness({
+    create: async () => {
+      throw Object.assign(new Error(reason), { code: 'template_mismatch' })
+    },
+  })
+  const current = {
+    summary: 'Dispatched “Task” to the Codex supervisor.',
+    node_id: 'node-a',
+    bypass_cap: true,
+  }
+
+  await coordinator.dispatch('node-a')
+  const result = withFleetMetadata(
+    current,
+    coordinator.resultForDispatch('node-a'),
+  )
+  const copy = liveFleetDisplayText(displays.at(-1))
+
+  assert.deepEqual(result, {
+    ...current,
+    fleet: {
+      status: 'rejected',
+      error: { code: 'template_mismatch', reason },
+    },
+  })
+  assert.match(copy, /not eligible/i)
+  assert.match(copy, /template_mismatch/)
+  assert.doesNotMatch(copy, /busy/i)
 })
 
 test('polling maps adopted and running states to worker starting every 10 seconds', async () => {
@@ -204,6 +279,25 @@ test('project switch cancels fleet polling and clears the old project status', a
   coordinator.activate({ project: 'project-b', token: 'token-b', sessionId: 'session-b' })
 
   assert.equal(timers.size, 0)
+  assert.equal(displays.at(-1), null)
+})
+
+test('stale in-flight fleet responses are ignored after a project switch', async () => {
+  let resolveStatus
+  const { calls, coordinator, displays } = harness({
+    status: () =>
+      new Promise((resolve) => {
+        resolveStatus = resolve
+      }),
+  })
+  const pending = coordinator.dispatch('node-a')
+
+  coordinator.activate({ project: 'project-b', token: 'token-b', sessionId: 'session-b' })
+  resolveStatus(enabled)
+  await pending
+
+  assert.deepEqual(calls, [])
+  assert.equal(coordinator.resultForDispatch('node-a'), null)
   assert.equal(displays.at(-1), null)
 })
 
