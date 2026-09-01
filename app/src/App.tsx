@@ -2,7 +2,11 @@ import { useEffect } from 'react'
 import { GraphCanvas } from './components/GraphCanvas'
 import { CompatPage } from './pages/CompatPage'
 import { ToolsPage } from './pages/ToolsPage'
-import { initializeMissionClient } from './transport/client'
+import {
+  initializeMissionClient,
+  mountLiveFleet,
+  unmountLiveFleet,
+} from './transport/client'
 import { initializeWebMcp } from './webmcp/registry'
 import {
   contextualMissionTools,
@@ -13,6 +17,7 @@ import {
 function App() {
   useEffect(() => {
     if (window.location.pathname !== '/compat') {
+      mountLiveFleet()
       const missionClientInitialization = initializeMissionClient()
       void initializeWebMcp(
         missionTools,
@@ -24,6 +29,7 @@ function App() {
       ).catch((error) => {
         console.error('[MissionGraph] WebMCP initialization failed.', error)
       })
+      return unmountLiveFleet
     }
   }, [])
 
