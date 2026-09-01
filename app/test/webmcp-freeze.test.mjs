@@ -263,3 +263,22 @@ test('policy handshake next steps name the exact follow-up calls and references'
     assert.match(description, /Precondition|No precondition/)
   }
 })
+
+test('list_ready returns client-estimated path distance in live and fixture modes', () => {
+  const start = toolsSource.indexOf("name: 'list_ready'")
+  const listReadySource = toolsSource.slice(
+    start,
+    toolsSource.indexOf("name: 'list_pending_approvals'", start),
+  )
+
+  assert.match(listReadySource, /remaining_path_min: remainingPath/)
+  assert.match(listReadySource, /slack_min: critical\.eta - remainingPath/)
+  assert.match(
+    listReadySource,
+    /projection: 'client estimate against the server critical path'/,
+  )
+  assert.doesNotMatch(
+    listReadySource,
+    /connectionMode === 'fixture'[\s\S]*remaining_path_min/,
+  )
+})

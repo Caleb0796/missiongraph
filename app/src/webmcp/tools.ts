@@ -887,28 +887,29 @@ const listReady: ToolDefinition = {
           getDisplayState(current, state.nodes, state.edges) === 'ready' &&
           !(current as TaskNode & { assigned?: boolean }).assigned,
       )
-      .map((current) => ({
-        id: current.id,
-        title: current.title,
-        idle_since:
-          state.readySince[current.id] ??
-          (current as TaskNode & { ready_since?: string }).ready_since ??
-          'just became ready',
-        on_critical_path: critical.nodeIds.includes(current.id),
-        ...(state.connectionMode === 'fixture'
-          ? {
-              remaining_path_min: remainingPathWeight(
-                current.id,
-                state.nodes,
-                state.edges,
-              ),
-              slack_min:
-                critical.eta -
-                remainingPathWeight(current.id, state.nodes, state.edges),
-              distance_source: 'fixture-local estimate',
-            }
-          : { distance_source: 'server critical-path membership' }),
-      }))
+      .map((current) => {
+        const remainingPath = remainingPathWeight(
+          current.id,
+          state.nodes,
+          state.edges,
+        )
+        return {
+          id: current.id,
+          title: current.title,
+          idle_since:
+            state.readySince[current.id] ??
+            (current as TaskNode & { ready_since?: string }).ready_since ??
+            'just became ready',
+          on_critical_path: critical.nodeIds.includes(current.id),
+          remaining_path_min: remainingPath,
+          slack_min: critical.eta - remainingPath,
+          distance_source:
+            state.connectionMode === 'fixture'
+              ? 'fixture-local estimate'
+              : 'client estimate against the server critical path',
+          projection: 'client estimate against the server critical path',
+        }
+      })
     return {
       data: {
         summary:
