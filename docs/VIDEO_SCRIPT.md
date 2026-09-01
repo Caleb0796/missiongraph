@@ -27,8 +27,8 @@ Recording frame: the whole ChatGPT desktop window — agent conversation (left p
 ### 4. Close — 2:35–3:00 (Impact)
 - **Screen**: open a node dossier (Brief / Handoff / Decisions) → timeline replay → hold on full graph + URL.
 - **VO**: "Everything you saw is one append-only ledger — every actor labeled, every decision auditable. The mission judges explore is a real run: real workers, real commits, real approvals. Supervision-by-exception for agent fleets — missiongraph.vercel.app, native in ChatGPT's browser."
-- **End card**: `missiongraph.vercel.app · 232 tests · CI · adversarially reviewed`
-  Use the count that matches what you actually ship: **232** with the judge-fleet branch merged (server 63 / bridge 74 / app 95), **162** without it (server 42 / bridge 42 / app 78). Re-run the three suites on recording day rather than trusting this line.
+- **End card**: `missiongraph.vercel.app · 251 tests · 19 fleet scenarios · live-fire arbitration · adversarially reviewed`
+  Measured 2026-09-01 on merged main (`cf9cdbf`): server 69 / bridge 77 / app 105 = **251**, plus the 19-scenario fleet contract stub and a real-codex arbitration PASS (sol/medium, full lifecycle + handoff + approval). Re-run the suites on recording day rather than trusting this line.
 
 ## Pre-flight checklist (recording day)
 
