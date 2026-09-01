@@ -296,7 +296,14 @@ describe("FleetAdoptionLoop", () => {
 
   it("places the server title and brief verbatim into the existing worker brief", () => {
     const prompt = adoptedWorkerBrief("node", "Title from server", "Brief from server\nwith details", "/repo");
-    expect(prompt).toContain("Task brief: Title from server\n\nBrief from server\nwith details\nTarget repository: /repo");
+    // Prompt fields are JSON-encoded so that no value can add lines to the prompt, but the text
+    // must still be the server's own title and brief rather than anything recomputed locally.
+    const briefLine = prompt.split("\n").find((line) => line.startsWith("Task brief: "));
+    expect(briefLine).toBeDefined();
+    expect(JSON.parse(briefLine!.slice("Task brief: ".length))).toBe(
+      "Title from server\n\nBrief from server\nwith details",
+    );
+    expect(prompt).toContain(`Target repository: ${JSON.stringify("/repo")}`);
   });
 
   it("does not poll while a flagship execution owns the global slot", async () => {
