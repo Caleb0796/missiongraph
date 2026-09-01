@@ -385,7 +385,7 @@ export function getBlastRadius(
   }
 }
 
-function isReadyUnassigned(
+export function isReadyUnassigned(
   node: TaskNode,
   nodes: TaskNode[],
   edges: GraphEdge[],

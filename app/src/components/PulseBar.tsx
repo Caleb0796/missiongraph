@@ -1,4 +1,4 @@
-import type { DisplayState } from '../model/graph'
+import { isReadyUnassigned, type DisplayState } from '../model/graph'
 import {
   selectReplaySequenceLength,
   useMissionStore,
@@ -50,8 +50,13 @@ export function PulseBar({
   linkErrorHasStoredIdentity,
   contextualToolsDegraded,
 }: PulseBarProps) {
+  const nodes = useMissionStore((state) => state.nodes)
+  const edges = useMissionStore((state) => state.edges)
   const replaySequenceLength = useMissionStore(selectReplaySequenceLength)
   const replayTotal = replayProgress?.total ?? replaySequenceLength
+  const readyCount = nodes.filter((node) =>
+    isReadyUnassigned(node, nodes, edges),
+  ).length
 
   return (
     <header className="pulse-bar">
@@ -87,7 +92,7 @@ export function PulseBar({
             {eta} min
           </strong>
         </div>
-        <Stat label="Ready" value={counts.ready} tone="bg-blue-400" />
+        <Stat label="Ready" value={readyCount} tone="bg-blue-400" />
         <Stat label="Running" value={counts.running} tone="bg-cyan-400" />
         <Stat label="Paused" value={counts.paused} tone="bg-sky-300" />
         <Stat label="Review" value={counts.review} tone="bg-amber-300" />

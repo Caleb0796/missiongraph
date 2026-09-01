@@ -350,6 +350,23 @@ test('pulse reports paused workers from visitor clones', async () => {
   assert.match(pulse, /<Stat label="Paused" value=\{counts\.paused\}/)
 })
 
+test('assigned ready tasks cannot be dispatched twice', async () => {
+  const inspector = await source('../src/components/Inspector.tsx')
+  const card = await source('../src/components/TaskNodeCard.tsx')
+  const pulse = await source('../src/components/PulseBar.tsx')
+  const graph = await source('../src/model/graph.ts')
+  const dispatchButton = inspector.slice(
+    inspector.indexOf('onClick={() => dispatch(node.id)}') - 260,
+    inspector.indexOf('onClick={() => dispatch(node.id)}') + 180,
+  )
+  assert.match(dispatchButton, /runtimeNode\?\.assigned/)
+  assert.match(dispatchButton, /Queued for worker/)
+  assert.match(card, /data\.displayState === 'ready' && assigned/)
+  assert.match(card, />queued</)
+  assert.match(pulse, /value=\{readyCount\}/)
+  assert.match(graph, /export function isReadyUnassigned/)
+})
+
 test('judge first-run prompts and WebMCP guidance are wired into the canvas', async () => {
   const canvas = await source('../src/components/GraphCanvas.tsx')
   const pulse = await source('../src/components/PulseBar.tsx')
