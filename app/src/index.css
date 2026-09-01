@@ -355,6 +355,29 @@ a:focus-visible {
 
 .canvas-legend span { display: flex; align-items: center; gap: 6px; }
 
+.replay-caption {
+  position: absolute;
+  z-index: 7;
+  bottom: 18px;
+  left: 50%;
+  display: flex;
+  width: min(560px, calc(100% - 32px));
+  align-items: baseline;
+  gap: 9px;
+  pointer-events: none;
+  border: 1px solid #396775;
+  border-radius: 8px;
+  background: rgb(10 27 35 / 94%);
+  padding: 9px 12px;
+  color: #b8d9dd;
+  box-shadow: 0 12px 34px rgb(0 0 0 / 38%);
+  font-size: 11px;
+  line-height: 1.45;
+  transform: translateX(-50%);
+}
+
+.replay-caption strong { flex: 0 0 auto; color: #72d0dc; font-size: 10.5px; text-transform: uppercase; }
+
 .flight-panel {
   position: absolute;
   z-index: 6;

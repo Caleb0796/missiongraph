@@ -21,6 +21,7 @@ import {
 } from 'react'
 import '@xyflow/react/dist/style.css'
 import {
+  describeEvent,
   getCriticalPath,
   getDisplayState,
   getEventNodeId,
@@ -29,6 +30,7 @@ import {
   isSplitParent,
   type DisplayState,
 } from '../model/graph'
+import type { Actor } from '../model/types'
 import { useMissionStore } from '../store/mission-store'
 import {
   copyCurrentMissionLink,
@@ -60,6 +62,13 @@ const AGENT_PROMPTS = [
   'Ask it to clear the approval queue under a policy you state',
   'Split the rate-limit task into config and enforcement halves — show me the blast radius first.',
 ] as const
+
+function replayActorLabel(actor: Actor) {
+  if (actor === 'human') return 'You'
+  if (actor === 'browser_agent') return 'Your agent'
+  if (actor === 'supervisor') return 'Supervisor'
+  return 'Worker'
+}
 
 async function createLayout(nodeIds: string[], edges: Edge[]) {
   const graph = await elk.layout({
@@ -146,6 +155,10 @@ function MissionBoard() {
     step: number
     total: number
   } | null>(null)
+  const [replayCaption, setReplayCaption] = useState<{
+    actor: string
+    description: string
+  } | null>(null)
   const [relayouting, setRelayouting] = useState(false)
   const [layoutRetry, setLayoutRetry] = useState(0)
   const [layoutReadyFor, setLayoutReadyFor] = useState<{
@@ -194,6 +207,7 @@ function MissionBoard() {
     void setViewport(getViewport(), { duration: 0 })
     setHighlights([])
     setReplayProgress(null)
+    setReplayCaption(null)
     setReplaying(false)
   }, [getViewport, setHighlights, setViewport])
 
@@ -576,26 +590,38 @@ function MissionBoard() {
     const reducedMotion = window.matchMedia(
       '(prefers-reduced-motion: reduce)',
     ).matches
-    const recentNodeIds = events
+    const replaySteps = events
       .filter((event) => !['NODE_MOVED', 'SELECTION_CHANGED'].includes(event.type))
       .slice(-12)
-      .map((event) => getEventNodeId(event, edges))
-      .filter((id): id is string => Boolean(id))
-      .filter((id, index, all) => all.indexOf(id) === index)
+      .flatMap((event) => {
+        const nodeId = getEventNodeId(event, edges)
+        return nodeId
+          ? [{
+              nodeId,
+              actor: replayActorLabel(event.actor),
+              description: describeEvent(event, nodes, edges),
+            }]
+          : []
+      })
+      .filter(
+        (step, index, all) =>
+          all.findIndex((candidate) => candidate.nodeId === step.nodeId) === index,
+      )
       .slice(-6)
 
     setReplayProgress(
-      recentNodeIds.length > 0
-        ? { step: 1, total: recentNodeIds.length }
+      replaySteps.length > 0
+        ? { step: 1, total: replaySteps.length }
         : null,
     )
-    setReplaying(recentNodeIds.length > 0)
+    setReplaying(replaySteps.length > 0)
 
-    for (const [index, nodeId] of recentNodeIds.entries()) {
+    for (const [index, step] of replaySteps.entries()) {
       if (replayGeneration.current !== generation) return
-      setReplayProgress({ step: index + 1, total: recentNodeIds.length })
-      setHighlights([nodeId])
-      const point = positions[nodeId]
+      setReplayProgress({ step: index + 1, total: replaySteps.length })
+      setReplayCaption({ actor: step.actor, description: step.description })
+      setHighlights([step.nodeId])
+      const point = positions[step.nodeId]
       if (point) {
         void setCenter(point.x + 122, point.y + 71, {
           zoom: 0.95,
@@ -612,6 +638,7 @@ function MissionBoard() {
       replayActive.current = false
       setHighlights([])
       setReplayProgress(null)
+      setReplayCaption(null)
       setReplaying(false)
     }
   }
@@ -790,6 +817,12 @@ function MissionBoard() {
           />
           <Controls showInteractive={false} position="bottom-left" />
         </ReactFlow>
+        {replayCaption && (
+          <div className="replay-caption" role="status">
+            <strong>{replayCaption.actor}</strong>
+            <span>{replayCaption.description}</span>
+          </div>
+        )}
         <div className="canvas-legend">
           <span><i className="legend-line legend-line--critical" />Critical path</span>
           <span><i className="legend-line legend-line--conflict" />File conflict</span>
