@@ -208,6 +208,16 @@ test('confirmation metadata wraps without sharing the action row layout', async 
   assert.doesNotMatch(styles, /\.structural-confirm > div \{/)
 })
 
+test('judge-facing stylesheet text never drops below 10px', async () => {
+  const styles = await source('../src/index.css')
+  const undersized = [...styles.matchAll(/font-size: ([0-9.]+)px/g)]
+    .map((match) => Number(match[1]))
+    .filter((size) => size < 10)
+  assert.deepEqual(undersized, [])
+  assert.match(styles, /\.approval-facts \{[^}]*font-size: 10\.5px;/)
+  assert.match(styles, /\.structural-confirm-token \{[^}]*font-size: 10\.5px;/)
+})
+
 test('confirmation dialogs are named, described, focused, and escape-dismissible', async () => {
   const canvas = await source('../src/components/GraphCanvas.tsx')
   assert.equal(canvas.match(/aria-labelledby="confirmation-title"/g)?.length, 2)
