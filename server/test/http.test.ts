@@ -1760,6 +1760,138 @@ describe("HTTP and streaming contract", () => {
     }
   });
 
+  it("locks a filed handoff while its approval is pending and unlocks it after rejection", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.issueReporterCredential("project", "worker:a", "2026-08-30T10:00:00.000Z", "worker-a-token");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    store.append("project", {
+      actor: "human",
+      type: "TASK_ADDED",
+      payload: {
+        node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+      },
+      idem_key: "add-a",
+    });
+    const workerReport = (type: string, payload: Record<string, unknown>, idemKey: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: "Bearer worker-a-token" },
+      payload: { actor: "worker:a", type, payload, idem_key: idemKey },
+    });
+    const supervisorReport = (type: string, payload: Record<string, unknown>, idemKey: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: "Bearer reporter-secret" },
+      payload: { actor: "supervisor", type, payload, idem_key: idemKey },
+    });
+    await workerReport(
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "queued", to: "running" },
+      "a-running",
+    );
+    const originalHandoff = { ...baseHandoff, summary: "Original evidence for approval." };
+    const replacementHandoff = { ...baseHandoff, summary: "Replacement evidence after approval creation." };
+    const filed = await workerReport(
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: originalHandoff },
+      "a-handoff",
+    );
+    const approval = await supervisorReport(
+      "APPROVAL_CREATED",
+      {
+        approval_id: "approval-a",
+        node_id: "a",
+        summary: "Approve the original evidence.",
+        diff_stats: { lines_added: 12, lines_removed: 3, files: ["src/a.ts"] },
+        tests: "green",
+      },
+      "approval-a",
+    );
+    const replacement = await workerReport(
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: replacementHandoff },
+      "a-handoff-replacement",
+    );
+    const originalRetry = await workerReport(
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: originalHandoff },
+      "a-handoff",
+    );
+    const lockedSnapshot = await app.inject({
+      method: "GET",
+      url: "/api/p/project/snapshot",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect([filed.statusCode, approval.statusCode]).toEqual([200, 200]);
+    expect(replacement.statusCode).toBe(409);
+    expect(replacement.json()).toMatchObject({
+      error: { code: "handoff_locked_by_pending_approval" },
+    });
+    expect(originalRetry.json()).toEqual(filed.json());
+    expect(lockedSnapshot.json()).toMatchObject({
+      state: {
+        handoffs: { a: { summary: "Original evidence for approval." } },
+        approvals: {
+          "approval-a": {
+            status: "pending",
+            summary: "Approve the original evidence.",
+            diff_stats: { lines_added: 12, lines_removed: 3, files: ["src/a.ts"] },
+            tests: "green",
+          },
+        },
+      },
+    });
+
+    const { grant } = await issuePolicy(app, {
+      project: "project",
+      token: "visitor-token",
+      session: "session-a",
+      proof: "proof-a",
+    });
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": grant.policy_ref,
+        "x-mg-capability": grant.capability,
+        "x-mg-nonce": "reject-a",
+      },
+      payload: {
+        type: "REJECTED",
+        payload: {
+          approval_id: "approval-a",
+          node_id: "a",
+          policy_ref: grant.policy_ref,
+          reason: "Revise the handoff.",
+        },
+        idem_key: "rejected-a",
+      },
+    });
+    const replacementAfterRejection = await workerReport(
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: replacementHandoff },
+      "a-handoff-replacement",
+    );
+    const unlockedSnapshot = await app.inject({
+      method: "GET",
+      url: "/api/p/project/snapshot",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect([rejected.statusCode, replacementAfterRejection.statusCode]).toEqual([200, 200]);
+    expect(unlockedSnapshot.json()).toMatchObject({
+      state: {
+        handoffs: { a: { summary: "Replacement evidence after approval creation." } },
+        approvals: { "approval-a": { status: "rejected", reason: "Revise the handoff." } },
+      },
+    });
+  });
+
   it("binds worker reporter events to the credential node", async () => {
     const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
     store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");

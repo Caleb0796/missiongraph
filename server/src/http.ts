@@ -264,23 +264,37 @@ const workerStateTransitions = new Set([
   "running->failed",
 ]);
 
-function validateReporterTransition(input: EventInput): void {
-  if (input.type !== "NODE_STATE_CHANGED") return;
-  if (input.payload.to === "done") {
-    throw new IngressPolicyError(
-      403,
-      "transition_not_permitted_for_actor",
-      "Nodes may reach done only through an APPROVED event.",
-    );
+function validateReporterIngress(events: readonly Event[], input: EventInput): void {
+  if (input.type === "NODE_STATE_CHANGED") {
+    if (input.payload.to === "done") {
+      throw new IngressPolicyError(
+        403,
+        "transition_not_permitted_for_actor",
+        "Nodes may reach done only through an APPROVED event.",
+      );
+    }
+    if (input.actor.startsWith("worker:")) {
+      const transition = `${input.payload.from}->${input.payload.to}`;
+      if (!workerStateTransitions.has(transition)) {
+        throw new IngressPolicyError(
+          403,
+          "transition_not_permitted_for_actor",
+          `Worker actors may not report ${transition} transitions.`,
+        );
+      }
+    }
   }
-  if (!input.actor.startsWith("worker:")) return;
-  const transition = `${input.payload.from}->${input.payload.to}`;
-  if (!workerStateTransitions.has(transition)) {
-    throw new IngressPolicyError(
-      403,
-      "transition_not_permitted_for_actor",
-      `Worker actors may not report ${transition} transitions.`,
+  if (input.type === "HANDOFF_FILED") {
+    const hasPendingApproval = Object.values(fold(events).approvals).some(
+      (approval) => approval.node_id === input.payload.node_id && approval.status === "pending",
     );
+    if (hasPendingApproval) {
+      throw new IngressPolicyError(
+        409,
+        "handoff_locked_by_pending_approval",
+        "The handoff cannot change while an approval is pending; reject the approval first.",
+      );
+    }
   }
 }
 
@@ -921,7 +935,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       }
       const events = store.listEvents(project);
       if (!events.some((event) => event.idem_key === input.idem_key)) {
-        validateReporterTransition(input);
+        validateReporterIngress(events, input);
       }
       const result = store.append(project, input, { ts: reportTime.toISOString() });
       return reply.send({ seq: result.event.seq });
