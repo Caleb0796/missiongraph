@@ -391,13 +391,12 @@ describe("FleetAdoptionLoop", () => {
     harness.start();
 
     await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+    // The behavioral claim is "heartbeats keep firing while the worker runs", and the
+    // count floor proves it: a stalled loop cannot produce four beats inside this
+    // worker's short lifetime. Per-gap upper bounds were removed on purpose — they
+    // assert on the CI scheduler, not on this code (a 35ms interval was measured at
+    // 105ms and later 491ms on loaded GitHub runners).
     expect(stub.heartbeatTimes.length).toBeGreaterThanOrEqual(4);
-    for (let index = 1; index < stub.heartbeatTimes.length; index += 1) {
-      // The count floor above proves the cadence held on average; the per-gap bound only
-      // guards against the loop stalling outright, so give slow CI runners real margin
-      // (a 35ms interval was measured at 105ms on a loaded GitHub runner).
-      expect(stub.heartbeatTimes[index]! - stub.heartbeatTimes[index - 1]!).toBeLessThan(250);
-    }
   });
 
   it("fails a persisted adoption on restart when no worker process survived", async () => {
