@@ -2374,6 +2374,81 @@ describe("HTTP and streaming contract", () => {
     }
   });
 
+  it("defaults fleet mode off when FLEET_MODE is absent", async () => {
+    const previous = process.env.FLEET_MODE;
+    delete process.env.FLEET_MODE;
+    try {
+      const { app, store } = server();
+      store.createProject("project", "visitor-token", "2026-08-30T09:30:00.000Z");
+      const status = await app.inject({
+        method: "GET",
+        url: "/api/p/project/fleet-status",
+        headers: { "x-mg-token": "visitor-token" },
+      });
+      const disabled = await Promise.all([
+        app.inject({
+          method: "POST",
+          url: "/api/p/project/fleet-requests",
+          headers: { "x-mg-token": "visitor-token" },
+          payload: { node_id: "task" },
+        }),
+        app.inject({
+          method: "GET",
+          url: "/api/p/project/fleet-requests/request",
+          headers: { "x-mg-token": "visitor-token" },
+        }),
+        app.inject({ method: "POST", url: "/api/fleet/next", headers: { "x-mg-reporter": "reporter-secret" } }),
+        app.inject({
+          method: "POST",
+          url: "/api/fleet/request/heartbeat",
+          headers: { "x-mg-reporter": "reporter-secret" },
+        }),
+        app.inject({
+          method: "POST",
+          url: "/api/fleet/request/complete",
+          headers: { "x-mg-reporter": "reporter-secret" },
+          payload: { outcome: "done" },
+        }),
+      ]);
+
+      expect(status.json()).toEqual({ enabled: false, queue_depth: 0, daily_remaining: 0, project_remaining: 0 });
+      for (const response of disabled) {
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toMatchObject({ error: { code: "fleet_disabled" } });
+      }
+    } finally {
+      if (previous === undefined) delete process.env.FLEET_MODE;
+      else process.env.FLEET_MODE = previous;
+    }
+  });
+
+  it("ignores invalid fleet-only settings while disabled and validates each setting while enabled", () => {
+    const names = ["FLEET_MODE", "FLEET_DAILY_CAP", "FLEET_PER_PROJECT_CAP", "FLEET_ADOPT_TTL_MIN"] as const;
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.FLEET_MODE = "0";
+      process.env.FLEET_DAILY_CAP = "0";
+      process.env.FLEET_PER_PROJECT_CAP = "0";
+      process.env.FLEET_ADOPT_TTL_MIN = "0";
+      expect(() => server()).not.toThrow();
+
+      for (const name of names.slice(1)) {
+        process.env.FLEET_MODE = "1";
+        delete process.env.FLEET_DAILY_CAP;
+        delete process.env.FLEET_PER_PROJECT_CAP;
+        delete process.env.FLEET_ADOPT_TTL_MIN;
+        process.env[name] = "0";
+        expect(() => server()).toThrow(`${name} must be a positive integer`);
+      }
+    } finally {
+      for (const name of names) {
+        const value = previous[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   it("returns enabled fleet capacity and 204 when the queue is empty", async () => {
     const { app, store } = server({
       fleetMode: true,

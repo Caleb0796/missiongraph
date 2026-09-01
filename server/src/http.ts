@@ -398,17 +398,15 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
   const id = options.id ?? randomUUID;
   const configuredSeedProjectId = options.seedProjectId ?? process.env.SEED_PROJECT_ID;
   const fleetMode = options.fleetMode ?? process.env.FLEET_MODE === "1";
-  const fleetDailyCap = positiveInteger(options.fleetDailyCap ?? process.env.FLEET_DAILY_CAP, 30, "FLEET_DAILY_CAP");
-  const fleetPerProjectCap = positiveInteger(
-    options.fleetPerProjectCap ?? process.env.FLEET_PER_PROJECT_CAP,
-    1,
-    "FLEET_PER_PROJECT_CAP",
-  );
-  const fleetAdoptTtlMin = positiveInteger(
-    options.fleetAdoptTtlMin ?? process.env.FLEET_ADOPT_TTL_MIN,
-    20,
-    "FLEET_ADOPT_TTL_MIN",
-  );
+  const fleetDailyCap = fleetMode
+    ? positiveInteger(options.fleetDailyCap ?? process.env.FLEET_DAILY_CAP, 30, "FLEET_DAILY_CAP")
+    : 30;
+  const fleetPerProjectCap = fleetMode
+    ? positiveInteger(options.fleetPerProjectCap ?? process.env.FLEET_PER_PROJECT_CAP, 1, "FLEET_PER_PROJECT_CAP")
+    : 1;
+  const fleetAdoptTtlMin = fleetMode
+    ? positiveInteger(options.fleetAdoptTtlMin ?? process.env.FLEET_ADOPT_TTL_MIN, 20, "FLEET_ADOPT_TTL_MIN")
+    : 20;
   const fixtureSeedProjectId = "demo-seed";
   const allowedOrigins = new Set(
     options.allowedOrigins ??
