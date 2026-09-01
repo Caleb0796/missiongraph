@@ -311,6 +311,9 @@ test('late WebMCP activation updates the canvas and compatibility page reactivel
   assert.match(compat, /useSyncExternalStore\(/)
   assert.match(compat, /await recheckWebMcp\(\)/)
   assert.match(compat, /status\.state === 'active' \? status\.namespace/)
+  assert.match(compat, />\s*MissionGraph\s*</)
+  assert.match(compat, /WebMCP compatibility check/)
+  assert.doesNotMatch(compat, /MissionGraph M0|WebMCP compatibility spike/)
 })
 
 test('tool console keeps unknown tools and malformed JSON as inline errors', async () => {
