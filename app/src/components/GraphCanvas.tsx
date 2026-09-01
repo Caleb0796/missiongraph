@@ -769,7 +769,7 @@ function MissionBoard() {
                 Expires {new Date(humanConfirmation.expiresAt).toLocaleString()}.
               </p>
             </div>
-            <div>
+            <div className="structural-confirm-actions">
               <button
                 type="button"
                 className="action-secondary"
@@ -856,7 +856,7 @@ function MissionBoard() {
                   .join(', ')}.
               </p>
             )}
-            <div>
+            <div className="structural-confirm-actions">
               <button type="button" className="action-secondary" onClick={cancelStructural}>
                 Cancel
               </button>

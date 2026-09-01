@@ -9,7 +9,11 @@
     "lint": "oxlint",
     "test": "node --experimental-strip-types --test test/*.test.mjs",
     "preview": "vite preview",
-    "seed:dev": "node --experimental-strip-types scripts/seed-dev.ts"
+    "seed:dev": "node --experimental-strip-types scripts/seed-dev.ts",
+    "eval:webmcp:validate": "node --experimental-strip-types scripts/webmcp-eval.ts validate",
+    "eval:webmcp:fixture": "node --experimental-strip-types scripts/webmcp-eval.ts fixture",
+    "eval:webmcp:grade": "node --experimental-strip-types scripts/webmcp-eval.ts grade",
+    "eval:webmcp:redact": "node --experimental-strip-types scripts/webmcp-eval.ts redact"
   },
   "dependencies": {
     "@xyflow/react": "12.11.5",

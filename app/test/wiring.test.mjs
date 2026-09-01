@@ -192,6 +192,22 @@ test('consequential actions use a visible project-bound human confirmation', asy
   assert.match(store, /Confirmation changed; review the visible draft/)
 })
 
+test('confirmation metadata wraps without sharing the action row layout', async () => {
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  const styles = await source('../src/index.css')
+  assert.equal(
+    canvas.match(/className="structural-confirm-actions"/g)?.length,
+    2,
+  )
+  assert.match(
+    styles,
+    /\.structural-confirm-plan \{[^}]*overflow-wrap: anywhere;/,
+  )
+  assert.match(styles, /\.structural-confirm-plan li \{[^}]*font-size: 10px;/)
+  assert.match(styles, /\.structural-confirm-actions \{[^}]*display: flex;/)
+  assert.doesNotMatch(styles, /\.structural-confirm > div \{/)
+})
+
 test('identity recovery is source-aware and realtime resumes with fenced backoff', async () => {
   const client = await source('../src/transport/client.ts')
   const linkedBranch = client.slice(
