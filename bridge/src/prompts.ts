@@ -109,3 +109,12 @@ On failure, report NODE_STATE_CHANGED running→failed with a useful detail and 
 
 Filing HANDOFF_FILED is part of task completion. Do not claim completion until the server accepts every required report.`;
 }
+
+export function adoptedWorkerBrief(
+  nodeId: string,
+  title: string,
+  brief: string,
+  repoPath: string,
+): string {
+  return workerBrief(nodeId, `${title}\n\n${brief}`, repoPath);
+}

@@ -12,8 +12,9 @@ import {
   type ProcessIdentity,
   type ProcessStartTimeLookup,
 } from "./process.js";
-import { workerBrief } from "./prompts.js";
+import { adoptedWorkerBrief, workerBrief } from "./prompts.js";
 import { ReporterClient, reporterPayload } from "./reporter.js";
+import { ExecutionSlot, type ExecutionLease } from "./slot.js";
 import type { PendingAction, StateStore, WorkerState } from "./state.js";
 import type { Logger, SupervisorAction, SupervisorDecision } from "./types.js";
 
@@ -50,7 +51,13 @@ const actionRetryDelaysMs = [100, 500];
 const maximumDeadLetters = 50;
 
 interface WorkerCodexClient {
-  startWorker(nodeId: string, brief: string, worktree: string, reporterConfigPath: string): RunningCodex;
+  startWorker(
+    nodeId: string,
+    brief: string,
+    worktree: string,
+    reporterConfigPath: string,
+    workerConfig?: BridgeConfig,
+  ): RunningCodex;
   resumeWorker(
     nodeId: string,
     threadId: string,
@@ -58,6 +65,15 @@ interface WorkerCodexClient {
     worktree: string,
     reporterConfigPath: string,
   ): RunningCodex;
+}
+
+export interface FleetWorkerAssignment {
+  requestId: string;
+  projectId: string;
+  nodeId: string;
+  title: string;
+  brief: string;
+  workerKey: string;
 }
 
 function actionName(action: SupervisorAction): string {
@@ -72,6 +88,7 @@ function workerIdentity(worker: WorkerState): ProcessIdentity | undefined {
 
 export class ActionExecutor {
   private readonly running = new Map<string, RunningCodex>();
+  private readonly leases = new Map<string, ExecutionLease>();
   private readonly renewalTimers = new Map<string, NodeJS.Timeout>();
   private readonly cleanupTasks = new Set<Promise<void>>();
   private readonly reporter: ReporterClient;
@@ -84,8 +101,9 @@ export class ActionExecutor {
     private readonly stateStore: StateStore,
     private readonly codex: WorkerCodexClient,
     private readonly logger: Logger,
-    dryRun = false,
+    private readonly dryRun = false,
     private readonly processStartTime: ProcessStartTimeLookup = readProcessStartTime,
+    private readonly slot = new ExecutionSlot(config.fleetMode),
   ) {
     this.reporter = new ReporterClient(config, dryRun);
   }
@@ -123,7 +141,21 @@ export class ActionExecutor {
           text: `Startup reconciliation terminated spawning worker ${nodeId} after matching its persisted process identity; a ledger retry may respawn it safely.`,
         });
       } else if (worker.status === "live") {
-        this.scheduleRenewal(nodeId, worker.reporter_expires);
+        const lease = this.slot.tryAcquire(`recovered worker ${nodeId}`);
+        if (!lease) {
+          await terminateProcess(identity, { lookup: this.processStartTime });
+          worker.status = "dead";
+          delete worker.pid;
+          delete worker.process_start_time;
+          changed = true;
+          recovered.push({
+            act: "note",
+            text: `Startup reconciliation terminated worker ${nodeId} because another process already occupied the single execution slot.`,
+          });
+        } else {
+          this.leases.set(nodeId, lease);
+          this.scheduleRenewal(nodeId, worker.reporter_expires);
+        }
       }
     }
     if (changed) await this.stateStore.save();
@@ -331,58 +363,110 @@ export class ActionExecutor {
     if (previous?.status === "dead") {
       await this.journal(`Respawning dead worker for node ${nodeId} in a fresh worktree.`, `${pendingId}:respawn`);
     }
+    const lease = await this.slot.acquire(`flagship worker ${nodeId}`);
+    if (this.stopping) {
+      lease.release();
+      throw new Error("bridge is shutting down");
+    }
+    await this.launchWorker(
+      {
+        requestId: "",
+        projectId: this.config.projectId,
+        nodeId,
+        title: "",
+        brief,
+        workerKey: nodeId,
+      },
+      lease,
+      false,
+    );
+  }
+
+  async spawnFleetWorker(assignment: FleetWorkerAssignment, lease: ExecutionLease): Promise<RunningCodex> {
+    const previous = this.stateStore.state.workers[assignment.workerKey];
+    if (previous && previous.status !== "dead") {
+      lease.release();
+      throw new Error(`fleet worker ${assignment.workerKey} already has a ${previous.status} worker entry`);
+    }
+    return await this.launchWorker(assignment, lease, true);
+  }
+
+  async killTrackedWorker(workerKey: string): Promise<void> {
+    await this.killWorker(workerKey);
+  }
+
+  private async launchWorker(
+    assignment: FleetWorkerAssignment,
+    lease: ExecutionLease,
+    fleet: boolean,
+  ): Promise<RunningCodex> {
+    const { nodeId, workerKey } = assignment;
+    const workerConfig = assignment.projectId === this.config.projectId
+      ? this.config
+      : { ...this.config, projectId: assignment.projectId };
     const suffix = randomUUID().slice(0, 8);
     const nodeSlug = slug(nodeId);
     const branch = `work/${nodeSlug}-${suffix}`;
     const root = join(dirname(this.config.targetRepoPath), ".missiongraph-worktrees");
     const worktree = join(root, `${basename(this.config.targetRepoPath)}-${nodeSlug}-${suffix}`);
     const reporterConfigPath = `${worktree}.reporter.conf`;
-    const credential = await this.reporter.issue(`worker:${nodeId}`);
-    await writeReporterConfig(reporterConfigPath, credential.token);
-    await mkdir(root, { recursive: true });
-    await runGit(["worktree", "add", worktree, "-b", branch], this.config.targetRepoPath);
-    const state: WorkerState = {
-      status: "spawning",
-      worktree,
-      branch,
-      reporter_credential: credential.token,
-      reporter_expires: credential.expires,
-      reporter_config_path: reporterConfigPath,
-    };
-    this.stateStore.state.workers[nodeId] = state;
-    await this.stateStore.save();
-
-    let running: RunningCodex | undefined;
     try {
-      running = this.codex.startWorker(
-        nodeId,
-        workerBrief(nodeId, brief, worktree),
+      const credential = await new ReporterClient(workerConfig, this.dryRun).issue(`worker:${nodeId}`);
+      await writeReporterConfig(reporterConfigPath, credential.token);
+      await mkdir(root, { recursive: true });
+      await runGit(["worktree", "add", worktree, "-b", branch], this.config.targetRepoPath);
+      const state: WorkerState = {
+        status: "spawning",
         worktree,
-        reporterConfigPath,
-      );
-      this.running.set(nodeId, running);
-      const identity = await running.identity;
-      state.pid = identity.pid;
-      state.process_start_time = identity.starttime;
+        branch,
+        reporter_credential: credential.token,
+        reporter_expires: credential.expires,
+        reporter_config_path: reporterConfigPath,
+        ...(fleet ? {
+          node_id: nodeId,
+          project_id: assignment.projectId,
+          fleet_request_id: assignment.requestId,
+        } : {}),
+      };
+      this.stateStore.state.workers[workerKey] = state;
       await this.stateStore.save();
-      state.thread_id = await running.threadId;
-      state.status = "live";
-      await this.stateStore.save();
+
+      let running: RunningCodex | undefined;
+      try {
+        const prompt = fleet
+          ? adoptedWorkerBrief(nodeId, assignment.title, assignment.brief, worktree)
+          : workerBrief(nodeId, assignment.brief, worktree);
+        running = this.codex.startWorker(nodeId, prompt, worktree, reporterConfigPath, workerConfig);
+        this.running.set(workerKey, running);
+        this.leases.set(workerKey, lease);
+        const identity = await running.identity;
+        state.pid = identity.pid;
+        state.process_start_time = identity.starttime;
+        await this.stateStore.save();
+        state.thread_id = await running.threadId;
+        state.status = "live";
+        await this.stateStore.save();
+      } catch (error) {
+        if (running) await this.terminateFailedLaunch(workerKey, running);
+        state.status = "dead";
+        delete state.pid;
+        delete state.process_start_time;
+        this.running.delete(workerKey);
+        this.releaseLease(workerKey);
+        await this.stateStore.save();
+        throw error;
+      }
+      this.scheduleRenewal(workerKey, credential.expires);
+      this.logger.info(`spawned worker ${nodeId} as thread ${state.thread_id} in ${worktree}`);
+      this.trackInitialCompletion(workerKey, running, lease);
+      return running;
     } catch (error) {
-      if (running) await this.terminateFailedLaunch(nodeId, running);
-      state.status = "dead";
-      delete state.pid;
-      delete state.process_start_time;
-      this.running.delete(nodeId);
-      await this.stateStore.save();
+      lease.release();
       throw error;
     }
-    this.scheduleRenewal(nodeId, credential.expires);
-    this.logger.info(`spawned worker ${nodeId} as thread ${state.thread_id} in ${worktree}`);
-    this.trackInitialCompletion(nodeId, running);
   }
 
-  private trackInitialCompletion(nodeId: string, running: RunningCodex): void {
+  private trackInitialCompletion(nodeId: string, running: RunningCodex, lease: ExecutionLease): void {
     const cleanup = running.completed
       .catch((error: unknown) => {
         this.logger.error(`worker ${nodeId} process ended with error: ${error instanceof Error ? error.message : String(error)}`);
@@ -401,6 +485,10 @@ export class ActionExecutor {
       })
       .catch((error: unknown) => {
         this.logger.error(`failed to persist worker ${nodeId} process exit: ${error instanceof Error ? error.message : String(error)}`);
+      })
+      .finally(() => {
+        if (this.leases.get(nodeId) === lease) this.leases.delete(nodeId);
+        lease.release();
       });
     this.cleanupTasks.add(cleanup);
     void cleanup.finally(() => this.cleanupTasks.delete(cleanup));
@@ -423,18 +511,25 @@ export class ActionExecutor {
       await this.journal(note, `${pendingId}:live-control-rejected`);
       return;
     }
-    await this.ensureCredential(nodeId, worker);
-    if (this.stopping) throw new Error("bridge is shutting down");
-    const reporterConfigPath = worker.reporter_config_path ?? `${worker.worktree}.reporter.conf`;
-    const running = this.codex.resumeWorker(
-      nodeId,
-      worker.thread_id,
-      message,
-      worker.worktree,
-      reporterConfigPath,
-    );
-    this.running.set(nodeId, running);
+    const lease = await this.slot.acquire(`flagship worker resume ${nodeId}`);
+    if (this.stopping) {
+      lease.release();
+      throw new Error("bridge is shutting down");
+    }
+    let running: RunningCodex | undefined;
     try {
+      await this.ensureCredential(nodeId, worker);
+      if (this.stopping) throw new Error("bridge is shutting down");
+      const reporterConfigPath = worker.reporter_config_path ?? `${worker.worktree}.reporter.conf`;
+      running = this.codex.resumeWorker(
+        nodeId,
+        worker.thread_id,
+        message,
+        worker.worktree,
+        reporterConfigPath,
+      );
+      this.running.set(nodeId, running);
+      this.leases.set(nodeId, lease);
       const identity = await running.identity;
       worker.pid = identity.pid;
       worker.process_start_time = identity.starttime;
@@ -443,16 +538,21 @@ export class ActionExecutor {
       await running.threadId;
       await running.completed;
     } catch (error) {
-      await this.terminateFailedLaunch(nodeId, running);
+      if (running) await this.terminateFailedLaunch(nodeId, running);
       throw error;
     } finally {
-      if (this.running.get(nodeId) === running) {
-        this.running.delete(nodeId);
-        worker.status = "idle";
-        delete worker.pid;
-        delete worker.process_start_time;
-        this.clearRenewal(nodeId);
-        await this.stateStore.save();
+      try {
+        if (running && this.running.get(nodeId) === running) {
+          this.running.delete(nodeId);
+          worker.status = "idle";
+          delete worker.pid;
+          delete worker.process_start_time;
+          this.clearRenewal(nodeId);
+          await this.stateStore.save();
+        }
+      } finally {
+        this.releaseLease(nodeId);
+        lease.release();
       }
     }
   }
@@ -474,7 +574,7 @@ export class ActionExecutor {
       !Number.isFinite(reporterExpires) ||
       reporterExpires - Date.now() < reporterRenewalLeadMs
     ) {
-      const credential = await this.reporter.issue(`worker:${nodeId}`);
+      const credential = await this.reporterFor(worker).issue(`worker:${worker.node_id ?? nodeId}`);
       if (this.stopping) throw new Error("bridge is shutting down");
       worker.reporter_credential = credential.token;
       worker.reporter_expires = credential.expires;
@@ -513,7 +613,7 @@ export class ActionExecutor {
     const worker = this.stateStore.state.workers[nodeId];
     if (!worker || worker.status !== "live") return;
     try {
-      const credential = await this.reporter.issue(`worker:${nodeId}`);
+      const credential = await this.reporterFor(worker).issue(`worker:${worker.node_id ?? nodeId}`);
       if (this.stopping || worker.status !== "live") return;
       const reporterConfigPath = worker.reporter_config_path ?? `${worker.worktree}.reporter.conf`;
       await writeReporterConfig(reporterConfigPath, credential.token);
@@ -542,6 +642,7 @@ export class ActionExecutor {
     const worker = this.stateStore.state.workers[nodeId];
     if (!worker || worker.status === "dead") {
       this.logger.warn(`kill_worker ignored because node ${nodeId} has no tracked active process`);
+      this.releaseLease(nodeId);
       return;
     }
     const running = this.running.get(nodeId);
@@ -556,6 +657,21 @@ export class ActionExecutor {
     delete worker.process_start_time;
     this.running.delete(nodeId);
     this.clearRenewal(nodeId);
-    await this.stateStore.save();
+    try {
+      await this.stateStore.save();
+    } finally {
+      this.releaseLease(nodeId);
+    }
+  }
+
+  private reporterFor(worker: WorkerState): ReporterClient {
+    if (!worker.project_id || worker.project_id === this.config.projectId) return this.reporter;
+    return new ReporterClient({ ...this.config, projectId: worker.project_id }, this.dryRun);
+  }
+
+  private releaseLease(workerKey: string): void {
+    const lease = this.leases.get(workerKey);
+    this.leases.delete(workerKey);
+    lease?.release();
   }
 }
