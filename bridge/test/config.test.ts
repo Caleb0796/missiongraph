@@ -43,7 +43,7 @@ describe("bridge package root", () => {
     }
   });
 
-  it("lets FLEET_MODE=0 disable a true config value and parses timing overrides", async () => {
+  it("lets FLEET_MODE=0 disable a true config value and ignores timing overrides", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-config-env-"));
     const path = join(root, "config.json");
     vi.stubEnv("FLEET_MODE", "0");
@@ -59,7 +59,7 @@ describe("bridge package root", () => {
         fleet_mode: true,
       }));
       const loaded = await loadConfig(path);
-      expect(loaded).toMatchObject({ fleetMode: false, fleetPollMs: 2_500, fleetRunTtlMs: 180_000 });
+      expect(loaded).toMatchObject({ fleetMode: false, fleetPollMs: 15_000, fleetRunTtlMs: 15 * 60_000 });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -88,6 +88,7 @@ describe("bridge package root", () => {
   });
 
   it("rejects non-positive fleet timing overrides", async () => {
+    vi.stubEnv("FLEET_MODE", "1");
     vi.stubEnv("FLEET_POLL_SEC", "0");
     vi.stubEnv("MG_SERVER_URL", "http://127.0.0.1:3000");
     vi.stubEnv("MG_PROJECT_ID", "project");

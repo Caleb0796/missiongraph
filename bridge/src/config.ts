@@ -78,6 +78,7 @@ export async function loadConfig(path = resolve(bridgePackageRoot, "config.json"
   if (!(["http:", "https:"] as string[]).includes(parsedServerUrl.protocol)) {
     throw new Error("server URL must use http or https");
   }
+  const fleetMode = fleetEnabled(file.fleet_mode);
   return {
     serverUrl: serverUrl.replace(/\/$/, ""),
     projectId: required(choose("MG_PROJECT_ID", file.project_id), "MG_PROJECT_ID or project_id"),
@@ -93,9 +94,9 @@ export async function loadConfig(path = resolve(bridgePackageRoot, "config.json"
     model: choose("MG_CODEX_MODEL", file.model) ?? "gpt-5.6-sol",
     effort: choose("MG_CODEX_EFFORT", file.effort) ?? "high",
     statePath: resolve(choose("MG_BRIDGE_STATE", file.state_path) ?? resolve(bridgePackageRoot, "state.json")),
-    fleetMode: fleetEnabled(file.fleet_mode),
-    fleetPollMs: durationMs("FLEET_POLL_SEC", 15_000, 1_000),
-    fleetRunTtlMs: durationMs("FLEET_RUN_TTL_MIN", 15 * 60_000, 60_000),
+    fleetMode,
+    fleetPollMs: fleetMode ? durationMs("FLEET_POLL_SEC", 15_000, 1_000) : 15_000,
+    fleetRunTtlMs: fleetMode ? durationMs("FLEET_RUN_TTL_MIN", 15 * 60_000, 60_000) : 15 * 60_000,
     fleetHeartbeatMs: 45_000,
   };
 }
