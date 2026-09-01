@@ -8,25 +8,25 @@ Recording frame: the whole ChatGPT desktop window — agent conversation (left p
 
 ### 0. Hook — 0:00–0:20
 - **Screen**: ChatGPT built-in browser on https://missiongraph.vercel.app, mid-mission graph (done/running/review mixed, critical path lit). Slow pan.
-- **VO**: "Parallel agent fleets are fast — and illegible. Chat is legible — and serial. MissionGraph is mission control: one living task graph where you, your browser agent, and a fleet of Codex workers run a project together."
+- **VO**: "I run coding agents in parallel — and honestly, I lose track. Chat can only tell me one thread at a time. This is MissionGraph: the whole mission on one live graph — me, my browser agent, and real Codex workers, all looking at the same picture."
 
 ### 1. Agent catch-up — 0:20–1:00 (WebMCP Leverage)
 - **Action**: click a first-run chip to copy the prompt; tell the agent **"Catch me up on this mission."** Agent calls `graph_digest`; the camera lens follows its narration.
-- **VO**: "The page registers 20-plus tools on document.modelContext. My agent discovers them natively — no extension, no copy-paste. Every tool result carries a cursor and everything that changed since, so an agent that was away five minutes is current by its next call."
+- **VO**: "Watch this — I just ask my agent to catch me up. The page has already handed it twenty-plus tools through WebMCP — no extension, no copy-paste. And every answer comes with whatever changed while it was away, so it's never working from a stale picture."
 - **Must be in frame**: the agent's tool-call entries in the conversation pane.
 
 ### 2. Policy grant + live fleet — 1:00–1:55 (Execution + security)
 - **Action**: on the local-stack mission (bridge running): say **"My policy: approve anything under 50 changed lines with green tests."** → agent calls `state_policy` → the canvas shows the **Human policy confirmation** dialog (exact text + expiry) → human clicks **Confirm** → agent clears the review queue under the grant. Then **"What's idle and worth staffing?"** → **"Dispatch it."** → a second confirmation dialog (action-scoped, one use) → Confirm → node flips READY→RUNNING as a real Codex worker starts.
-- **VO**: "I state a policy in one sentence. The agent cannot self-authorize — a visible human confirmation mints the grant, then the agent clears the queue under it; every approval records the policy it cited and consumes a nonce-bound use. The idle radar finds unstaffed work; one dispatch, and a real Codex worker picks it up — live."
+- **VO**: "Now the security part. I give it my policy in one sentence. But the agent can't just approve things on its own — I get this dialog, I read exactly what I'm signing off on, and I click confirm. Then it clears the review queue, and every single approval is logged with the policy behind it. Next: I ask what's sitting idle, tell it to dispatch — one more confirmation — and that's a real Codex worker starting up. Live."
 
 ### 3. Mid-flight rewire — 1:55–2:35 (Creativity & Ambition)
 - **Action**: select the **running rate-limit task** (contextual tools register on selection) → **"Split the rate-limit task into config and enforcement halves — show me the blast radius first."** → blast-radius preview → **"Apply it."** → confirm → the parent's children appear, edges re-route, and the critical path recomputes.
-- **VO**: "Mid-flight, I re-engineer the graph itself. Selecting a node registers contextual tools on the fly. A split previews its blast radius before anything applies — then the edges re-route and the critical path recomputes, live, on the same append-only ledger."
+- **VO**: "Here's my favorite part. That rate-limit task is already running — and I can still redesign around it. The moment I click the node, the page hands my agent new tools just for it. I ask for a split, it shows me the blast radius first — what this touches — then I apply, and the graph rewires itself. Watch the critical path move."
 - **Do NOT claim a live re-brief.** A worker whose process is still `live` cannot be re-briefed: `resumeWorker` rejects `rebrief_worker` for a live process and journals it instead (bridge/src/actions.ts). The split is recorded and the graph rewires; the running worker keeps its original brief until it exits. Saying "workers get re-briefed" on camera would be a claim the code does not honour.
 
 ### 4. Close — 2:35–3:00 (Impact)
 - **Screen**: open a node dossier (Brief / Handoff / Decisions) → timeline replay → hold on full graph + URL.
-- **VO**: "Everything you saw is one append-only ledger — every actor labeled, every decision auditable. The mission judges explore is a real run: real workers, real commits, real approvals. Supervision-by-exception for agent fleets — missiongraph.vercel.app, native in ChatGPT's browser."
+- **VO**: "And everything you just watched is on the record — every action, who did it, under what authority. The mission you can explore yourself is a real run: real workers, real commits, real approvals. Code today — but this works for any long-running mission. missiongraph.vercel.app, right inside ChatGPT's browser."
 - **End card**: `missiongraph.vercel.app · 251 tests · 19 fleet scenarios · live-fire arbitration · adversarially reviewed`
   Measured 2026-09-01 on merged main (`cf9cdbf`): server 69 / bridge 77 / app 105 = **251**, plus the 19-scenario fleet contract stub and a real-codex arbitration PASS (sol/medium, full lifecycle + handoff + approval). Re-run the suites on recording day rather than trusting this line.
 
