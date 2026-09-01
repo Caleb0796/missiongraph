@@ -501,8 +501,10 @@ describe("FleetAdoptionLoop", () => {
     });
   });
 
-  it("resumes heartbeats for a persisted live adoption and fails honestly when its process disappears", async () => {
+  it("evaluates protocol evidence before failing a recovered worker whose process disappears", async () => {
     const stub = await startedStub();
+    stub.ledgerEvents.splice(0);
+    stub.ledgerReads = 1;
     const child = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], {
       stdio: "ignore",
     });
@@ -525,6 +527,7 @@ describe("FleetAdoptionLoop", () => {
         adopted_at: new Date(Date.now() - 100).toISOString(),
         started_at: new Date(Date.now() - 100).toISOString(),
       };
+      Object.assign(state.state.fleet_adoption, { ledger_seq_at_adoption: 0 });
       state.state.workers["fleet:request-1"] = {
         status: "live",
         thread_id: "recovered-thread",
@@ -550,8 +553,69 @@ describe("FleetAdoptionLoop", () => {
     await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
-      note: expect.stringContaining("no longer running"),
+      note: expect.stringContaining("ordered NODE_STATE_CHANGED running→review|failed"),
     });
+  });
+
+  it("completes done after restart when the recovered worker exits with valid protocol evidence", async () => {
+    const stub = await startedStub();
+    stub.ledgerReads = 1;
+    const child = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], {
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    cleanups.push(async () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      }
+    });
+    const harness = await createHarness(stub, {}, async (state) => {
+      const adopted = claim();
+      const repoPath = join(dirname(state.path), "repo");
+      const worktree = join(dirname(state.path), "recovered-success-worktree");
+      const add = spawnSync(
+        "git",
+        ["-C", repoPath, "worktree", "add", "-b", "work/recovered-success", worktree],
+        { encoding: "utf8" },
+      );
+      if (add.status !== 0) throw new Error(add.stderr);
+      state.state.fleet_adoption = {
+        ...adopted,
+        worker_key: "fleet:request-1",
+        status: "running",
+        adopted_at: new Date(Date.now() - 100).toISOString(),
+        started_at: new Date(Date.now() - 100).toISOString(),
+      };
+      Object.assign(state.state.fleet_adoption, { ledger_seq_at_adoption: 0 });
+      state.state.workers["fleet:request-1"] = {
+        status: "live",
+        thread_id: "recovered-thread",
+        worktree,
+        branch: "work/recovered-success",
+        reporter_credential: "credential-adopted-project",
+        reporter_expires: "2099-08-30T10:15:00.000Z",
+        node_id: adopted.node_id,
+        project_id: adopted.project_id,
+        fleet_request_id: adopted.request_id,
+        pid: child.pid!,
+        process_start_time: `fleet-test-child-${child.pid}`,
+      };
+      await state.save();
+    });
+    harness.start();
+
+    await waitFor(() => stub.heartbeatTimes.length >= 1);
+    child.kill("SIGTERM");
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    }
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toEqual({ outcome: "done" });
   });
 
   it("does not rerun a completed persisted request if the server returns it again", async () => {

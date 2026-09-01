@@ -502,29 +502,7 @@ export class FleetAdoptionLoop {
         await this.beginCompletion(adoption, result.outcome, result.note);
         return;
       }
-      let completion: FleetCompletion;
-      try {
-        const worker = this.stateStore.state.workers[adoption.worker_key];
-        completion = worker
-          ? await this.client.protocolCompletion(
-            adoption.project_id,
-            adoption.node_id,
-            adoption.visitor_token,
-            (adoption as ScopedFleetAdoptionState).ledger_seq_at_adoption,
-            worker.worktree,
-            worker.branch,
-            claimAbort.signal,
-          )
-          : {
-            outcome: "failed",
-            note: "Fleet worker exited cleanly without required server ledger reports: persisted worker checkout.",
-          };
-      } catch (error) {
-        completion = {
-          outcome: "failed",
-          note: `Fleet worker protocol verification failed: ${error instanceof Error ? error.message : String(error)}`,
-        };
-      }
+      const completion = await this.verifyProtocolCompletion(adoption, claimAbort.signal);
       await this.beginCompletion(adoption, completion.outcome, completion.note);
     } finally {
       if (!launchAttempted) lease.release();
@@ -560,7 +538,8 @@ export class FleetAdoptionLoop {
       return;
     }
     if (worker.status !== "live" || !worker.pid || !worker.process_start_time) {
-      await this.beginCompletion(adoption, "failed", "Recovered fleet worker process was no longer running.");
+      const completion = await this.verifyProtocolCompletion(adoption, this.abort.signal);
+      await this.beginCompletion(adoption, completion.outcome, completion.note);
       return;
     }
     const deadline = Date.parse(adoption.started_at ?? adoption.adopted_at) + this.config.fleetRunTtlMs;
@@ -570,8 +549,8 @@ export class FleetAdoptionLoop {
       return;
     }
     if (!await processMatches({ pid: worker.pid, starttime: worker.process_start_time }, this.processStartTime)) {
-      await this.actions.killTrackedWorker(adoption.worker_key);
-      await this.beginCompletion(adoption, "failed", "Recovered fleet worker process was no longer running.");
+      const completion = await this.verifyProtocolCompletion(adoption, this.abort.signal);
+      await this.beginCompletion(adoption, completion.outcome, completion.note);
       return;
     }
     if (!await this.client.heartbeat(adoption.request_id, this.abort.signal)) {
@@ -582,6 +561,35 @@ export class FleetAdoptionLoop {
     adoption.status = "running";
     adoption.heartbeat_at = new Date().toISOString();
     await this.stateStore.save();
+  }
+
+  private async verifyProtocolCompletion(
+    adoption: FleetAdoptionState,
+    signal: AbortSignal,
+  ): Promise<FleetCompletion> {
+    const worker = this.stateStore.state.workers[adoption.worker_key];
+    if (!worker) {
+      return {
+        outcome: "failed",
+        note: "Fleet worker exited cleanly without required server ledger reports: persisted worker checkout.",
+      };
+    }
+    try {
+      return await this.client.protocolCompletion(
+        adoption.project_id,
+        adoption.node_id,
+        adoption.visitor_token,
+        (adoption as ScopedFleetAdoptionState).ledger_seq_at_adoption,
+        worker.worktree,
+        worker.branch,
+        signal,
+      );
+    } catch (error) {
+      return {
+        outcome: "failed",
+        note: `Fleet worker protocol verification failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
   }
 
   private async beginCompletion(
