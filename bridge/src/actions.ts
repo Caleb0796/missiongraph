@@ -58,6 +58,7 @@ const reporterRenewalLeadMs = 5 * 60_000;
 const reporterRenewalRetryMs = 5_000;
 const maximumTimerDelayMs = 2_147_483_647;
 const actionRetryDelaysMs = [100, 500];
+const recoveredLookupRetryDelaysMs = [50, 100];
 const maximumDeadLetters = 50;
 
 interface WorkerCodexClient {
@@ -443,7 +444,20 @@ export class ActionExecutor {
     const root = join(dirname(this.config.targetRepoPath), ".missiongraph-worktrees");
     const worktree = join(root, `${basename(this.config.targetRepoPath)}-${nodeSlug}-${suffix}`);
     const reporterConfigPath = `${worktree}.reporter.conf`;
+    const state: WorkerState = {
+      status: "spawning",
+      worktree,
+      branch,
+      reporter_config_path: reporterConfigPath,
+      ...(fleet ? {
+        node_id: nodeId,
+        project_id: assignment.projectId,
+        fleet_request_id: assignment.requestId,
+      } : {}),
+    };
+    this.stateStore.state.workers[workerKey] = state;
     try {
+      await this.stateStore.save();
       launchSignal.throwIfAborted();
       const credential = await new ReporterClient(workerConfig, this.dryRun).issue(`worker:${nodeId}`, launchSignal);
       launchSignal.throwIfAborted();
@@ -452,20 +466,8 @@ export class ActionExecutor {
       await mkdir(root, { recursive: true });
       await runGit(["worktree", "add", worktree, "-b", branch], this.config.targetRepoPath, launchSignal);
       launchSignal.throwIfAborted();
-      const state: WorkerState = {
-        status: "spawning",
-        worktree,
-        branch,
-        reporter_credential: credential.token,
-        reporter_expires: credential.expires,
-        reporter_config_path: reporterConfigPath,
-        ...(fleet ? {
-          node_id: nodeId,
-          project_id: assignment.projectId,
-          fleet_request_id: assignment.requestId,
-        } : {}),
-      };
-      this.stateStore.state.workers[workerKey] = state;
+      state.reporter_credential = credential.token;
+      state.reporter_expires = credential.expires;
       await this.stateStore.save();
 
       let running: RunningCodex | undefined;
@@ -509,6 +511,13 @@ export class ActionExecutor {
       this.trackInitialCompletion(workerKey, running, lease);
       return running;
     } catch (error) {
+      if (this.stateStore.state.workers[workerKey] === state && state.status === "spawning") {
+        state.status = "dead";
+        delete state.pid;
+        delete state.process_start_time;
+        await this.clearReporterCredential(state);
+        await this.stateStore.save();
+      }
       await unlink(reporterConfigPath).catch((unlinkError: NodeJS.ErrnoException) => {
         if (unlinkError.code !== "ENOENT") throw unlinkError;
       });
@@ -547,39 +556,61 @@ export class ActionExecutor {
   }
 
   private trackRecoveredCompletion(nodeId: string, identity: ProcessIdentity, lease: ExecutionLease): void {
-    let release = false;
     const cleanup = (async () => {
-      while (!this.stopping && await processMatches(identity, this.processStartTime)) {
+      while (!this.stopping) {
+        try {
+          if (!await this.recoveredProcessMatches(nodeId, identity)) {
+            await this.settleRecoveredWorker(nodeId, identity);
+            return;
+          }
+        } catch (error) {
+          this.logger.error(
+            `recovered worker ${nodeId} process lookup failed permanently: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          await this.settleRecoveredWorker(nodeId, identity);
+          return;
+        }
         await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
-      }
-      if (this.stopping) {
-        release = true;
-        return;
-      }
-      release = true;
-      const current = this.stateStore.state.workers[nodeId];
-      if (
-        current?.pid === identity.pid &&
-        current.process_start_time === identity.starttime
-      ) {
-        delete current.pid;
-        delete current.process_start_time;
-        this.clearRenewal(nodeId);
-        await this.clearReporterCredential(current);
-        current.status = current.thread_id ? "idle" : "dead";
-        await this.stateStore.save();
       }
     })().catch((error: unknown) => {
       this.logger.error(
         `failed to monitor recovered worker ${nodeId}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }).finally(() => {
-      if (!release) return;
       if (this.leases.get(nodeId) === lease) this.leases.delete(nodeId);
       lease.release();
     });
     this.cleanupTasks.add(cleanup);
     void cleanup.finally(() => this.cleanupTasks.delete(cleanup));
+  }
+
+  private async recoveredProcessMatches(nodeId: string, identity: ProcessIdentity): Promise<boolean> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await processMatches(identity, this.processStartTime);
+      } catch (error) {
+        const delay = recoveredLookupRetryDelaysMs[attempt];
+        if (delay === undefined) throw error;
+        this.logger.warn(
+          `recovered worker ${nodeId} process lookup failed; retrying in ${delay}ms: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, delay));
+      }
+    }
+  }
+
+  private async settleRecoveredWorker(nodeId: string, identity: ProcessIdentity): Promise<void> {
+    const current = this.stateStore.state.workers[nodeId];
+    if (
+      current?.pid !== identity.pid ||
+      current.process_start_time !== identity.starttime
+    ) return;
+    delete current.pid;
+    delete current.process_start_time;
+    this.clearRenewal(nodeId);
+    await this.clearReporterCredential(current);
+    current.status = current.thread_id ? "idle" : "dead";
+    await this.stateStore.save();
   }
 
   private async resumeWorker(
