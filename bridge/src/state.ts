@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open as openFile, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { mkdir, open as openFile, readFile, readdir, rename, unlink, utimes } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -12,6 +12,8 @@ import {
   type ProcessStartTimeLookup,
 } from "./process.js";
 import type { SupervisorAction } from "./types.js";
+
+const lockHeartbeatIntervalMs = 60_000;
 
 export interface PendingAction {
   id: string;
@@ -296,6 +298,8 @@ export class StateStore {
   readonly existed: boolean;
   readonly recoveryMessage?: string;
   private pendingSave: Promise<void> = Promise.resolve();
+  private pendingHeartbeat: Promise<void> = Promise.resolve();
+  private readonly heartbeatTimer: NodeJS.Timeout;
   private closed = false;
 
   private constructor(
@@ -305,16 +309,24 @@ export class StateStore {
     state: BridgeState,
     existed: boolean,
     recoveryMessage?: string,
+    heartbeatIntervalMs = lockHeartbeatIntervalMs,
   ) {
     this.state = state;
     this.existed = existed;
     if (recoveryMessage) this.recoveryMessage = recoveryMessage;
+    this.heartbeatTimer = setInterval(() => {
+      const touch = async (): Promise<void> => this.touchLock();
+      this.pendingHeartbeat = this.pendingHeartbeat.then(touch, touch);
+      void this.pendingHeartbeat.catch(() => undefined);
+    }, heartbeatIntervalMs);
+    this.heartbeatTimer.unref();
   }
 
   static async open(
     path: string,
     projectId: string,
     processStartTime: ProcessStartTimeLookup = readProcessStartTime,
+    heartbeatIntervalMs = lockHeartbeatIntervalMs,
   ): Promise<StateStore> {
     await mkdir(dirname(path), { recursive: true });
     const lockPath = `${path}.lock`;
@@ -323,7 +335,7 @@ export class StateStore {
       await cleanTemporaries(path);
       try {
         const parsed = stateValue(JSON.parse(await readFile(path, "utf8")), projectId);
-        return new StateStore(path, lockPath, lockContents, parsed, true, parsed.recovery_note);
+        return new StateStore(path, lockPath, lockContents, parsed, true, parsed.recovery_note, heartbeatIntervalMs);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
           return new StateStore(
@@ -332,6 +344,8 @@ export class StateStore {
             lockContents,
             { v: 1, project_id: projectId, cursor: "0", pending_actions: [], dead_letters: [], workers: {} },
             false,
+            undefined,
+            heartbeatIntervalMs,
           );
         }
         const backup = `${path}.corrupt-${Date.now()}`;
@@ -353,6 +367,7 @@ export class StateStore {
           state,
           false,
           recoveryMessage,
+          heartbeatIntervalMs,
         );
       }
     } catch (error) {
@@ -384,10 +399,21 @@ export class StateStore {
     await this.pendingSave;
   }
 
+  private async touchLock(): Promise<void> {
+    if (this.closed) return;
+    if (await readFile(this.lockPath, "utf8").catch(() => "") !== this.lockContents) return;
+    const now = new Date();
+    await utimes(this.lockPath, now, now).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
+    clearInterval(this.heartbeatTimer);
     await this.pendingSave.catch(() => undefined);
     this.closed = true;
+    await this.pendingHeartbeat.catch(() => undefined);
     if (await readFile(this.lockPath, "utf8").catch(() => "") !== this.lockContents) return;
     await unlink(this.lockPath).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "ENOENT") throw error;

@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -18,6 +18,34 @@ describe("StateStore", () => {
       const replacement = await StateStore.open(path, "project", processStartTime);
       await replacement.close();
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes the held lock lease and stops its heartbeat on close", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-lock-heartbeat-"));
+    const path = join(root, "state.json");
+    const lockPath = `${path}.lock`;
+    let state: StateStore | undefined;
+    try {
+      state = await StateStore.open(path, "project", processStartTime, 20);
+      const lockContents = await readFile(lockPath, "utf8");
+      const stale = new Date(Date.now() - 10 * 60_000);
+      await utimes(lockPath, stale, stale);
+      const deadline = Date.now() + 1_000;
+      while ((await stat(lockPath)).mtimeMs === stale.getTime() && Date.now() < deadline) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+      }
+      expect((await stat(lockPath)).mtimeMs).toBeGreaterThan(stale.getTime());
+
+      await state.close();
+      state = undefined;
+      await writeFile(lockPath, lockContents);
+      await utimes(lockPath, stale, stale);
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 75));
+      expect((await stat(lockPath)).mtimeMs).toBe(stale.getTime());
+    } finally {
+      await state?.close();
       await rm(root, { recursive: true, force: true });
     }
   });
