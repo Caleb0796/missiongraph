@@ -17,6 +17,7 @@ import {
   type StructuralPlanInput,
 } from '../store/mission-store'
 import {
+  fleetResultForDispatch,
   loadChangesSince,
   mutate,
   mutateBatch,
@@ -25,6 +26,7 @@ import {
   stagePolicyDraft,
   type MutationBatchItem,
 } from '../transport/client'
+import { withFleetMetadata } from '../transport/fleet'
 import type { ToolDefinition, ToolOutcome } from './registry'
 import { buildSplitPlan, type SplitSubtask } from './split'
 
@@ -1112,12 +1114,16 @@ const dispatch: ToolDefinition = {
       },
       { actor: 'browser_agent' },
     )
+    const fleet = await fleetResultForDispatch(id)
     return {
-      data: {
-        summary: `Dispatched “${target.title}” to the Codex supervisor.`,
-        node_id: id,
-        bypass_cap: bypassCap,
-      },
+      data: withFleetMetadata(
+        {
+          summary: `Dispatched “${target.title}” to the Codex supervisor.`,
+          node_id: id,
+          bypass_cap: bypassCap,
+        },
+        fleet,
+      ),
     }
   },
 }

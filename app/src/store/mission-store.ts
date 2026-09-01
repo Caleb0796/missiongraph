@@ -36,6 +36,7 @@ import {
   shouldApplyDigest,
   shouldApplySnapshot,
 } from '../transport/client-logic'
+import type { LiveFleetDisplay } from '../transport/fleet'
 import {
   StructuralConfirmationController,
   type StructuralOperationProposal,
@@ -148,6 +149,7 @@ interface MissionState {
   explainOverlays: Record<string, ExplainOverlay>
   cameraRequest: CameraRequest | null
   toast: Toast | null
+  liveFleet: LiveFleetDisplay | null
   structuralPreview: StructuralPreview | null
   humanConfirmation: HumanConfirmation | null
   contextualToolsDegraded: boolean
@@ -206,6 +208,7 @@ interface MissionState {
   setContextualToolsDegraded: (degraded: boolean) => void
   requestCamera: (ids: string[]) => void
   showExplainOverlay: (id: string, text: string, ttlSeconds: number) => void
+  setLiveFleet: (liveFleet: LiveFleetDisplay | null) => void
   showToast: (message: string, tone?: Toast['tone'], caption?: string) => void
   clearToast: () => void
 }
@@ -519,6 +522,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   explainOverlays: {},
   cameraRequest: null,
   toast: null,
+  liveFleet: null,
   structuralPreview: null,
   humanConfirmation: null,
   contextualToolsDegraded: false,
@@ -585,6 +589,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         structuralPreview: projectChanged ? null : state.structuralPreview,
         humanConfirmation: projectChanged ? null : state.humanConfirmation,
         explainOverlays: projectChanged ? {} : state.explainOverlays,
+        liveFleet: projectChanged ? null : state.liveFleet,
         selectedId:
           projectChanged || !selectedExists ? null : state.selectedId,
         connectionMode: 'live',
@@ -955,6 +960,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       structuralPreview: null,
       humanConfirmation: null,
       explainOverlays: {},
+      liveFleet: null,
       selectedId: null,
       topologyRevision: get().topologyRevision + 1,
     })
@@ -1324,6 +1330,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       }))
     }, ttlSeconds * 1_000)
     overlayTimers.set(id, timer)
+  },
+  setLiveFleet(liveFleet) {
+    set({ liveFleet })
   },
   showToast(message, tone = 'info', caption) {
     set({
