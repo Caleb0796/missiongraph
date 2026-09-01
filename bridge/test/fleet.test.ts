@@ -27,6 +27,15 @@ class FleetStub {
   readonly credentialActors: string[] = [];
   readonly claims: (FleetClaim | undefined)[] = [];
   readonly missingProjects = new Set<string>();
+  readonly ledgerEvents: { actor: string; type: string; payload: Record<string, unknown> }[] = [
+    {
+      actor: "worker:adopted-node",
+      type: "NODE_STATE_CHANGED",
+      payload: { node_id: "adopted-node", from: "running", to: "review" },
+    },
+    { actor: "worker:adopted-node", type: "HANDOFF_FILED", payload: { node_id: "adopted-node" } },
+    { actor: "worker:adopted-node", type: "APPROVAL_CREATED", payload: { node_id: "adopted-node" } },
+  ];
   heartbeatMissingAfter: number | undefined;
   heartbeatConflictAfter: number | undefined;
   completeMissing = false;
@@ -124,6 +133,12 @@ class FleetStub {
     }
     if (request.method === "POST" && /^\/api\/p\/[^/]+\/report$/.test(url.pathname)) {
       return this.json(response, 200, { seq: 1 });
+    }
+    if (request.method === "GET" && /^\/api\/p\/[^/]+\/export$/.test(url.pathname)) {
+      if (request.headers["x-mg-token"] !== "adopted-visitor-token") {
+        return this.json(response, 401, { error: "unauthorized" });
+      }
+      return this.json(response, 200, { v: 1, events: this.ledgerEvents });
     }
     this.json(response, 404, { error: { code: "not_found", message: "missing" } });
   }
@@ -292,6 +307,27 @@ describe("FleetAdoptionLoop", () => {
     expect(stub.heartbeatTimes.length).toBeGreaterThanOrEqual(1);
     expect(stub.completionCalls).toEqual([{ requestId: "request-1", body: { outcome: "done" } }]);
     expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
+  });
+
+  it("preserves a cleanly exiting worker's reported terminal failure", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.ledgerEvents.splice(0, stub.ledgerEvents.length,
+      {
+        actor: "worker:adopted-node",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "adopted-node", from: "running", to: "failed", detail: "Authoritative tests failed." },
+      },
+    );
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toEqual({
+      outcome: "failed",
+      note: "Fleet worker reported terminal NODE_STATE_CHANGED to failed: Authoritative tests failed.",
+    });
   });
 
   it("places the server title and brief verbatim into the existing worker brief", () => {
