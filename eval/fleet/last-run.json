@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "mode": "stub",
+  "started_at": "2026-09-01T06:44:31.727Z",
+  "finished_at": "2026-09-01T06:44:32.160Z",
+  "passed": 19,
+  "failed": 0,
+  "skipped": 0,
+  "total": 19,
+  "scenarios": [
+    {
+      "name": "happy-path",
+      "status": "PASS",
+      "duration_ms": 48
+    },
+    {
+      "name": "seed-project-rejection",
+      "status": "PASS",
+      "duration_ms": 9
+    },
+    {
+      "name": "seed-registry-addition",
+      "status": "PASS",
+      "duration_ms": 14
+    },
+    {
+      "name": "seed-registry-tombstone",
+      "status": "PASS",
+      "duration_ms": 10
+    },
+    {
+      "name": "template_mismatch",
+      "status": "PASS",
+      "duration_ms": 14
+    },
+    {
+      "name": "undispatched-custom-precedence",
+      "status": "PASS",
+      "duration_ms": 6
+    },
+    {
+      "name": "post-baseline-authored-enqueue",
+      "status": "PASS",
+      "duration_ms": 12
+    },
+    {
+      "name": "post-baseline-authored-claim",
+      "status": "PASS",
+      "duration_ms": 28
+    },
+    {
+      "name": "post-baseline-split-child",
+      "status": "PASS",
+      "duration_ms": 10
+    },
+    {
+      "name": "edited-brief",
+      "status": "PASS",
+      "duration_ms": 10
+    },
+    {
+      "name": "node_not_dispatched",
+      "status": "PASS",
+      "duration_ms": 3
+    },
+    {
+      "name": "eligibility-projection",
+      "status": "PASS",
+      "duration_ms": 38
+    },
+    {
+      "name": "per-project-cap",
+      "status": "PASS",
+      "duration_ms": 28
+    },
+    {
+      "name": "daily-cap",
+      "status": "PASS",
+      "duration_ms": 59
+    },
+    {
+      "name": "FIFO-fairness",
+      "status": "PASS",
+      "duration_ms": 48
+    },
+    {
+      "name": "TTL-expiry",
+      "status": "PASS",
+      "duration_ms": 29
+    },
+    {
+      "name": "claim-template-mismatch",
+      "status": "PASS",
+      "duration_ms": 28
+    },
+    {
+      "name": "stale-claim",
+      "status": "PASS",
+      "duration_ms": 27
+    },
+    {
+      "name": "disabled-mode",
+      "status": "PASS",
+      "duration_ms": 12
+    }
+  ]
+}

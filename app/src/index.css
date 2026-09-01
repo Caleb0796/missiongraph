@@ -373,6 +373,27 @@ a:focus-visible {
   backdrop-filter: blur(14px);
 }
 
+.live-fleet-status {
+  border: 1px solid rgb(85 209 228 / 38%);
+  border-radius: 999px;
+  background: rgb(13 36 44 / 94%);
+  padding: 7px 11px;
+  color: #91dce4;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 24%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.live-fleet-status--degraded {
+  border-color: rgb(239 184 94 / 42%);
+  border-radius: 8px;
+  background: rgb(42 31 18 / 96%);
+  color: #e4bd7d;
+  line-height: 1.5;
+}
+
 .flight-panel-heading {
   display: flex;
   align-items: center;

@@ -7,9 +7,11 @@ import {
   validateSupervisorDecision,
 } from "./decision.js";
 import { EnvelopePump, type PreparedDelivery } from "./pump.js";
+import { FleetAdoptionLoop } from "./fleet.js";
 import { eventEnvelope, supervisorBrief } from "./prompts.js";
 import { readProcessStartTime, terminateProcess, type ProcessStartTimeLookup } from "./process.js";
 import { StateStore, type BridgeState } from "./state.js";
+import { ExecutionSlot } from "./slot.js";
 import { streamEvents } from "./sse.js";
 import type { Logger, MissionEvent, Snapshot, SupervisorDecision } from "./types.js";
 
@@ -33,6 +35,8 @@ export class MissionGraphBridge {
   private codex: CodexClient | undefined;
   private abort: AbortController | undefined;
   private stream: Promise<void> | undefined;
+  private fleet: FleetAdoptionLoop | undefined;
+  private readonly slot: ExecutionSlot;
   private stopping = false;
 
   constructor(
@@ -40,7 +44,9 @@ export class MissionGraphBridge {
     private readonly logger: Logger,
     private readonly dryRun = false,
     private readonly processStartTime: ProcessStartTimeLookup = readProcessStartTime,
-  ) {}
+  ) {
+    this.slot = new ExecutionSlot(config.fleetMode);
+  }
 
   async start(): Promise<void> {
     if (this.stateStore || this.stopping) throw new Error("bridge is already started or shutting down");
@@ -56,7 +62,15 @@ export class MissionGraphBridge {
       if (this.dryRun) assertDryRunState(stateStore.path, stateStore.state);
       const supervisorRecovery = await this.reconcileSupervisorProcess(stateStore);
       const codex = new CodexClient(this.config, this.logger, this.dryRun, this.processStartTime);
-      const actions = new ActionExecutor(this.config, stateStore, codex, this.logger, this.dryRun, this.processStartTime);
+      const actions = new ActionExecutor(
+        this.config,
+        stateStore,
+        codex,
+        this.logger,
+        this.dryRun,
+        this.processStartTime,
+        this.slot,
+      );
       this.codex = codex;
       this.actions = actions;
       if (this.stopping) throw new Error("bridge is shutting down");
@@ -75,7 +89,7 @@ export class MissionGraphBridge {
       }
 
       if (!stateStore.state.supervisor_thread_id) {
-        const result = await this.runSupervisor(codex.startSupervisor(supervisorBrief(currentSnapshot)));
+        const result = await this.runSupervisor(() => codex.startSupervisor(supervisorBrief(currentSnapshot)));
         if (!result.threadId) throw new Error("supervisor JSONL did not contain thread.started");
         stateStore.state.supervisor_thread_id = result.threadId;
         await stateStore.save();
@@ -105,6 +119,17 @@ export class MissionGraphBridge {
         (event: MissionEvent) => this.pump?.enqueue(event),
         this.logger,
       );
+      if (this.config.fleetMode) {
+        this.fleet = new FleetAdoptionLoop(
+          this.config,
+          stateStore,
+          actions,
+          this.slot,
+          this.logger,
+          this.processStartTime,
+        );
+        this.fleet.start();
+      }
     } catch (error) {
       this.actions?.beginShutdown();
       await Promise.all([this.codex?.stop(), this.actions?.terminateAll()]);
@@ -119,9 +144,10 @@ export class MissionGraphBridge {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.actions?.beginShutdown();
+    await this.fleet?.stop();
     this.abort?.abort();
     this.pump?.stop();
-    this.actions?.beginShutdown();
     await Promise.all([this.codex?.stop(), this.actions?.terminateAll()]);
     await this.actions?.stop();
     await this.stream;
@@ -133,6 +159,7 @@ export class MissionGraphBridge {
     this.actions = undefined;
     this.codex = undefined;
     this.stateStore = undefined;
+    this.fleet = undefined;
   }
 
   async whenIdle(): Promise<void> {
@@ -148,7 +175,7 @@ export class MissionGraphBridge {
     if (!threadId || !this.codex || !this.actions) throw new Error("supervisor thread is unavailable");
     const envelopes = events.map(eventEnvelope);
     const payload = JSON.stringify(envelopes.length === 1 ? envelopes[0] : envelopes);
-    const result = await this.runSupervisor(this.codex.resumeSupervisor(threadId, payload));
+    const result = await this.runSupervisor(() => this.codex!.resumeSupervisor(threadId, payload));
     const range = `${events[0]?.seq ?? "?"}-${events.at(-1)?.seq ?? "?"}`;
     const decision = await this.parseWithRetry(result.stdout, threadId, `envelope seq ${range}`);
     if (!decision) {
@@ -182,28 +209,45 @@ export class MissionGraphBridge {
     const first = parseSupervisorDecision(stdout, this.logger);
     if (first) return first;
     this.logger.warn(`retrying malformed supervisor decision for ${context}`);
-    const running = this.codex?.resumeSupervisor(threadId, strictDecisionReminder);
-    const retry = running ? await this.runSupervisor(running) : undefined;
+    const retry = this.codex
+      ? await this.runSupervisor(() => this.codex!.resumeSupervisor(threadId, strictDecisionReminder))
+      : undefined;
     return retry ? parseSupervisorDecision(retry.stdout, this.logger) : undefined;
   }
 
-  private async runSupervisor(running: RunningCodex): Promise<CodexResult> {
+  private async runSupervisor(start: () => RunningCodex): Promise<CodexResult> {
     const stateStore = this.stateStore;
     if (!stateStore) throw new Error("bridge state is unavailable");
-    const identity = await running.identity;
+    const lease = await this.slot.acquire("flagship supervisor");
+    let running: RunningCodex | undefined;
+    let identity: Awaited<RunningCodex["identity"]> | undefined;
+    try {
+      running = start();
+      identity = await running.identity;
+    } catch (error) {
+      lease.release();
+      throw error;
+    }
     stateStore.state.supervisor_pid = identity.pid;
     stateStore.state.supervisor_process_start_time = identity.starttime;
-    await stateStore.save();
     try {
+      await stateStore.save();
       return await running.completed;
+    } catch (error) {
+      await running.terminate().catch(() => undefined);
+      throw error;
     } finally {
-      if (
-        stateStore.state.supervisor_pid === identity.pid &&
-        stateStore.state.supervisor_process_start_time === identity.starttime
-      ) {
-        delete stateStore.state.supervisor_pid;
-        delete stateStore.state.supervisor_process_start_time;
-        await stateStore.save();
+      try {
+        if (
+          stateStore.state.supervisor_pid === identity.pid &&
+          stateStore.state.supervisor_process_start_time === identity.starttime
+        ) {
+          delete stateStore.state.supervisor_pid;
+          delete stateStore.state.supervisor_process_start_time;
+          await stateStore.save();
+        }
+      } finally {
+        lease.release();
       }
     }
   }

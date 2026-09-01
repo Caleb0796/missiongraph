@@ -211,6 +211,10 @@ function identifier(value: unknown, label: string): string {
   return parsed;
 }
 
+export function parseIdentifier(value: unknown, label: string): string {
+  return identifier(value, label);
+}
+
 function number(value: unknown, label: string, minimum = 0): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < minimum) {
     throw new EventValidationError(`${label} must be a finite number >= ${minimum}`);
@@ -829,12 +833,28 @@ export class EventStore {
         used_at TEXT NOT NULL,
         PRIMARY KEY (capability_ref, nonce)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS clone_baselines (
+        project_id TEXT PRIMARY KEY REFERENCES projects(id),
+        baseline_seq INTEGER NOT NULL CHECK(baseline_seq >= 0)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS fleet_requests (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        outcome TEXT,
+        note TEXT,
+        created_at TEXT NOT NULL,
+        adopted_at TEXT,
+        finished_at TEXT
+      ) STRICT;
       CREATE INDEX IF NOT EXISTS events_project_node ON events(project_id, node_ref, seq);
       CREATE INDEX IF NOT EXISTS events_project_edge ON events(project_id, edge_ref, seq);
       CREATE INDEX IF NOT EXISTS reporter_credentials_project ON reporter_credentials(project_id, expires_at);
       CREATE INDEX IF NOT EXISTS browser_sessions_project ON browser_sessions(project_id, expires_at);
       CREATE INDEX IF NOT EXISTS human_drafts_project ON human_drafts(project_id, session_id, expires_at);
       CREATE INDEX IF NOT EXISTS human_capabilities_project ON human_capabilities(project_id, session_id, expires_at);
+      CREATE INDEX IF NOT EXISTS fleet_requests_status_created ON fleet_requests(status, created_at);
     `);
   }
 
@@ -1335,6 +1355,45 @@ export class EventStore {
     };
   }
 
+  recordCloneBaseline(projectId: string): number {
+    const baseline = this.latestSeq(projectId);
+    this.database
+      .prepare("INSERT INTO clone_baselines (project_id, baseline_seq) VALUES (?, ?)")
+      .run(projectId, baseline);
+    return baseline;
+  }
+
+  cloneBaseline(projectId: string): number | undefined {
+    const row = this.database
+      .prepare("SELECT baseline_seq FROM clone_baselines WHERE project_id = ?")
+      .get(projectId) as { baseline_seq: number } | undefined;
+    return row?.baseline_seq;
+  }
+
+  humanCapabilityUseMatches(input: {
+    projectId: string;
+    ref: string;
+    nonce: string;
+    action: HumanAction;
+    subjectHash: string;
+  }): boolean {
+    const row = this.database
+      .prepare(
+        `SELECT capability.actions_json, capability.subject_hash
+         FROM human_capabilities AS capability
+         JOIN human_capability_uses AS use ON use.capability_ref = capability.ref
+         WHERE capability.ref = ? AND capability.project_id = ? AND use.nonce = ?`,
+      )
+      .get(input.ref, input.projectId, input.nonce) as
+      | { actions_json: string; subject_hash: string }
+      | undefined;
+    return Boolean(
+      row &&
+      row.subject_hash === input.subjectHash &&
+      (JSON.parse(row.actions_json) as HumanAction[]).includes(input.action),
+    );
+  }
+
   latestSeq(projectId: string): number {
     if (!this.hasProject(projectId)) throw new UnknownProjectError(projectId);
     const row = this.database
@@ -1401,18 +1460,19 @@ export class EventStore {
     if (options.baseSeq !== undefined && options.baseSeq !== currentSeq) {
       throw new StaleSequenceError(currentSeq);
     }
+    options.authorize?.();
+    const validatedInput = parseEventInput(input);
     const event = {
       seq: currentSeq + 1,
       project_id: projectId,
       ts: options.ts ?? new Date().toISOString(),
-      ...input,
+      ...validatedInput,
     } as Event;
-    options.authorize?.();
     reduceEvent(fold(this.listEvents(projectId)), event, {
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
       ...(options.trustedImport === true ? { replay: true } : {}),
     });
-    const { nodeRef, edgeRef } = refs(input);
+    const { nodeRef, edgeRef } = refs(validatedInput);
     this.database
       .prepare(
         `INSERT INTO events
@@ -1461,9 +1521,10 @@ export class EventStore {
         const timestamp = options.ts ?? new Date().toISOString();
         const batchHash = createHash("sha256").update(idemKey).digest("hex");
         options.authorize?.();
+        const validatedInputs = inputs.map((input) => parseEventInput(input));
         let state = fold(this.listEvents(projectId));
         const events: Event[] = [];
-        for (const [index, input] of inputs.entries()) {
+        for (const [index, input] of validatedInputs.entries()) {
           const event = {
             seq: currentSeq + index + 1,
             project_id: projectId,

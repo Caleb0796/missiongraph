@@ -31,6 +31,11 @@ import {
   type IdentitySource,
 } from './client-logic'
 import { SettledDebouncer } from './settled-debounce'
+import {
+  LiveFleetCoordinator,
+  type FleetDispatchMetadata,
+  type FleetRequestStatus,
+} from './fleet'
 
 const IDENTITY_KEY = 'missiongraph.visitor-identity'
 const fixtureSessionId = crypto.randomUUID()
@@ -261,6 +266,61 @@ async function jsonResponse<T>(response: Response): Promise<T> {
   return body as T
 }
 
+interface FleetStatusResponse {
+  enabled: boolean
+  queue_depth: number
+  daily_remaining: number
+  project_remaining: number
+}
+
+interface FleetRequestResponse {
+  id: string
+  status: FleetRequestStatus
+  position?: number
+}
+
+async function fleetResponse<T>(path: string, init: RequestInit) {
+  const abort = new AbortController()
+  const timeout = window.setTimeout(() => abort.abort(), 4_000)
+  try {
+    return await jsonResponse<T>(
+      await fetch(endpoint(path), { ...init, signal: abort.signal }),
+    )
+  } finally {
+    window.clearTimeout(timeout)
+  }
+}
+
+const liveFleet = new LiveFleetCoordinator({
+  transport: {
+    status: async (session) =>
+      fleetResponse<FleetStatusResponse>(
+        `/api/p/${encodeURIComponent(session.project)}/fleet-status`,
+        { headers: { 'x-mg-token': session.token } },
+      ),
+    create: async (session, nodeId) =>
+      fleetResponse<FleetRequestResponse>(
+        `/api/p/${encodeURIComponent(session.project)}/fleet-requests`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-mg-token': session.token,
+          },
+          body: JSON.stringify({ node_id: nodeId }),
+        },
+      ),
+    get: async (session, requestId) =>
+      fleetResponse<FleetRequestResponse>(
+        `/api/p/${encodeURIComponent(session.project)}/fleet-requests/${encodeURIComponent(requestId)}`,
+        { headers: { 'x-mg-token': session.token } },
+      ),
+  },
+  onDisplay: (display) => useMissionStore.getState().setLiveFleet(display),
+  schedule: (callback, milliseconds) => window.setTimeout(callback, milliseconds),
+  cancel: (timer) => window.clearTimeout(timer as number),
+})
+
 function stableValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stableValue)
   if (typeof value !== 'object' || value === null) return value
@@ -360,6 +420,11 @@ async function issueBrowserSession(candidate: ActiveIdentity) {
     epoch: candidate.epoch,
   }
   useMissionStore.getState().setSessionId(session.session_id)
+  liveFleet.activate({
+    project: candidate.client.project,
+    token: candidate.client.token,
+    sessionId: session.session_id,
+  })
   return browserSession
 }
 
@@ -410,6 +475,7 @@ function deactivateIdentity(candidate?: ActiveIdentity) {
   identity = null
   browserSession = null
   policyCapabilities.clear()
+  liveFleet.activate(null)
 }
 
 function calibrateClock(
@@ -818,6 +884,7 @@ function handleRealtimeMessage(raw: string, stamp: StreamStamp) {
     }
     calibrateClock(identity!, data.event.ts, Date.now(), null, true)
     store.applyEvent(data.event)
+    liveFleet.noteLedgerEvent(data.event)
     proveConnectionStable(stamp, true)
     scheduleServerDigest(identity!)
   } else {
@@ -1045,6 +1112,10 @@ async function postMutation<T extends EvType>(
     context,
     'mutation result',
   )
+  if (type === 'DISPATCHED') {
+    const dispatched = payload as EventPayloadMap['DISPATCHED']
+    void liveFleet.dispatch(dispatched.node_id)
+  }
   await waitForSequence(result.seq, context)
   return result.seq
 }
@@ -1504,6 +1575,18 @@ export function mutate<T extends EvType>(
   return executeSingleWithPresence(type, payload, actor, context)
 }
 
+export function fleetResultForDispatch(nodeId: string): FleetDispatchMetadata | null {
+  return liveFleet.resultForDispatch(nodeId)
+}
+
+export function mountLiveFleet() {
+  liveFleet.setMounted(true)
+}
+
+export function unmountLiveFleet() {
+  liveFleet.setMounted(false)
+}
+
 export function mutateBatch(
   batch: MutationBatchItem[],
   options: Pick<MutationOptions, 'actor' | 'staleMode' | 'capability'> = {},
@@ -1932,6 +2015,7 @@ function loadHistoryWithWebSocket(
         return
       }
       useMissionStore.getState().recordHistoricalEvent(data.event)
+      liveFleet.noteLedgerEvent(data.event)
       if (data.event.seq >= target) finish()
     })
     historySocket.addEventListener('error', () =>
@@ -1991,6 +2075,7 @@ function loadHistoryWithSse(
         return
       }
       useMissionStore.getState().recordHistoricalEvent(data.event)
+      liveFleet.noteLedgerEvent(data.event)
       if (data.event.seq >= target) finish()
     })
     historySource.addEventListener('error', () =>

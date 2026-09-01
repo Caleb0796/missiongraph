@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import type { BridgeConfig } from "./config.js";
 
+const reporterRequestTimeoutMs = 30_000;
+
 export interface ReporterEvent {
   actor: "supervisor" | `worker:${string}`;
   type: string;
@@ -34,7 +36,10 @@ export class ReporterClient {
     return `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/report`;
   }
 
-  async issue(actor: ReporterEvent["actor"]): Promise<ReporterCredential> {
+  async issue(actor: ReporterEvent["actor"], signal?: AbortSignal): Promise<ReporterCredential> {
+    const boundedSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(reporterRequestTimeoutMs)])
+      : AbortSignal.timeout(reporterRequestTimeoutMs);
     const response = await fetch(
       `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/reporter-credentials`,
       {
@@ -44,6 +49,7 @@ export class ReporterClient {
           "content-type": "application/json",
         },
         body: JSON.stringify({ actor }),
+        signal: boundedSignal,
       },
     );
     if (!response.ok) {

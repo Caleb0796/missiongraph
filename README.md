@@ -65,13 +65,17 @@ pnpm dev
 
 ## Testing
 
-146 tests across the three packages (CI runs them on every push):
+232 tests across the three packages (CI runs them on every push):
 
 ```sh
-cd server && pnpm test   # 36 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, and nonce-bound human-presence capabilities
-cd bridge && pnpm test   # 41 — decision validation, crash replay, PID/lock safety, credential renewal, and a human-confirmed dispatch integration against the real server
-cd app    && pnpm test   # 69 — tool envelopes, identity fencing/recovery, split confirmation, S2 policy/action dialogs, late WebMCP injection, tier detection, and real-server HTTP paths
+cd server && pnpm test   # 63 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, and the fleet queue
+cd bridge && pnpm test   # 74 — decision validation, crash replay, PID/lock safety, credential renewal, lease and watchdog behaviour, the worker-launch handshake, and human-confirmed dispatch integrations against the real server
+cd app    && pnpm test   # 95 — tool envelopes, identity fencing/recovery, split confirmation, S2 policy/action dialogs, late WebMCP injection, tier detection, fleet-off dispatch invariants, and real-server HTTP paths
 ```
+
+The fleet contract has its own scenario harness on top of those: `node eval/fleet/run.mjs --stub` runs 16
+acceptance scenarios against an in-process mirror of the server, and `--real` runs them against a live
+server and bridge.
 
 Beyond unit/integration tests, every milestone went through an **adversarial review loop** (independent reviewer session → findings → fix round → fix-verification round) and a **live functional arbitration** on the real stack — 50+ P1/P2 findings found and closed this way, with the full trail in [PROGRESS.md](PROGRESS.md).
 

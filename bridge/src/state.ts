@@ -38,6 +38,29 @@ export interface WorkerState {
   reporter_config_path?: string;
   pid?: number;
   process_start_time?: string;
+  node_id?: string;
+  project_id?: string;
+  fleet_request_id?: string;
+}
+
+export interface FleetAdoptionState {
+  request_id: string;
+  project_id: string;
+  node_id: string;
+  node: {
+    title: string;
+    brief: string;
+    estimate: number;
+  };
+  visitor_token: string;
+  worker_key: string;
+  status: "adopted" | "running" | "completing" | "completed" | "abandoned";
+  adopted_at: string;
+  started_at?: string;
+  heartbeat_at?: string;
+  outcome?: "done" | "failed";
+  note?: string;
+  finished_at?: string;
 }
 
 export interface BridgeState {
@@ -51,6 +74,7 @@ export interface BridgeState {
   pending_actions: PendingAction[];
   dead_letters: DeadLetter[];
   workers: Record<string, WorkerState>;
+  fleet_adoption?: FleetAdoptionState;
 }
 
 interface LockRecord extends ProcessIdentity {
@@ -181,7 +205,8 @@ function stateValue(value: unknown, projectId: string): BridgeState {
     (parsed.supervisor_thread_id !== undefined && typeof parsed.supervisor_thread_id !== "string") ||
     (parsed.supervisor_pid !== undefined && (!Number.isSafeInteger(parsed.supervisor_pid) || parsed.supervisor_pid <= 0)) ||
     (parsed.supervisor_process_start_time !== undefined && typeof parsed.supervisor_process_start_time !== "string") ||
-    (parsed.recovery_note !== undefined && typeof parsed.recovery_note !== "string")
+    (parsed.recovery_note !== undefined && typeof parsed.recovery_note !== "string") ||
+    (parsed.fleet_adoption !== undefined && !fleetAdoptionValue(parsed.fleet_adoption))
   ) {
     throw new Error(`state does not match project ${projectId}`);
   }
@@ -190,7 +215,10 @@ function stateValue(value: unknown, projectId: string): BridgeState {
       typeof worker !== "object" ||
       worker === null ||
       typeof worker.worktree !== "string" ||
-      typeof worker.branch !== "string"
+      typeof worker.branch !== "string" ||
+      (worker.node_id !== undefined && typeof worker.node_id !== "string") ||
+      (worker.project_id !== undefined && typeof worker.project_id !== "string") ||
+      (worker.fleet_request_id !== undefined && typeof worker.fleet_request_id !== "string")
     ) {
       throw new Error("worker state is invalid");
     }
@@ -235,6 +263,32 @@ function stateValue(value: unknown, projectId: string): BridgeState {
     ) throw new Error("dead letter ledger entry is invalid");
   }
   return parsed as BridgeState;
+}
+
+function fleetAdoptionValue(value: unknown): value is FleetAdoptionState {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const adoption = value as Partial<FleetAdoptionState>;
+  const node = adoption.node as Partial<FleetAdoptionState["node"]> | undefined;
+  return (
+    typeof adoption.request_id === "string" &&
+    typeof adoption.project_id === "string" &&
+    typeof adoption.node_id === "string" &&
+    typeof adoption.visitor_token === "string" &&
+    typeof adoption.worker_key === "string" &&
+    ["adopted", "running", "completing", "completed", "abandoned"].includes(adoption.status ?? "") &&
+    Number.isFinite(Date.parse(adoption.adopted_at ?? "")) &&
+    (adoption.started_at === undefined || Number.isFinite(Date.parse(adoption.started_at))) &&
+    (adoption.heartbeat_at === undefined || Number.isFinite(Date.parse(adoption.heartbeat_at))) &&
+    (adoption.outcome === undefined || adoption.outcome === "done" || adoption.outcome === "failed") &&
+    (adoption.note === undefined || typeof adoption.note === "string") &&
+    (adoption.finished_at === undefined || Number.isFinite(Date.parse(adoption.finished_at))) &&
+    typeof node === "object" &&
+    node !== null &&
+    typeof node.title === "string" &&
+    typeof node.brief === "string" &&
+    typeof node.estimate === "number" &&
+    Number.isFinite(node.estimate)
+  );
 }
 
 export class StateStore {

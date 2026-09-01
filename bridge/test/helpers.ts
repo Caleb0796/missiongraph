@@ -46,6 +46,10 @@ export function config(root: string, repoPath = join(root, "repo")): BridgeConfi
     model: "gpt-5.6-sol",
     effort: "high",
     statePath: join(root, "state.json"),
+    fleetMode: false,
+    fleetPollMs: 15_000,
+    fleetRunTtlMs: 15 * 60_000,
+    fleetHeartbeatMs: 45_000,
   };
 }
 

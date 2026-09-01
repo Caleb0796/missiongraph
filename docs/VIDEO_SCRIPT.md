@@ -20,13 +20,15 @@ Recording frame: the whole ChatGPT desktop window — agent conversation (left p
 - **VO**: "I state a policy in one sentence. The agent cannot self-authorize — a visible human confirmation mints the grant, then the agent clears the queue under it; every approval records the policy it cited and consumes a nonce-bound use. The idle radar finds unstaffed work; one dispatch, and a real Codex worker picks it up — live."
 
 ### 3. Mid-flight rewire — 1:55–2:35 (Creativity & Ambition)
-- **Action**: select the **running rate-limit task** (contextual tools register on selection) → **"Split the rate-limit task into config and enforcement halves — show me the blast radius first."** → blast-radius preview → **"Apply it."** → confirm → edges re-route, critical path recomputes, workers get re-briefed.
-- **VO**: "Mid-flight, I re-engineer the graph itself. Selecting a node registers contextual tools on the fly. A split previews its blast radius before anything applies — then workers are re-briefed and the critical path re-routes, live."
+- **Action**: select the **running rate-limit task** (contextual tools register on selection) → **"Split the rate-limit task into config and enforcement halves — show me the blast radius first."** → blast-radius preview → **"Apply it."** → confirm → the parent's children appear, edges re-route, and the critical path recomputes.
+- **VO**: "Mid-flight, I re-engineer the graph itself. Selecting a node registers contextual tools on the fly. A split previews its blast radius before anything applies — then the edges re-route and the critical path recomputes, live, on the same append-only ledger."
+- **Do NOT claim a live re-brief.** A worker whose process is still `live` cannot be re-briefed: `resumeWorker` rejects `rebrief_worker` for a live process and journals it instead (bridge/src/actions.ts). The split is recorded and the graph rewires; the running worker keeps its original brief until it exits. Saying "workers get re-briefed" on camera would be a claim the code does not honour.
 
 ### 4. Close — 2:35–3:00 (Impact)
 - **Screen**: open a node dossier (Brief / Handoff / Decisions) → timeline replay → hold on full graph + URL.
 - **VO**: "Everything you saw is one append-only ledger — every actor labeled, every decision auditable. The mission judges explore is a real run: real workers, real commits, real approvals. Supervision-by-exception for agent fleets — missiongraph.vercel.app, native in ChatGPT's browser."
-- **End card**: `missiongraph.vercel.app · 156 tests · CI · adversarially reviewed`
+- **End card**: `missiongraph.vercel.app · 232 tests · CI · adversarially reviewed`
+  Use the count that matches what you actually ship: **232** with the judge-fleet branch merged (server 63 / bridge 74 / app 95), **162** without it (server 42 / bridge 42 / app 78). Re-run the three suites on recording day rather than trusting this line.
 
 ## Pre-flight checklist (recording day)
 

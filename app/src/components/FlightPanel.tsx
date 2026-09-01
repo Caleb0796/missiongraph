@@ -5,6 +5,7 @@ import {
   idleRadar,
 } from '../model/graph'
 import { useMissionStore } from '../store/mission-store'
+import { liveFleetDisplayText } from '../transport/fleet'
 
 interface FlightPanelProps {
   now: number
@@ -27,6 +28,7 @@ export function FlightPanel({ now }: FlightPanelProps) {
   const approve = useMissionStore((state) => state.approve)
   const reject = useMissionStore((state) => state.reject)
   const dispatch = useMissionStore((state) => state.dispatch)
+  const liveFleet = useMissionStore((state) => state.liveFleet)
   const [selectedPolicies, setSelectedPolicies] = useState<Record<string, string>>(
     {},
   )
@@ -48,6 +50,14 @@ export function FlightPanel({ now }: FlightPanelProps) {
 
   return (
     <aside className="flight-panel" aria-label="Flight supervision">
+      {liveFleet && (
+        <div
+          className={`live-fleet-status live-fleet-status--${liveFleet.phase}`}
+          role="status"
+        >
+          {liveFleetDisplayText(liveFleet)}
+        </div>
+      )}
       <section>
         <header className="flight-panel-heading">
           <div>
