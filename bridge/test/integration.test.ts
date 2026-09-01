@@ -278,6 +278,163 @@ describe("bridge dry-run integration", () => {
   );
 
   it(
+    "pauses a running mock worker when SIGTERM shuts down the bridge",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "missiongraph-sigterm-integration-"));
+      const port = await freePort();
+      const reporterToken = "sigterm-integration-reporter-token";
+      const serverUrl = `http://127.0.0.1:${port}`;
+      const server = spawn("pnpm", ["--dir", join(repositoryRoot, "server"), "exec", "tsx", "src/http.ts"], {
+        cwd: repositoryRoot,
+        env: {
+          ...process.env,
+          REPORTER_TOKEN: reporterToken,
+          DB_PATH: join(root, "sigterm.sqlite"),
+          PORT: String(port),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let serverStderr = "";
+      server.stderr?.on("data", (chunk: Buffer) => {
+        serverStderr += chunk.toString();
+      });
+      let bridgeProcess: ChildProcess | undefined;
+      let bridgeStderr = "";
+      try {
+        const clone = await cloneWhenReady(serverUrl);
+        const repoPath = join(root, "target-repo");
+        const statePath = join(root, "bridge-state.json");
+        await initializeRepo(repoPath);
+        await mutation(
+          serverUrl,
+          clone.project,
+          clone.token,
+          "TASK_ADDED",
+          {
+            node: {
+              id: "sigterm-node",
+              title: "SIGTERM node",
+              brief: "Exercise graceful worker detachment.",
+              estimate_min: 1,
+              tags: ["sigterm"],
+              state: "queued",
+            },
+          },
+          "sigterm-add",
+        );
+        await confirmedMutation(
+          serverUrl,
+          clone.project,
+          clone.token,
+          "DISPATCHED",
+          {
+            node_id: "sigterm-node",
+            brief_override: "MOCK_REPORT_LIFECYCLE MOCK_HANG",
+            bypass_cap: true,
+          },
+          "sigterm-dispatch",
+        );
+
+        bridgeProcess = spawn(
+          process.execPath,
+          [join(repositoryRoot, "server/node_modules/tsx/dist/cli.mjs"), "test/sigterm-bridge.ts"],
+          {
+            cwd: join(repositoryRoot, "bridge"),
+            env: {
+              ...process.env,
+              MG_SERVER_URL: serverUrl,
+              MG_PROJECT_ID: clone.project,
+              MG_VISITOR_TOKEN: clone.token,
+              MG_REPORTER_CREDENTIAL: reporterToken,
+              MG_TARGET_REPO: repoPath,
+              MG_BRIDGE_STATE: statePath,
+              FLEET_MODE: "0",
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        bridgeProcess.stderr?.on("data", (chunk: Buffer) => {
+          bridgeStderr += chunk.toString();
+        });
+
+        let workerPid: number | undefined;
+        let nodeState: string | undefined;
+        for (let attempt = 0; attempt < 200 && (!workerPid || nodeState !== "running"); attempt += 1) {
+          const snapshotResponse = await fetch(
+            `${serverUrl}/api/p/${encodeURIComponent(clone.project)}/snapshot`,
+            { headers: { "x-mg-token": clone.token } },
+          );
+          if (snapshotResponse.ok) {
+            const snapshot = await snapshotResponse.json() as {
+              state: { nodes: Record<string, { state: string }> };
+            };
+            nodeState = snapshot.state.nodes["sigterm-node"]?.state;
+          }
+          try {
+            const persisted = JSON.parse(await readFile(statePath, "utf8")) as {
+              workers: Record<string, { pid?: number }>;
+            };
+            workerPid = persisted.workers["sigterm-node"]?.pid;
+          } catch {
+            workerPid = undefined;
+          }
+          if (!workerPid || nodeState !== "running") {
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+          }
+        }
+        expect(nodeState, bridgeStderr).toBe("running");
+        expect(workerPid, bridgeStderr).toEqual(expect.any(Number));
+        expect(() => process.kill(workerPid!, 0)).not.toThrow();
+
+        await stopProcess(bridgeProcess);
+        bridgeProcess = undefined;
+
+        const persisted = JSON.parse(await readFile(statePath, "utf8")) as {
+          workers: Record<string, { status: string; pid?: number }>;
+        };
+        expect(persisted.workers["sigterm-node"]).toMatchObject({ status: "idle" });
+        expect(persisted.workers["sigterm-node"]).not.toHaveProperty("pid");
+        expect(() => process.kill(workerPid!, 0)).toThrow();
+
+        const snapshotResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(clone.project)}/snapshot`, {
+          headers: { "x-mg-token": clone.token },
+        });
+        const snapshot = await snapshotResponse.json() as {
+          state: { nodes: Record<string, { state: string }> };
+        };
+        expect(snapshot.state.nodes["sigterm-node"]?.state).toBe("paused");
+        const ledgerResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(clone.project)}/export`, {
+          headers: { "x-mg-token": clone.token },
+        });
+        const ledger = await ledgerResponse.json() as {
+          events: { actor: string; type: string; payload: Record<string, unknown> }[];
+        };
+        expect(ledger.events.filter((event) =>
+          event.actor === "worker:sigterm-node" &&
+          event.type === "NODE_STATE_CHANGED" &&
+          event.payload.to === "paused"
+        )).toEqual([
+          expect.objectContaining({
+            payload: {
+              node_id: "sigterm-node",
+              from: "running",
+              to: "paused",
+              detail: "worker detached during bridge shutdown",
+            },
+          }),
+        ]);
+        expect(bridgeStderr).not.toContain("Error:");
+      } finally {
+        if (bridgeProcess) await stopProcess(bridgeProcess);
+        await stopProcess(server);
+        await rm(root, { recursive: true, force: true });
+      }
+      expect(serverStderr).not.toContain("Error:");
+    },
+    20_000,
+  );
+
+  it(
     "adopts a seeded clone through the real fleet server and detaches after reported worker lifecycle",
     async () => {
       const root = await mkdtemp(join(tmpdir(), "missiongraph-fleet-integration-"));

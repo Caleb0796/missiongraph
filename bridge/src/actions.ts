@@ -60,6 +60,7 @@ const maximumTimerDelayMs = 2_147_483_647;
 const actionRetryDelaysMs = [100, 500];
 const recoveredLookupRetryDelaysMs = [50, 100];
 const maximumDeadLetters = 50;
+const detachedWorkerDetail = "worker detached during bridge shutdown";
 
 interface WorkerCodexClient {
   startWorker(
@@ -129,6 +130,7 @@ export class ActionExecutor {
     for (const [nodeId, worker] of Object.entries(this.stateStore.state.workers)) {
       const identity = workerIdentity(worker);
       if (worker.status === "idle" || worker.status === "dead") {
+        await this.reconcileDetachedFlagship(nodeId, worker, true);
         if (worker.reporter_credential || worker.reporter_expires || worker.reporter_config_path) {
           await this.clearReporterCredential(worker);
           changed = true;
@@ -141,6 +143,7 @@ export class ActionExecutor {
         continue;
       }
       if (!identity || !await processMatches(identity, this.processStartTime)) {
+        await this.reconcileDetachedFlagship(nodeId, worker, true);
         worker.status = "dead";
         delete worker.pid;
         delete worker.process_start_time;
@@ -151,6 +154,7 @@ export class ActionExecutor {
           text: `Startup reconciliation marked worker ${nodeId} dead because its persisted process identity is missing or no longer matches. The thread id was retained for a later rebrief resume attempt.`,
         });
       } else if (worker.status === "spawning") {
+        await this.reconcileDetachedFlagship(nodeId, worker, true);
         await terminateProcess(identity, { lookup: this.processStartTime });
         worker.status = "dead";
         delete worker.pid;
@@ -164,6 +168,7 @@ export class ActionExecutor {
       } else if (worker.status === "live") {
         const lease = this.slot.tryAcquire(`recovered worker ${nodeId}`);
         if (!lease) {
+          await this.reconcileDetachedFlagship(nodeId, worker, true);
           await terminateProcess(identity, { lookup: this.processStartTime });
           worker.status = "dead";
           delete worker.pid;
@@ -243,7 +248,7 @@ export class ActionExecutor {
   async terminateAll(): Promise<void> {
     this.beginShutdown();
     const results = await Promise.allSettled(
-      Object.keys(this.stateStore.state.workers).map((nodeId) => this.killWorker(nodeId)),
+      Object.keys(this.stateStore.state.workers).map((nodeId) => this.killWorker(nodeId, true)),
     );
     for (const result of results) {
       if (result.status === "rejected") {
@@ -780,8 +785,15 @@ export class ActionExecutor {
     }
   }
 
-  private async killWorker(nodeId: string): Promise<void> {
+  private async killWorker(nodeId: string, bridgeShutdown = false): Promise<void> {
     const worker = this.stateStore.state.workers[nodeId];
+    if (bridgeShutdown && worker && worker.status !== "dead") {
+      await this.reconcileDetachedFlagship(nodeId, worker, false).catch((error: unknown) => {
+        this.logger.error(
+          `failed to pause detached worker ${nodeId} during bridge shutdown: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }
     if (!worker || worker.status === "dead") {
       this.logger.warn(`kill_worker ignored because node ${nodeId} has no tracked active process`);
       if (worker) {
@@ -809,6 +821,64 @@ export class ActionExecutor {
     } finally {
       this.releaseLease(nodeId);
     }
+  }
+
+  private async reconcileDetachedFlagship(
+    nodeId: string,
+    worker: WorkerState,
+    freshCredential: boolean,
+  ): Promise<void> {
+    if (worker.fleet_request_id) return;
+    if (await this.serverNodeState(nodeId) !== "running") return;
+    const actor = `worker:${nodeId}` as const;
+    const expires = Date.parse(worker.reporter_expires ?? "");
+    let token = worker.reporter_credential;
+    if (
+      freshCredential ||
+      !token ||
+      !Number.isFinite(expires) ||
+      expires <= Date.now() + 5_000
+    ) {
+      token = (await this.reporter.issue(actor)).token;
+    }
+    const idemKey = createHash("sha256")
+      .update(this.config.projectId)
+      .update("\0")
+      .update(nodeId)
+      .update("\0")
+      .update(worker.thread_id ?? worker.branch)
+      .update("\0")
+      .update(token)
+      .update("\0")
+      .update(detachedWorkerDetail)
+      .digest("hex");
+    const reporter = new ReporterClient({ ...this.config, reporterCredential: token }, this.dryRun);
+    try {
+      await reporter.post(reporterPayload(actor, "NODE_STATE_CHANGED", {
+        node_id: nodeId,
+        from: "running",
+        to: "paused",
+        detail: detachedWorkerDetail,
+      }, idemKey));
+    } catch (error) {
+      if (await this.serverNodeState(nodeId) !== "running") return;
+      throw error;
+    }
+    this.logger.info(`paused detached worker ${nodeId} in the server ledger`);
+  }
+
+  private async serverNodeState(nodeId: string): Promise<string | undefined> {
+    const response = await fetch(
+      `${this.config.serverUrl}/api/p/${encodeURIComponent(this.config.projectId)}/snapshot`,
+      {
+        headers: { "x-mg-token": this.config.visitorToken },
+        signal: AbortSignal.timeout(30_000),
+      },
+    );
+    if (!response.ok) throw new Error(`snapshot GET failed (${response.status}): ${await response.text()}`);
+    const body = await response.json() as { state?: { nodes?: Record<string, { state?: unknown }> } };
+    const state = body.state?.nodes?.[nodeId]?.state;
+    return typeof state === "string" ? state : undefined;
   }
 
   private reporterFor(worker: WorkerState): ReporterClient {

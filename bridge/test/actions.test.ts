@@ -34,6 +34,98 @@ function running(
 }
 
 describe("ActionExecutor", () => {
+  it("reconciles an idle local worker from running to paused with a fresh credential", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-detached-recovery-"));
+    let serverState = "running";
+    const reports: Record<string, unknown>[] = [];
+    const credentials: string[] = [];
+    const authorizations: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/snapshot")) {
+        return Response.json({ state: { nodes: { a: { state: serverState } } }, cursor: "8" });
+      }
+      if (url.endsWith("/reporter-credentials")) {
+        const body = JSON.parse(String(init?.body)) as { actor: string };
+        credentials.push(body.actor);
+        return Response.json({
+          token: `fresh-worker-token-${credentials.length}`,
+          actor: body.actor,
+          expires: "2099-08-30T10:15:00.000Z",
+        });
+      }
+      authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      reports.push(body);
+      serverState = "paused";
+      return Response.json({ seq: 9 });
+    }));
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    try {
+      const bridgeConfig = config(root);
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, lockProcessStartTime);
+      const reporterConfigPath = join(root, "idle.reporter.conf");
+      await writeFile(reporterConfigPath, "header = \"Authorization: Bearer old-token\"\n");
+      state.state.workers.a = {
+        status: "idle",
+        thread_id: "worker-a",
+        worktree: join(root, "worker-a"),
+        branch: "work/a",
+        reporter_credential: "old-token",
+        reporter_expires: "2099-08-30T10:15:00.000Z",
+        reporter_config_path: reporterConfigPath,
+      };
+      await state.save();
+      executor = new ActionExecutor(bridgeConfig, state, {
+        startWorker: () => { throw new Error("not used"); },
+        resumeWorker: () => { throw new Error("not used"); },
+      }, new TestLogger());
+
+      await executor.initialize();
+      await executor.initialize();
+      serverState = "running";
+      await executor.initialize();
+      await executor.initialize();
+
+      expect(credentials).toEqual(["worker:a", "worker:a"]);
+      expect(authorizations).toEqual(["Bearer fresh-worker-token-1", "Bearer fresh-worker-token-2"]);
+      expect(reports).toEqual([
+        expect.objectContaining({
+          actor: "worker:a",
+          type: "NODE_STATE_CHANGED",
+          payload: {
+            node_id: "a",
+            from: "running",
+            to: "paused",
+            detail: "worker detached during bridge shutdown",
+          },
+          idem_key: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+        expect.objectContaining({
+          actor: "worker:a",
+          type: "NODE_STATE_CHANGED",
+          payload: {
+            node_id: "a",
+            from: "running",
+            to: "paused",
+            detail: "worker detached during bridge shutdown",
+          },
+          idem_key: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+      ]);
+      expect(new Set(reports.map((report) => report.idem_key)).size).toBe(2);
+      expect(state.state.workers.a).toMatchObject({ status: "idle", thread_id: "worker-a" });
+      expect(state.state.workers.a).not.toHaveProperty("reporter_credential");
+      await expect(readFile(reporterConfigPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await executor?.stop();
+      await state?.close();
+      vi.unstubAllGlobals();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("prunes stale worktree metadata during startup reconciliation", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-worktree-prune-"));
     let state: StateStore | undefined;
@@ -657,6 +749,9 @@ describe("ActionExecutor", () => {
     const issued: string[] = [];
     const reports: Record<string, unknown>[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/snapshot")) {
+        return Response.json({ state: { nodes: { stale: { state: "paused" } } }, cursor: "1" });
+      }
       if (String(input).endsWith("/reporter-credentials")) {
         const body = JSON.parse(String(init?.body)) as { actor: string };
         issued.push(body.actor);
