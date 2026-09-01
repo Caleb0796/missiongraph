@@ -117,7 +117,13 @@ export class CodexClient {
     return this.start(this.supervisorResumeArgs(threadId, envelope), this.config.targetRepoPath);
   }
 
-  startWorker(nodeId: string, brief: string, worktree: string, reporterConfigPath: string): RunningCodex {
+  startWorker(
+    nodeId: string,
+    brief: string,
+    worktree: string,
+    reporterConfigPath: string,
+    workerConfig: BridgeConfig = this.config,
+  ): RunningCodex {
     const running = this.start(
       [
         "exec",
@@ -137,7 +143,7 @@ export class CodexClient {
         "--json",
       ],
       this.config.targetRepoPath,
-      workerChildEnvironment(this.config, nodeId, reporterConfigPath),
+      workerChildEnvironment(workerConfig, nodeId, reporterConfigPath),
     );
     void running.completed.catch(() => undefined);
     return running;

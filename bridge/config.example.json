@@ -6,5 +6,6 @@
   "target_repo_path": "/absolute/path/to/demo-repo",
   "codex_binary_path": "codex",
   "model": "gpt-5.6-sol",
-  "effort": "high"
+  "effort": "high",
+  "fleet_mode": false
 }

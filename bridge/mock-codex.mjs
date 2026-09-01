@@ -78,5 +78,9 @@ if (brief.startsWith("MISSIONGRAPH SUPERVISOR")) {
   const nodeId = brief.match(/Node ID: ([^\n]+)/)?.[1] ?? createHash("sha1").update(brief).digest("hex").slice(0, 8);
   emit({ type: "thread.started", thread_id: `mock-worker-${nodeId}` });
   agent({ worker_complete: true });
+  const delay = Number(brief.match(/MOCK_DELAY_(\d+)/)?.[1] ?? "0");
+  if (brief.includes("MOCK_HANG")) await new Promise(() => setInterval(() => undefined, 1_000));
+  if (delay > 0) await new Promise((resolvePromise) => setTimeout(resolvePromise, delay));
+  if (brief.includes("MOCK_FAIL")) process.exit(12);
 }
 await finish();

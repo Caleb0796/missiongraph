@@ -13,6 +13,10 @@ export interface BridgeConfig {
   model: string;
   effort: string;
   statePath: string;
+  fleetMode: boolean;
+  fleetPollMs: number;
+  fleetRunTtlMs: number;
+  fleetHeartbeatMs: number;
 }
 
 interface FileConfig {
@@ -25,6 +29,7 @@ interface FileConfig {
   model?: string;
   effort?: string;
   state_path?: string;
+  fleet_mode?: boolean | number | string;
 }
 
 export function resolveBridgePackageRoot(moduleUrl: string): string {
@@ -46,6 +51,19 @@ function required(value: string | undefined, name: string): string {
 
 function choose(envName: string, fileValue: string | undefined): string | undefined {
   return process.env[envName] || fileValue;
+}
+
+function fleetEnabled(fileValue: FileConfig["fleet_mode"]): boolean {
+  const value = process.env.FLEET_MODE ?? fileValue;
+  return value === true || value === 1 || value === "1";
+}
+
+function durationMs(envName: "FLEET_POLL_SEC" | "FLEET_RUN_TTL_MIN", fallback: number, scale: number): number {
+  const value = process.env[envName];
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${envName} must be a positive number`);
+  return parsed * scale;
 }
 
 export async function loadConfig(path = resolve(bridgePackageRoot, "config.json")): Promise<BridgeConfig> {
@@ -75,5 +93,9 @@ export async function loadConfig(path = resolve(bridgePackageRoot, "config.json"
     model: choose("MG_CODEX_MODEL", file.model) ?? "gpt-5.6-sol",
     effort: choose("MG_CODEX_EFFORT", file.effort) ?? "high",
     statePath: resolve(choose("MG_BRIDGE_STATE", file.state_path) ?? resolve(bridgePackageRoot, "state.json")),
+    fleetMode: fleetEnabled(file.fleet_mode),
+    fleetPollMs: durationMs("FLEET_POLL_SEC", 15_000, 1_000),
+    fleetRunTtlMs: durationMs("FLEET_RUN_TTL_MIN", 15 * 60_000, 60_000),
+    fleetHeartbeatMs: 45_000,
   };
 }
