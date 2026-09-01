@@ -54,7 +54,7 @@ export class FleetClient {
       assert(!text.includes(this.reporterToken), `${path} leaked the supervisor token`);
     }
     if (fleet) {
-      this.fleetResponses.push({ path, text });
+      this.fleetResponses.push({ path, status: response.status, text });
       this.assertFleetResponseSafe(path, text);
     }
     return result;

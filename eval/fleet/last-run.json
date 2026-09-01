@@ -1,61 +1,100 @@
 {
   "version": 1,
   "mode": "stub",
-  "started_at": "2026-09-01T04:42:21.496Z",
-  "finished_at": "2026-09-01T04:42:21.754Z",
-  "passed": 10,
-  "failed": 0,
-  "total": 10,
+  "started_at": "2026-09-01T05:37:28.543Z",
+  "finished_at": "2026-09-01T05:37:28.859Z",
+  "passed": 7,
+  "failed": 9,
+  "total": 16,
   "scenarios": [
     {
       "name": "happy-path",
       "status": "PASS",
-      "duration_ms": 44
+      "duration_ms": 47
+    },
+    {
+      "name": "seed-project-rejection",
+      "status": "FAIL",
+      "duration_ms": 9,
+      "error": "reject configured seed project: expected 400, got 200"
+    },
+    {
+      "name": "seed-registry-addition",
+      "status": "FAIL",
+      "duration_ms": 11,
+      "error": "enqueue dispatched template node: expected 200, got 400"
+    },
+    {
+      "name": "seed-registry-tombstone",
+      "status": "FAIL",
+      "duration_ms": 11,
+      "error": "reject tombstoned seed template: expected 400, got 200"
     },
     {
       "name": "template_mismatch",
       "status": "PASS",
-      "duration_ms": 17
+      "duration_ms": 13
+    },
+    {
+      "name": "undispatched-custom-precedence",
+      "status": "FAIL",
+      "duration_ms": 6,
+      "error": "reject undispatched custom task error code: expected \"node_not_dispatched\", got \"template_mismatch\""
     },
     {
       "name": "edited-brief",
       "status": "PASS",
-      "duration_ms": 10
+      "duration_ms": 9
     },
     {
       "name": "node_not_dispatched",
       "status": "PASS",
-      "duration_ms": 4
+      "duration_ms": 2
+    },
+    {
+      "name": "eligibility-projection",
+      "status": "FAIL",
+      "duration_ms": 11,
+      "error": "reject non-queued projection: expected 400, got 200"
     },
     {
       "name": "per-project-cap",
-      "status": "PASS",
-      "duration_ms": 26
+      "status": "FAIL",
+      "duration_ms": 20,
+      "error": "expired request permits the same node to be re-enqueued: expected 200, got 409"
     },
     {
       "name": "daily-cap",
-      "status": "PASS",
-      "duration_ms": 43
+      "status": "FAIL",
+      "duration_ms": 43,
+      "error": "UTC rollover resets daily capacity: expected 2, got 0"
     },
     {
       "name": "FIFO-fairness",
       "status": "PASS",
-      "duration_ms": 46
+      "duration_ms": 47
     },
     {
       "name": "TTL-expiry",
-      "status": "PASS",
-      "duration_ms": 29
+      "status": "FAIL",
+      "duration_ms": 23,
+      "error": "expired request must not expose an outcome"
+    },
+    {
+      "name": "claim-template-mismatch",
+      "status": "FAIL",
+      "duration_ms": 24,
+      "error": "claim-time template mismatch outcome: expected \"template_mismatch\", got \"stale\""
     },
     {
       "name": "stale-claim",
       "status": "PASS",
-      "duration_ms": 28
+      "duration_ms": 26
     },
     {
       "name": "disabled-mode",
       "status": "PASS",
-      "duration_ms": 11
+      "duration_ms": 13
     }
   ]
 }

@@ -87,11 +87,43 @@ export async function startFleetStub({
     return event;
   }
 
+  const seedProject = {
+    id: `seed-${randomUUID()}`,
+    token: `visitor-${randomUUID()}`,
+    nodes: new Map(),
+    events: [],
+  };
+  seedTemplates.forEach((template, index) => {
+    const node = {
+      id: `seed-node-${index + 1}-${randomUUID()}`,
+      ...template,
+      tags: ["fleet-template"],
+      state: "queued",
+      record_type: "task",
+      availability: "ready",
+      assigned: false,
+      dispatched: false,
+      lifecycle: false,
+    };
+    seedProject.nodes.set(node.id, node);
+    append(seedProject, "human", "TASK_ADDED", {
+      node: {
+        id: node.id,
+        title: node.title,
+        brief: node.brief,
+        estimate_min: node.estimate_min,
+        tags: node.tags,
+        state: node.state,
+      },
+    });
+  });
+  projects.set(seedProject.id, seedProject);
+
   function cloneProject() {
     const id = `clone-${randomUUID()}`;
     const token = `visitor-${randomUUID()}`;
     const project = { id, token, nodes: new Map(), events: [] };
-    seedTemplates.forEach((template, index) => {
+    [...seedProject.nodes.values()].forEach((template, index) => {
       const node = {
         id: `clone-node-${index + 1}-${randomUUID()}`,
         ...template,
@@ -389,8 +421,45 @@ export async function startFleetStub({
   return {
     baseUrl,
     reporterToken,
+    seedProject: { project: seedProject.id, token: seedProject.token },
     advance(ms) {
       nowMs += ms;
+    },
+    addSeedTemplate({ title, brief, estimate_min = 1 }) {
+      const node = {
+        id: `seed-node-${randomUUID()}`,
+        title,
+        brief,
+        estimate_min,
+        tags: ["fleet-template"],
+        state: "queued",
+        record_type: "task",
+        availability: "ready",
+        assigned: false,
+        dispatched: false,
+        lifecycle: false,
+      };
+      seedProject.nodes.set(node.id, node);
+      append(seedProject, "human", "TASK_ADDED", {
+        node: {
+          id: node.id,
+          title: node.title,
+          brief: node.brief,
+          estimate_min: node.estimate_min,
+          tags: node.tags,
+          state: node.state,
+        },
+      });
+      return node.id;
+    },
+    removeSeedTemplate(nodeId) {
+      if (!seedProject.nodes.delete(nodeId)) throw new Error("cannot remove unknown stub seed node");
+      append(seedProject, "human", "TASK_REMOVED", { node_id: nodeId, tombstone: true });
+    },
+    setNode(projectId, nodeId, changes) {
+      const node = projects.get(projectId)?.nodes.get(nodeId);
+      if (!node) throw new Error("cannot change unknown stub node");
+      Object.assign(node, changes);
     },
     invalidate(projectId, nodeId) {
       const project = projects.get(projectId);

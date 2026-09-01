@@ -122,6 +122,45 @@ export const scenarios = [
     },
   },
   {
+    name: "seed-project-rejection",
+    stubOnly: true,
+    async run({ client, controls }) {
+      const seed = controls.seedProject;
+      const nodes = taskNodes(await client.snapshot(seed));
+      assert(nodes.length >= 1, "configured seed project has no task templates");
+      await client.dispatch(seed, nodes[0].id);
+      expectError(await client.enqueue(seed, nodes[0].id), 400, "template_mismatch", "reject configured seed project");
+    },
+  },
+  {
+    name: "seed-registry-addition",
+    stubOnly: true,
+    async run({ client, controls }) {
+      const title = `Added seed template ${randomUUID()}`;
+      const brief = "A template added to the configured seed registry must become eligible in later clones.";
+      controls.addSeedTemplate({ title, brief });
+      const { clone, nodes } = await cloneNodes(client, 4);
+      const added = nodes.find((node) => node.title === title && node.brief === brief);
+      assert(added, "clone did not fold the added seed template");
+      const queued = await dispatchAndEnqueue(client, clone, added);
+      await claimExpected(client, { id: queued.id, clone, node: added });
+      await finishClaim(client, queued.id);
+    },
+  },
+  {
+    name: "seed-registry-tombstone",
+    stubOnly: true,
+    async run({ client, controls }) {
+      const { clone, nodes } = await cloneNodes(client);
+      const seedNodes = taskNodes(await client.snapshot(controls.seedProject));
+      const template = seedNodes.find((node) => node.title === nodes[0].title && node.brief === nodes[0].brief);
+      assert(template, "clone template is absent from the configured seed project");
+      controls.removeSeedTemplate(template.id);
+      await client.dispatch(clone, nodes[0].id);
+      expectError(await client.enqueue(clone, nodes[0].id), 400, "template_mismatch", "reject tombstoned seed template");
+    },
+  },
+  {
     name: "template_mismatch",
     async run({ client }) {
       const { clone } = await cloneNodes(client);
@@ -134,6 +173,17 @@ export const scenarios = [
       expectError(await client.enqueue(clone, nodeId), 400, "template_mismatch", "reject judge-added custom task");
       const after = client.expectStatus(await client.fleetStatus(clone), 200, "read queue depth after rejection");
       assertEqual(after.queue_depth, before.queue_depth, "template mismatch changed queue depth");
+    },
+  },
+  {
+    name: "undispatched-custom-precedence",
+    async run({ client }) {
+      const { clone } = await cloneNodes(client);
+      const nodeId = await client.addTask(clone, {
+        title: `Undispatched custom task ${randomUUID()}`,
+        brief: "Dispatch state must be classified before template membership.",
+      });
+      expectError(await client.enqueue(clone, nodeId), 400, "node_not_dispatched", "reject undispatched custom task");
     },
   },
   {
@@ -158,6 +208,37 @@ export const scenarios = [
     },
   },
   {
+    name: "eligibility-projection",
+    stubOnly: true,
+    async run({ client, controls }) {
+      const stateCase = await cloneNodes(client);
+      await client.dispatch(stateCase.clone, stateCase.nodes[0].id);
+      controls.setNode(stateCase.clone.project, stateCase.nodes[0].id, { state: "running" });
+      expectError(
+        await client.enqueue(stateCase.clone, stateCase.nodes[0].id),
+        400,
+        "node_not_dispatched",
+        "reject non-queued projection",
+      );
+
+      const recordCase = await cloneNodes(client);
+      await client.dispatch(recordCase.clone, recordCase.nodes[0].id);
+      controls.setNode(recordCase.clone.project, recordCase.nodes[0].id, { record_type: "group" });
+      expectError(await client.enqueue(recordCase.clone, recordCase.nodes[0].id), 404, "node_not_found", "reject group record");
+
+      const assignedCase = await cloneNodes(client);
+      await client.dispatch(assignedCase.clone, assignedCase.nodes[0].id);
+      controls.setNode(assignedCase.clone.project, assignedCase.nodes[0].id, { dispatched: false });
+      const queued = client.expectStatus(
+        await client.enqueue(assignedCase.clone, assignedCase.nodes[0].id),
+        200,
+        "accept assigned projection independent of stub-only dispatched flag",
+      );
+      await claimExpected(client, { id: queued.id, clone: assignedCase.clone, node: assignedCase.nodes[0] });
+      await finishClaim(client, queued.id);
+    },
+  },
+  {
     name: "per-project-cap",
     stubOptions: { perProjectCap: 1, ttlMin: 0.001 },
     async run(context) {
@@ -177,21 +258,31 @@ export const scenarios = [
       }
       const expired = client.expectStatus(await client.getRequest(clone, first.id), 200, "sweep expired project request");
       assertEqual(expired.status, "expired", "adopted request expiry");
-      const refunded = client.expectStatus(await client.enqueue(clone, nodes[1].id), 200, "expired request refunds project cap");
-      await claimExpected(client, { id: refunded.id, clone, node: nodes[1] });
+      const refunded = client.expectStatus(
+        await client.enqueue(clone, nodes[0].id),
+        200,
+        "expired request permits the same node to be re-enqueued",
+      );
+      await claimExpected(client, { id: refunded.id, clone, node: nodes[0] });
       await finishClaim(client, refunded.id);
     },
   },
   {
     name: "daily-cap",
     stubOptions: { dailyCap: 2, perProjectCap: 1 },
-    async run({ client }) {
+    async run({ client, mode, controls, acceptedBefore = 0 }) {
+      const configuredCap = mode === "stub" ? 2 : Number(process.env.FLEET_DAILY_CAP ?? 30);
       const probe = await cloneNodes(client);
       const status = client.expectStatus(await client.fleetStatus(probe.clone), 200, "read daily fleet capacity");
       assert(Number.isInteger(status.daily_remaining), "fleet status has no integer daily_remaining");
+      assertEqual(
+        status.daily_remaining,
+        configuredCap - acceptedBefore,
+        "initial daily remaining matches externally configured cap",
+      );
       assert(status.daily_remaining >= 1, "daily capacity was already exhausted before the scenario");
       const accepted = [];
-      for (let index = 0; index < status.daily_remaining; index += 1) {
+      for (let index = 0; index < configuredCap - acceptedBefore; index += 1) {
         const { clone, nodes } = index === 0 ? probe : await cloneNodes(client);
         const request = await dispatchAndEnqueue(client, clone, nodes[0]);
         accepted.push({ id: request.id, clone, node: nodes[0] });
@@ -202,6 +293,15 @@ export const scenarios = [
       for (const expected of accepted) {
         await claimExpected(client, expected);
         await finishClaim(client, expected.id);
+      }
+      if (mode === "stub") {
+        controls.advance(12 * 60 * 60_000);
+        const rollover = client.expectStatus(await client.fleetStatus(probe.clone), 200, "read capacity after UTC rollover");
+        assertEqual(rollover.daily_remaining, configuredCap, "UTC rollover resets daily capacity");
+        const nextDay = await cloneNodes(client);
+        const request = await dispatchAndEnqueue(client, nextDay.clone, nextDay.nodes[0]);
+        await claimExpected(client, { id: request.id, clone: nextDay.clone, node: nextDay.nodes[0] });
+        await finishClaim(client, request.id);
       }
     },
   },
@@ -240,6 +340,28 @@ export const scenarios = [
       await claimExpected(client, { id: secondRequest.id, clone: second.clone, node: second.nodes[0] });
       const expired = client.expectStatus(await client.getRequest(first.clone, firstRequest.id), 200, "read expired adopted request");
       assertEqual(expired.status, "expired", "un-heartbeated adopted request status");
+      assert(typeof expired.finished_at === "string", "expired request has no finished_at timestamp");
+      assert(!Object.hasOwn(expired, "outcome"), "expired request must not expose an outcome");
+      await finishClaim(client, secondRequest.id);
+    },
+  },
+  {
+    name: "claim-template-mismatch",
+    stubOnly: true,
+    async run({ client, controls }) {
+      const first = await cloneNodes(client);
+      const second = await cloneNodes(client);
+      const firstRequest = await dispatchAndEnqueue(client, first.clone, first.nodes[0]);
+      const secondRequest = await dispatchAndEnqueue(client, second.clone, second.nodes[0]);
+      controls.setNode(first.clone.project, first.nodes[0].id, { title: `Changed after enqueue ${randomUUID()}` });
+      await claimExpected(client, { id: secondRequest.id, clone: second.clone, node: second.nodes[0] });
+      const mismatch = client.expectStatus(
+        await client.getRequest(first.clone, firstRequest.id),
+        200,
+        "read claim-time template mismatch",
+      );
+      assertEqual(mismatch.status, "failed", "claim-time template mismatch status");
+      assertEqual(mismatch.outcome, "template_mismatch", "claim-time template mismatch outcome");
       await finishClaim(client, secondRequest.id);
     },
   },
