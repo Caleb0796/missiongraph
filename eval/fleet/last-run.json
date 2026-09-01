@@ -1,8 +1,8 @@
 {
   "version": 1,
   "mode": "stub",
-  "started_at": "2026-09-01T09:00:36.542Z",
-  "finished_at": "2026-09-01T09:00:36.978Z",
+  "started_at": "2026-09-01T22:57:19.892Z",
+  "finished_at": "2026-09-01T22:57:20.304Z",
   "passed": 19,
   "failed": 0,
   "skipped": 0,
@@ -11,27 +11,27 @@
     {
       "name": "happy-path",
       "status": "PASS",
-      "duration_ms": 54
+      "duration_ms": 46
     },
     {
       "name": "seed-project-rejection",
       "status": "PASS",
-      "duration_ms": 10
+      "duration_ms": 8
     },
     {
       "name": "seed-registry-addition",
       "status": "PASS",
-      "duration_ms": 14
+      "duration_ms": 15
     },
     {
       "name": "seed-registry-tombstone",
       "status": "PASS",
-      "duration_ms": 12
+      "duration_ms": 11
     },
     {
       "name": "template_mismatch",
       "status": "PASS",
-      "duration_ms": 15
+      "duration_ms": 13
     },
     {
       "name": "undispatched-custom-precedence",
@@ -41,17 +41,17 @@
     {
       "name": "post-baseline-authored-enqueue",
       "status": "PASS",
-      "duration_ms": 10
+      "duration_ms": 11
     },
     {
       "name": "post-baseline-authored-claim",
       "status": "PASS",
-      "duration_ms": 27
+      "duration_ms": 25
     },
     {
       "name": "post-baseline-split-child",
       "status": "PASS",
-      "duration_ms": 10
+      "duration_ms": 11
     },
     {
       "name": "edited-brief",
@@ -61,42 +61,42 @@
     {
       "name": "node_not_dispatched",
       "status": "PASS",
-      "duration_ms": 4
+      "duration_ms": 3
     },
     {
       "name": "eligibility-projection",
       "status": "PASS",
-      "duration_ms": 38
+      "duration_ms": 37
     },
     {
       "name": "per-project-cap",
       "status": "PASS",
-      "duration_ms": 26
+      "duration_ms": 24
     },
     {
       "name": "daily-cap",
       "status": "PASS",
-      "duration_ms": 58
+      "duration_ms": 61
     },
     {
       "name": "FIFO-fairness",
       "status": "PASS",
-      "duration_ms": 51
+      "duration_ms": 44
     },
     {
       "name": "TTL-expiry",
       "status": "PASS",
-      "duration_ms": 28
+      "duration_ms": 27
     },
     {
       "name": "claim-template-mismatch",
       "status": "PASS",
-      "duration_ms": 26
+      "duration_ms": 25
     },
     {
       "name": "stale-claim",
       "status": "PASS",
-      "duration_ms": 27
+      "duration_ms": 24
     },
     {
       "name": "disabled-mode",

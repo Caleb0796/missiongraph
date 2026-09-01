@@ -38,6 +38,7 @@ Configure the bridge with environment variables or copy `bridge/config.example.j
 | `MG_CODEX_PATH` | `codex_binary_path` | Codex executable; default `codex` |
 | `MG_CODEX_MODEL` | `model` | Codex model; default `gpt-5.6-sol` |
 | `MG_CODEX_EFFORT` | `effort` | Reasoning effort; default `high` |
+| `MG_CODEX_SANDBOX` | `codex_sandbox` | Worker sandbox: `workspace-write` (default) or `danger-full-access` for container runtimes where codex's bubblewrap sandbox cannot start (no user namespaces) |
 | `MG_BRIDGE_STATE` | `state_path` | Persistent cursor/thread/worktree state; default `bridge/state.json` |
 
 `config.json` and `state.json` are gitignored. Prefer environment-secret injection on a VM and restrict any file containing credentials to mode `0600`.

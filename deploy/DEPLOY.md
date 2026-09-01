@@ -54,6 +54,8 @@ Clone one flagship mission (POST `/api/clone-demo`), keep its `project`/`token`.
 
 **Zero-downtime deploys and the bridge lock.** During a deploy the old and new instances briefly share `/data`, so the new bridge's first start loses the state lock and exits; `entry.sh` retries on a bounded loop (30 × 30s) and the old instance releases the lock as it shuts down (entry.sh forwards SIGTERM so the bridge's graceful stop actually runs). If the log keeps showing `bridge state lock … is held on host <old-instance>` past ten minutes, the loop moves the leftover lock aside itself; as a manual last resort, delete `/data/bridge-state.json.lock` from a shell and restart the service.
 
+**Worker sandbox on Render.** Codex's Linux sandbox is bubblewrap, which needs user namespaces; Render's runtime forbids them, so a sandboxed worker's every shell command fails at `bwrap: setting up uid map: Operation not permitted` and the worker exits without reporting. `render.yaml` therefore sets `MG_CODEX_SANDBOX=danger-full-access` (set it in the dashboard env as well). Compensating controls: single-tenant container, workers briefed only on their git worktree, and no secret in the worker environment. `entry.sh` logs a `worker-mode probe` line at boot showing exactly what a worker's shell sees.
+
 Flip `BRIDGE_ENABLED=1` **last**, after every other variable is in place: while it is `0` there is no worker process on the VM, so nothing can be spent and nothing can execute.
 
 ### Judge fleet (a clone may borrow the bridge for ONE human-confirmed, template-bound task)

@@ -32,18 +32,22 @@ describe("StateStore", () => {
       const lockContents = await readFile(lockPath, "utf8");
       const stale = new Date(Date.now() - 10 * 60_000);
       await utimes(lockPath, stale, stale);
-      const deadline = Date.now() + 1_000;
-      while ((await stat(lockPath)).mtimeMs === stale.getTime() && Date.now() < deadline) {
+      // Filesystems round mtimes differently (ext4 on CI stored the stale time as
+      // …976.999 for …977), so "unchanged" must not be an exact float comparison:
+      // a refreshed lease is minutes newer than the stale stamp, so wait for that.
+      const refreshedAfter = stale.getTime() + 60_000;
+      const deadline = Date.now() + 2_000;
+      while ((await stat(lockPath)).mtimeMs < refreshedAfter && Date.now() < deadline) {
         await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
       }
-      expect((await stat(lockPath)).mtimeMs).toBeGreaterThan(stale.getTime());
+      expect((await stat(lockPath)).mtimeMs).toBeGreaterThan(refreshedAfter);
 
       await state.close();
       state = undefined;
       await writeFile(lockPath, lockContents);
       await utimes(lockPath, stale, stale);
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 75));
-      expect((await stat(lockPath)).mtimeMs).toBe(stale.getTime());
+      expect((await stat(lockPath)).mtimeMs).toBeLessThan(refreshedAfter);
     } finally {
       await state?.close();
       await rm(root, { recursive: true, force: true });

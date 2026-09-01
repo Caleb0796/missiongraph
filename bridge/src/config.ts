@@ -12,6 +12,7 @@ export interface BridgeConfig {
   codexBinaryPath: string;
   model: string;
   effort: string;
+  codexSandbox: "workspace-write" | "danger-full-access";
   statePath: string;
   fleetMode: boolean;
   fleetPollMs: number;
@@ -28,6 +29,7 @@ interface FileConfig {
   codex_binary_path?: string;
   model?: string;
   effort?: string;
+  codex_sandbox?: string;
   state_path?: string;
   fleet_mode?: boolean | number | string;
 }
@@ -66,6 +68,13 @@ function durationMs(envName: "FLEET_POLL_SEC" | "FLEET_RUN_TTL_MIN", fallback: n
   return parsed * scale;
 }
 
+
+function workerSandbox(value: string | undefined): BridgeConfig["codexSandbox"] {
+  const mode = value ?? "workspace-write";
+  if (mode === "workspace-write" || mode === "danger-full-access") return mode;
+  throw new Error(`MG_CODEX_SANDBOX must be workspace-write or danger-full-access (got ${JSON.stringify(mode)})`);
+}
+
 export async function loadConfig(path = resolve(bridgePackageRoot, "config.json")): Promise<BridgeConfig> {
   let file: FileConfig = {};
   try {
@@ -93,6 +102,14 @@ export async function loadConfig(path = resolve(bridgePackageRoot, "config.json"
     codexBinaryPath: choose("MG_CODEX_PATH", file.codex_binary_path) ?? "codex",
     model: choose("MG_CODEX_MODEL", file.model) ?? "gpt-5.6-sol",
     effort: choose("MG_CODEX_EFFORT", file.effort) ?? "high",
+    // Worker sandbox. Codex's Linux sandbox is bubblewrap, which needs user namespaces;
+    // some container runtimes (Render's included) forbid them, so every worker shell
+    // command dies at "bwrap: setting up uid map: Operation not permitted" and the
+    // worker exits without reporting anything. On such hosts the VM operator sets
+    // danger-full-access explicitly: the container is single-tenant, the worktree is
+    // still the only checkout the worker is briefed on, and no secret is in its
+    // environment. Default stays the real sandbox.
+    codexSandbox: workerSandbox(choose("MG_CODEX_SANDBOX", file.codex_sandbox)),
     statePath: resolve(choose("MG_BRIDGE_STATE", file.state_path) ?? resolve(bridgePackageRoot, "state.json")),
     fleetMode,
     fleetPollMs: fleetMode ? durationMs("FLEET_POLL_SEC", 15_000, 1_000) : 15_000,

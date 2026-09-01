@@ -267,6 +267,9 @@ const workerStateTransitions = new Set([
   "queued->running",
   "running->review",
   "running->failed",
+  // The bridge reports a detached worker as paused under that worker's own credential
+  // (shutdown and startup recovery); pausing never advances toward done.
+  "running->paused",
 ]);
 
 const fieldByteLimits = {

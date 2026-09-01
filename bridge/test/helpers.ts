@@ -45,6 +45,7 @@ export function config(root: string, repoPath = join(root, "repo")): BridgeConfi
     codexBinaryPath: "codex",
     model: "gpt-5.6-sol",
     effort: "high",
+  codexSandbox: "workspace-write",
     statePath: join(root, "state.json"),
     fleetMode: false,
     fleetPollMs: 15_000,

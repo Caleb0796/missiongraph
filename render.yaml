@@ -52,6 +52,13 @@ services:
         value: gpt-5.6-sol
       - key: MG_CODEX_EFFORT
         value: medium
+      # Render's container runtime forbids user namespaces, so codex's bubblewrap sandbox
+      # cannot start ("bwrap: setting up uid map: Operation not permitted") and a sandboxed
+      # worker exits without ever reporting. The VM therefore runs workers with the sandbox
+      # off: single-tenant container, workers briefed only on their git worktree, and no
+      # secret in the worker environment. Keep workspace-write wherever bubblewrap works.
+      - key: MG_CODEX_SANDBOX
+        value: danger-full-access
       # Judge fleet (a clone may borrow the bridge for ONE human-confirmed, template-bound task).
       # Everything below is inert while FLEET_MODE is 0 — the merged code changes nothing here.
       - key: FLEET_MODE
