@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -26,6 +26,7 @@ function running(
     identity: Promise.resolve({ pid, starttime: `start-${pid}` }),
     threadId: Promise.resolve(threadId),
     completed,
+    begin: () => undefined,
     terminate,
   };
 }
@@ -66,9 +67,21 @@ describe("ActionExecutor", () => {
           expect(JSON.parse(readFileSync(bridgeConfig.statePath, "utf8"))).toMatchObject({
             workers: { "node-a": { status: "spawning" } },
           });
+          const worker = running("worker-node-a", initialCompleted, async () => completeInitial());
           return {
-            ...running("worker-node-a", initialCompleted, async () => completeInitial()),
+            ...worker,
             threadId: initialThread,
+            begin: () => {
+              expect(JSON.parse(readFileSync(bridgeConfig.statePath, "utf8"))).toMatchObject({
+                workers: {
+                  "node-a": {
+                    status: "spawning",
+                    pid: worker.pid,
+                    process_start_time: `start-${worker.pid}`,
+                  },
+                },
+              });
+            },
           };
         },
         resumeWorker: (_nodeId: string, threadId: string, message: string) => {
@@ -118,7 +131,7 @@ describe("ActionExecutor", () => {
         ],
       });
 
-      expect(issued).toEqual(["worker-token-1", "worker-token-2"]);
+      expect(issued).toEqual(["worker-token-1", "worker-token-2", "worker-token-3", "worker-token-4"]);
       expect(state.state.workers["node-a"]).toMatchObject({ status: "idle", thread_id: "worker-node-a" });
       expect(state.state.workers["node-a"]?.pid).toBeUndefined();
       expect(resumed).toHaveLength(3);
@@ -139,7 +152,11 @@ describe("ActionExecutor", () => {
   it("rejects controls for a live worker with journaled notes instead of launching resumes", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-live-control-"));
     const reports: Record<string, unknown>[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/reporter-credentials")) {
+        const body = JSON.parse(String(init?.body)) as { actor: string };
+        return Response.json({ token: "renewed-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+      }
       reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       return Response.json({ seq: reports.length });
     }));
@@ -229,7 +246,11 @@ describe("ActionExecutor", () => {
   it("replays a durable pending action after a simulated crash", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-ledger-replay-"));
     const reports: Record<string, unknown>[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/reporter-credentials")) {
+        const body = JSON.parse(String(init?.body)) as { actor: string };
+        return Response.json({ token: "renewed-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+      }
       reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       return Response.json({ seq: 1 });
     }));
@@ -268,7 +289,11 @@ describe("ActionExecutor", () => {
   it("retries a mechanical failure three times before journaling the action payload", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-action-failure-"));
     const reports: Record<string, unknown>[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/reporter-credentials")) {
+        const body = JSON.parse(String(init?.body)) as { actor: string };
+        return Response.json({ token: "renewed-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+      }
       reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       return Response.json({ seq: 1 });
     }));
@@ -323,8 +348,15 @@ describe("ActionExecutor", () => {
   it("dead-letters an action when permanent-failure journaling fails and continues draining", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-dead-letter-"));
     const reports: Record<string, unknown>[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (String(input).endsWith("/reporter-credentials")) {
+        return Response.json({
+          token: "renewed-token",
+          actor: body.actor,
+          expires: "2099-08-30T10:15:00.000Z",
+        });
+      }
       const text = (body.payload as { text?: string } | undefined)?.text ?? "";
       if (text.includes("Mechanical action permanently failed")) return new Response("journal unavailable", { status: 503 });
       reports.push(body);
@@ -426,6 +458,61 @@ describe("ActionExecutor", () => {
     }
   });
 
+  it("interrupts a worker launch whose process identity never settles during shutdown", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-identity-shutdown-"));
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).endsWith("/reporter-credentials")) return Response.json({ seq: 1 });
+      const body = JSON.parse(String(init?.body)) as { actor: string };
+      return Response.json({ token: "worker-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+    }));
+    let resolveIdentity!: (identity: { pid: number; starttime: string }) => void;
+    let resolveThread!: (threadId: string) => void;
+    let launched!: () => void;
+    const launchStarted = new Promise<void>((resolvePromise) => { launched = resolvePromise; });
+    let terminated = false;
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    try {
+      const bridgeConfig = config(root);
+      await initializeRepo(bridgeConfig.targetRepoPath);
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, lockProcessStartTime);
+      const codex = {
+        startWorker: (): RunningCodex => {
+          launched();
+          return {
+            pid: 40_001,
+            identity: new Promise((resolvePromise) => { resolveIdentity = resolvePromise; }),
+            threadId: new Promise((resolvePromise) => { resolveThread = resolvePromise; }),
+            completed: Promise.resolve({ stdout: "", stderr: "" }),
+            begin: () => undefined,
+            terminate: async () => { terminated = true; },
+          };
+        },
+        resumeWorker: () => { throw new Error("not used"); },
+      };
+      executor = new ActionExecutor(bridgeConfig, state, codex, new TestLogger());
+      const execution = executor.execute({ actions: [{ act: "spawn_worker", node_id: "a", brief: "Build A." }] });
+      await launchStarted;
+      executor.beginShutdown();
+      const stoppedPromptly = await Promise.race([
+        execution.then(() => true),
+        new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 150)),
+      ]);
+      resolveIdentity({ pid: 40_001, starttime: "worker-start" });
+      resolveThread("worker-a");
+      await execution;
+
+      expect(stoppedPromptly).toBe(true);
+      expect(terminated).toBe(true);
+    } finally {
+      await executor?.terminateAll();
+      await executor?.stop();
+      await state?.close();
+      vi.unstubAllGlobals();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reconciles mismatched processes and recreates renewal for matching live identities", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-reconcile-"));
     const issued: string[] = [];
@@ -449,11 +536,16 @@ describe("ActionExecutor", () => {
     try {
       const bridgeConfig = config(root);
       state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, processStartTime);
+      const staleReporterConfig = join(root, "stale.reporter.conf");
+      await writeFile(staleReporterConfig, "header = \"Authorization: Bearer stale-token\"\n");
       state.state.workers.stale = {
         status: "live",
         thread_id: "stale-thread",
         worktree: join(root, "stale"),
         branch: "work/stale",
+        reporter_credential: "stale-token",
+        reporter_expires: "2099-08-30T10:15:00.000Z",
+        reporter_config_path: staleReporterConfig,
         pid: 111,
         process_start_time: "old-start",
       };
@@ -485,9 +577,113 @@ describe("ActionExecutor", () => {
       expect(reports).toEqual([
         expect.objectContaining({ type: "JOURNAL_NOTE", payload: { text: expect.stringContaining("marked worker stale dead") } }),
       ]);
+      await expect(readFile(staleReporterConfig, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
       expect(await readFile(state.state.workers.live!.reporter_config_path!, "utf8")).toContain("renewed-token");
       expect((await stat(state.state.workers.live!.reporter_config_path!)).mode & 0o777).toBe(0o600);
     } finally {
+      await executor?.stop();
+      await state?.close();
+      vi.unstubAllGlobals();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("releases the global lease when a recovered live worker process exits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-recovered-worker-"));
+    const child = (await import("node:child_process")).spawn(
+      process.execPath,
+      ["-e", "setInterval(() => undefined, 1000)"],
+      { stdio: "ignore" },
+    );
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      child.once("spawn", resolvePromise);
+      child.once("error", rejectPromise);
+    });
+    const processStartTime = async (pid: number): Promise<string | undefined> => {
+      if (pid === process.pid) return "test-bridge-start";
+      if (pid !== child.pid) return undefined;
+      try {
+        process.kill(pid, 0);
+        return "recovered-child-start";
+      } catch {
+        return undefined;
+      }
+    };
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    try {
+      const bridgeConfig = { ...config(root), fleetMode: true };
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, processStartTime);
+      state.state.workers.live = {
+        status: "live",
+        thread_id: "live-thread",
+        worktree: join(root, "live"),
+        branch: "work/live",
+        reporter_credential: "token",
+        reporter_expires: "2099-08-30T10:15:00.000Z",
+        pid: child.pid!,
+        process_start_time: "recovered-child-start",
+      };
+      await state.save();
+      const slot = new (await import("../src/slot.js")).ExecutionSlot();
+      executor = new ActionExecutor(bridgeConfig, state, {
+        startWorker: () => { throw new Error("not used"); },
+        resumeWorker: () => { throw new Error("not used"); },
+      }, new TestLogger(), false, processStartTime, slot);
+      await executor.initialize();
+      expect(slot.owner).toBe("recovered worker live");
+
+      child.kill("SIGTERM");
+      await new Promise<void>((resolvePromise) => child.once("exit", () => resolvePromise()));
+      for (let attempt = 0; attempt < 100 && slot.owner !== undefined; attempt += 1) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+      }
+
+      expect(slot.owner).toBeUndefined();
+      expect(state.state.workers.live?.status).toBe("idle");
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      await executor?.terminateAll();
+      await executor?.stop();
+      await state?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes a worker reporter configuration when the worker reaches a terminal process state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-reporter-cleanup-"));
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).endsWith("/reporter-credentials")) return Response.json({ seq: 1 });
+      const body = JSON.parse(String(init?.body)) as { actor: string };
+      return Response.json({ token: "worker-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+    }));
+    let finish!: () => void;
+    const completed = new Promise<{ stdout: string; stderr: string }>((resolvePromise) => {
+      finish = () => resolvePromise({ stdout: "", stderr: "" });
+    });
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    try {
+      const bridgeConfig = config(root);
+      await initializeRepo(bridgeConfig.targetRepoPath);
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, lockProcessStartTime);
+      executor = new ActionExecutor(bridgeConfig, state, {
+        startWorker: () => running("worker-a", completed),
+        resumeWorker: () => { throw new Error("not used"); },
+      }, new TestLogger());
+      await executor.execute({ actions: [{ act: "spawn_worker", node_id: "a", brief: "Build A." }] });
+      const reporterConfigPath = state.state.workers.a!.reporter_config_path!;
+      expect(await readFile(reporterConfigPath, "utf8")).toContain("worker-token");
+
+      finish();
+      for (let attempt = 0; attempt < 100 && state.state.workers.a?.status !== "idle"; attempt += 1) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+      }
+
+      await expect(readFile(reporterConfigPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      finish();
+      await executor?.terminateAll();
       await executor?.stop();
       await state?.close();
       vi.unstubAllGlobals();

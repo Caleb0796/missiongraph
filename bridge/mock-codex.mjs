@@ -116,6 +116,7 @@ if (brief.startsWith("MISSIONGRAPH SUPERVISOR")) {
   if (!includesPair("-s", "workspace-write") || !args.includes("sandbox_workspace_write.network_access=true")) process.exit(8);
   const nodeId = brief.match(/Node ID: ([^\n]+)/)?.[1] ?? createHash("sha1").update(brief).digest("hex").slice(0, 8);
   const reportLifecycle = brief.includes("MOCK_REPORT_LIFECYCLE");
+  if (brief.includes("MOCK_NO_THREAD")) await new Promise(() => setInterval(() => undefined, 1_000));
   emit({ type: "thread.started", thread_id: `mock-worker-${nodeId}` });
   if (reportLifecycle) {
     await report("NODE_STATE_CHANGED", { node_id: nodeId, from: "queued", to: "running", detail: "Mock fleet worker started." });

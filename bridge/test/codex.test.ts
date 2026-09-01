@@ -62,11 +62,18 @@ describe("CodexClient", () => {
         threadId: "mock-supervisor",
       });
       const worker = client.startWorker("node-a", "Node ID: node-a\nBuild A.", bridgeConfig.targetRepoPath, join(root, "reporter.conf"));
+      (worker as typeof worker & { begin?: () => void }).begin?.();
       await expect(worker.threadId).resolves.toBe("mock-worker-node-a");
       await worker.completed;
-      await expect(
-        client.resumeWorker("node-a", "mock-worker-node-a", "Continue.", bridgeConfig.targetRepoPath, join(root, "reporter.conf")).completed,
-      ).resolves.toMatchObject({ threadId: "mock-worker-node-a" });
+      const resumed = client.resumeWorker(
+        "node-a",
+        "mock-worker-node-a",
+        "Continue.",
+        bridgeConfig.targetRepoPath,
+        join(root, "reporter.conf"),
+      );
+      resumed.begin();
+      await expect(resumed.completed).resolves.toMatchObject({ threadId: "mock-worker-node-a" });
     } finally {
       for (const [name, value] of Object.entries(previous)) {
         if (value === undefined) delete process.env[name];
@@ -74,6 +81,32 @@ describe("CodexClient", () => {
       }
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("keeps a worker behind a launch handshake until its process identity can be persisted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-codex-handshake-"));
+    const bridgeConfig = config(root);
+    await initializeRepo(bridgeConfig.targetRepoPath);
+    const client = new CodexClient(bridgeConfig, new TestLogger(), true, async (pid) => `test-start-${pid}`);
+    const worker = client.startWorker(
+      "node-a",
+      "Node ID: node-a\nBuild A.",
+      bridgeConfig.targetRepoPath,
+      join(root, "reporter.conf"),
+    ) as ReturnType<CodexClient["startWorker"]> & { begin?: () => void };
+    const beforeBegin = await Promise.race([
+      worker.threadId.then(() => "started" as const),
+      new Promise<"waiting">((resolvePromise) => setTimeout(() => resolvePromise("waiting"), 75)),
+    ]);
+    if (beforeBegin === "waiting") {
+      worker.begin!();
+      await expect(worker.threadId).resolves.toBe("mock-worker-node-a");
+    }
+    await worker.completed;
+    await client.stop();
+    await rm(root, { recursive: true, force: true });
+    expect(beforeBegin).toBe("waiting");
+    expect(worker.begin).toBeTypeOf("function");
   });
 
   it("passes every MissionGraph environment variable referenced by the worker prompt", () => {
