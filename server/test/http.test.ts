@@ -126,6 +126,60 @@ async function issuePolicy(
   };
 }
 
+function addFleetNode(
+  store: MissionGraphServer["store"],
+  project: string,
+  nodeId: string,
+  title: string,
+  brief: string,
+  dispatched: boolean,
+) {
+  store.append(project, {
+    actor: "human",
+    type: "TASK_ADDED",
+    payload: {
+      node: { id: nodeId, title, brief, estimate_min: 12, tags: ["fleet"], state: "queued" },
+    },
+    idem_key: `add-${project}-${nodeId}`,
+  });
+  if (dispatched) {
+    store.append(project, {
+      actor: "human",
+      type: "DISPATCHED",
+      payload: { node_id: nodeId, bypass_cap: true },
+      idem_key: `dispatch-${project}-${nodeId}`,
+    });
+  }
+}
+
+function prepareFleet(
+  store: MissionGraphServer["store"],
+  candidates: { project: string; token: string; nodeId: string; title: string; brief: string; dispatched?: boolean }[],
+) {
+  store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+  const templates = new Set<string>();
+  for (const candidate of candidates) {
+    if (!store.hasProject(candidate.project)) {
+      store.createProject(candidate.project, candidate.token, "2026-08-30T09:30:00.000Z", {
+        seedProjectId: "seed",
+      });
+    }
+    const templateKey = `${candidate.title}\n${candidate.brief}`;
+    if (!templates.has(templateKey)) {
+      templates.add(templateKey);
+      addFleetNode(store, "seed", `template-${templates.size}`, candidate.title, candidate.brief, false);
+    }
+    addFleetNode(
+      store,
+      candidate.project,
+      candidate.nodeId,
+      candidate.title,
+      candidate.brief,
+      candidate.dispatched ?? true,
+    );
+  }
+}
+
 describe("HTTP and streaming contract", () => {
   it("answers CORS preflights only for configured origins", async () => {
     const { app } = server({ allowedOrigins: ["https://missiongraph.vercel.app"] });
@@ -1633,5 +1687,380 @@ describe("HTTP and streaming contract", () => {
 
     expect(response.status).toBe(200);
     expect(text).toContain('data: {"kind":"event","event":{"seq":1');
+  });
+
+  it("runs a fleet request through enqueue, claim, heartbeat, and completion", async () => {
+    let clock = new Date("2026-08-30T10:00:00.000Z");
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed", now: () => clock });
+    prepareFleet(store, [
+      { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
+    ]);
+
+    const enqueued = await app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: { node_id: "task" },
+    });
+    const request = enqueued.json<{ id: string; status: string; position: number }>();
+    clock = new Date("2026-08-30T10:00:10.000Z");
+    const claimed = await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    clock = new Date("2026-08-30T10:00:20.000Z");
+    const heartbeat = await app.inject({
+      method: "POST",
+      url: `/api/fleet/${request.id}/heartbeat`,
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    clock = new Date("2026-08-30T10:00:30.000Z");
+    const completed = await app.inject({
+      method: "POST",
+      url: `/api/fleet/${request.id}/complete`,
+      headers: { "x-mg-reporter": "reporter-secret" },
+      payload: { outcome: "done", note: "Worker finished cleanly." },
+    });
+    const status = await app.inject({
+      method: "GET",
+      url: `/api/p/project/fleet-requests/${request.id}`,
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect(enqueued.statusCode).toBe(200);
+    expect(request).toMatchObject({ status: "queued", position: 1 });
+    expect(claimed.json()).toMatchObject({
+      request_id: request.id,
+      project_id: "project",
+      node_id: "task",
+      node: { title: "Build API", brief: "Implement it.", estimate: 12 },
+      visitor_token: "visitor-token",
+    });
+    expect(heartbeat.json()).toEqual({ id: request.id, status: "running" });
+    expect(completed.json()).toEqual({ id: request.id, status: "done" });
+    expect(status.json()).toEqual({
+      id: request.id,
+      status: "done",
+      adopted_at: "2026-08-30T10:00:10.000Z",
+      finished_at: "2026-08-30T10:00:30.000Z",
+      outcome: "done",
+    });
+    expect(
+      store.database.prepare("SELECT note FROM fleet_requests WHERE id = ?").get(request.id),
+    ).toEqual({ note: "Worker finished cleanly." });
+  });
+
+  it("rejects an edited brief that no longer matches the seed template", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+    store.createProject("project", "visitor-token", "2026-08-30T09:30:00.000Z", { seedProjectId: "seed" });
+    addFleetNode(store, "seed", "template", "Build API", "Original brief.", false);
+    addFleetNode(store, "project", "task", "Build API", "Edited brief.", true);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: { node_id: "task" },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: { code: "template_mismatch" } });
+  });
+
+  it("rejects a template node that has not been dispatched", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    prepareFleet(store, [
+      {
+        project: "project",
+        token: "visitor-token",
+        nodeId: "task",
+        title: "Build API",
+        brief: "Implement it.",
+        dispatched: false,
+      },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: { node_id: "task" },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: { code: "node_not_dispatched" } });
+  });
+
+  it("enforces the project cap and refunds it after adoption expires", async () => {
+    let clock = new Date("2026-08-30T10:00:00.000Z");
+    const { app, store } = server({
+      fleetMode: true,
+      seedProjectId: "seed",
+      fleetPerProjectCap: 1,
+      fleetAdoptTtlMin: 1,
+      now: () => clock,
+    });
+    prepareFleet(store, [
+      { project: "project", token: "visitor-token", nodeId: "a", title: "Task A", brief: "Build A." },
+      { project: "project", token: "visitor-token", nodeId: "b", title: "Task B", brief: "Build B." },
+    ]);
+    const enqueue = (nodeId: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: { node_id: nodeId },
+    });
+
+    const first = await enqueue("a");
+    const capped = await enqueue("b");
+    await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    clock = new Date("2026-08-30T10:01:01.000Z");
+    const fleetStatus = await app.inject({
+      method: "GET",
+      url: "/api/p/project/fleet-status",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+    const refunded = await enqueue("b");
+
+    expect(first.statusCode).toBe(200);
+    expect(capped.statusCode).toBe(429);
+    expect(capped.json()).toMatchObject({ error: { code: "fleet_project_cap" } });
+    expect(fleetStatus.json()).toMatchObject({ enabled: true, project_remaining: 1 });
+    expect(refunded.statusCode).toBe(200);
+  });
+
+  it("enforces the global UTC daily fleet cap", async () => {
+    const { app, store } = server({
+      fleetMode: true,
+      seedProjectId: "seed",
+      fleetDailyCap: 1,
+      fleetPerProjectCap: 2,
+      now: () => new Date("2026-08-30T23:59:00.000Z"),
+    });
+    prepareFleet(store, [
+      { project: "project-a", token: "visitor-a", nodeId: "a", title: "Task A", brief: "Build A." },
+      { project: "project-b", token: "visitor-b", nodeId: "b", title: "Task B", brief: "Build B." },
+    ]);
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/p/project-a/fleet-requests",
+      headers: { "x-mg-token": "visitor-a" },
+      payload: { node_id: "a" },
+    });
+    const capped = await app.inject({
+      method: "POST",
+      url: "/api/p/project-b/fleet-requests",
+      headers: { "x-mg-token": "visitor-b" },
+      payload: { node_id: "b" },
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(capped.statusCode).toBe(429);
+    expect(capped.json()).toMatchObject({ error: { code: "fleet_daily_cap" } });
+  });
+
+  it("returns a conflict for a duplicate active fleet request", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    prepareFleet(store, [
+      { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
+    ]);
+    const enqueue = () => app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: { node_id: "task" },
+    });
+
+    await enqueue();
+    const duplicate = await enqueue();
+
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json()).toMatchObject({ error: { code: "fleet_request_exists" } });
+  });
+
+  it("marks a stale queued item failed and claims the next eligible item atomically", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed", fleetPerProjectCap: 2 });
+    prepareFleet(store, [
+      { project: "project", token: "visitor-token", nodeId: "a", title: "Task A", brief: "Build A." },
+      { project: "project", token: "visitor-token", nodeId: "b", title: "Task B", brief: "Build B." },
+    ]);
+    const enqueue = async (nodeId: string) => {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/p/project/fleet-requests",
+        headers: { "x-mg-token": "visitor-token" },
+        payload: { node_id: nodeId },
+      });
+      return response.json<{ id: string }>();
+    };
+    const stale = await enqueue("a");
+    const eligible = await enqueue("b");
+    store.append("project", {
+      actor: "human",
+      type: "TASK_REMOVED",
+      payload: { node_id: "a", tombstone: true },
+      idem_key: "a-undispatched",
+    });
+
+    const claimed = await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    const staleStatus = await app.inject({
+      method: "GET",
+      url: `/api/p/project/fleet-requests/${stale.id}`,
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect(claimed.json()).toMatchObject({ request_id: eligible.id, node_id: "b" });
+    expect(staleStatus.json()).toMatchObject({ id: stale.id, status: "failed", outcome: "stale" });
+  });
+
+  it("expires adopted requests when their fleet TTL elapses", async () => {
+    let clock = new Date("2026-08-30T10:00:00.000Z");
+    const { app, store } = server({
+      fleetMode: true,
+      seedProjectId: "seed",
+      fleetAdoptTtlMin: 1,
+      now: () => clock,
+    });
+    prepareFleet(store, [
+      { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
+    ]);
+    const enqueued = await app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: { node_id: "task" },
+    });
+    const { id: requestId } = enqueued.json<{ id: string }>();
+    await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    await app.inject({
+      method: "POST",
+      url: `/api/fleet/${requestId}/heartbeat`,
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    clock = new Date("2026-08-30T10:01:01.000Z");
+
+    const status = await app.inject({
+      method: "GET",
+      url: `/api/p/project/fleet-requests/${requestId}`,
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect(status.json()).toEqual({
+      id: requestId,
+      status: "expired",
+      adopted_at: "2026-08-30T10:00:00.000Z",
+      finished_at: "2026-08-30T10:01:01.000Z",
+    });
+  });
+
+  it("rejects visitor credentials on supervisor fleet routes", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    prepareFleet(store, [
+      { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({ error: { code: "unauthorized" } });
+  });
+
+  it("rejects supervisor credentials on visitor fleet routes", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    prepareFleet(store, [
+      { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
+    ]);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-reporter": "reporter-secret" },
+      payload: { node_id: "task" },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json()).toMatchObject({ error: { code: "unauthorized" } });
+  });
+
+  it("keeps fleet status probeable while every other fleet route is disabled", async () => {
+    const { app, store } = server({ fleetMode: false });
+    store.createProject("project", "visitor-token", "2026-08-30T09:30:00.000Z");
+    const status = await app.inject({
+      method: "GET",
+      url: "/api/p/project/fleet-status",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+    const disabled = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: "/api/p/project/fleet-requests",
+        headers: { "x-mg-token": "visitor-token" },
+        payload: { node_id: "task" },
+      }),
+      app.inject({
+        method: "GET",
+        url: "/api/p/project/fleet-requests/request",
+        headers: { "x-mg-token": "visitor-token" },
+      }),
+      app.inject({ method: "POST", url: "/api/fleet/next", headers: { "x-mg-reporter": "reporter-secret" } }),
+      app.inject({
+        method: "POST",
+        url: "/api/fleet/request/heartbeat",
+        headers: { "x-mg-reporter": "reporter-secret" },
+      }),
+      app.inject({
+        method: "POST",
+        url: "/api/fleet/request/complete",
+        headers: { "x-mg-reporter": "reporter-secret" },
+        payload: { outcome: "done" },
+      }),
+    ]);
+
+    expect(status.json()).toEqual({ enabled: false, queue_depth: 0, daily_remaining: 0, project_remaining: 0 });
+    for (const response of disabled) {
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toMatchObject({ error: { code: "fleet_disabled" } });
+    }
+  });
+
+  it("returns enabled fleet capacity and 204 when the queue is empty", async () => {
+    const { app, store } = server({
+      fleetMode: true,
+      seedProjectId: "seed",
+      fleetDailyCap: 7,
+      fleetPerProjectCap: 3,
+    });
+    store.createProject("project", "visitor-token", "2026-08-30T09:30:00.000Z");
+    const status = await app.inject({
+      method: "GET",
+      url: "/api/p/project/fleet-status",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+    const next = await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+
+    expect(status.json()).toEqual({ enabled: true, queue_depth: 0, daily_remaining: 7, project_remaining: 3 });
+    expect(next.statusCode).toBe(204);
   });
 });
