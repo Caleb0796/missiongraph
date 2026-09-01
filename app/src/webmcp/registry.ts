@@ -11,6 +11,10 @@ import {
   missionClientReadiness,
   type RegistryLifecycleStatus,
 } from './registry-lifecycle'
+import {
+  contentSafeAnnotations,
+  contentSafeEnvelope,
+} from './content-policy'
 
 export { executeRegisteredTool } from './dynamic-tools'
 
@@ -195,16 +199,18 @@ async function executeDefinition(
     ? []
     : storeAfter.changes
         .filter((change) => change.seq > Number(since))
-        .slice(-50)
+  const safe = contentSafeEnvelope(outcome, changes)
+  const boundedOutcome = safe.outcome as ToolOutcome
   clientCursor = {
     projectId: storeAfter.projectId,
     cursor: projectChanged ? '0' : storeAfter.cursor,
   }
   return JSON.stringify({
-    ok: !outcome.error,
-    ...outcome,
+    ok: !boundedOutcome.error,
+    ...boundedOutcome,
     cursor: storeAfter.cursor,
-    changes_since: changes,
+    changes_since: safe.changes,
+    content_policy: safe.contentPolicy,
   })
 }
 
@@ -234,7 +240,7 @@ function wrapTool(definition: ToolDefinition): ModelContextTool {
     name: definition.name,
     description: definition.description,
     inputSchema: definition.inputSchema,
-    annotations: definition.annotations,
+    annotations: contentSafeAnnotations(definition.annotations),
     execute(inputs, options) {
       return executeDefinition(definition, inputs, options)
     },
