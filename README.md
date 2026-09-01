@@ -65,15 +65,15 @@ pnpm dev
 
 ## Testing
 
-232 tests across the three packages (CI runs them on every push):
+251 tests across the three packages (CI runs them on every push):
 
 ```sh
-cd server && pnpm test   # 63 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, and the fleet queue
-cd bridge && pnpm test   # 74 — decision validation, crash replay, PID/lock safety, credential renewal, lease and watchdog behaviour, the worker-launch handshake, and human-confirmed dispatch integrations against the real server
-cd app    && pnpm test   # 95 — tool envelopes, identity fencing/recovery, split confirmation, S2 policy/action dialogs, late WebMCP injection, tier detection, fleet-off dispatch invariants, and real-server HTTP paths
+cd server && pnpm test   # 69 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, and the fleet queue
+cd bridge && pnpm test   # 77 — decision validation, crash replay, PID/lock safety, credential renewal, lease and watchdog behaviour, the worker-launch handshake, and human-confirmed dispatch integrations against the real server
+cd app    && pnpm test   # 105 — tool envelopes, identity fencing/recovery, split confirmation, S2 policy/action dialogs, late WebMCP injection, tier detection, fleet-off dispatch invariants, and real-server HTTP paths
 ```
 
-The fleet contract has its own scenario harness on top of those: `node eval/fleet/run.mjs --stub` runs 16
+The fleet contract has its own scenario harness on top of those: `node eval/fleet/run.mjs --stub` runs 19
 acceptance scenarios against an in-process mirror of the server, and `--real` runs them against a live
 server and bridge.
 

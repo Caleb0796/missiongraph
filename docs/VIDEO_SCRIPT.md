@@ -28,7 +28,7 @@ Recording frame: the whole ChatGPT desktop window — agent conversation (left p
 - **Screen**: open a node dossier (Brief / Handoff / Decisions) → timeline replay → hold on full graph + URL.
 - **VO**: "And everything you just watched is on the record — every action, who did it, under what authority. The mission you can explore yourself is a real run: real workers, real commits, real approvals. Code today — but this works for any long-running mission. missiongraph.vercel.app, right inside ChatGPT's browser."
 - **End card**: `missiongraph.vercel.app · 251 tests · 19 fleet scenarios · live-fire arbitration · adversarially reviewed`
-  Measured 2026-09-01 on merged main (`cf9cdbf`): server 69 / bridge 77 / app 105 = **251**, plus the 19-scenario fleet contract stub and a real-codex arbitration PASS (sol/medium, full lifecycle + handoff + approval). Re-run the suites on recording day rather than trusting this line.
+  Measured 2026-09-01 in this worktree: server 69 / bridge 77 / app 105 = **251**, plus the 19-scenario fleet contract stub. The real-codex arbitration is separate from this count. Re-run the suites on recording day rather than trusting this line.
 
 ## Pre-flight checklist (recording day)
 

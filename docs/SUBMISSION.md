@@ -31,6 +31,8 @@ A human-presence capability layer separates agent proposals from human authoriza
 
 Every tool result carries `cursor` + `changes_since` (the digest pattern), so an agent that was away is fully caught up by its next call.
 
+The package suites pass 251 tests (server 69 / bridge 77 / app 105); the fleet stub passes 19 acceptance scenarios.
+
 ## Challenges / what we're proud of
 
 - **Adversarial review loops**: every milestone was reviewed by an independent adversarial session; 70+ P1/P2 findings were found and fixed (credential scoping, node-bound reporting, at-least-once delivery with a durable action ledger, identity-epoch fencing, an eight-finding security audit driven to human-presence grants with nonce-bound uses). The PROGRESS.md log keeps the whole trail, including our own false alarms.
