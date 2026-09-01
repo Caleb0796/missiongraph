@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "mode": "stub",
+  "started_at": "2026-09-01T04:42:21.496Z",
+  "finished_at": "2026-09-01T04:42:21.754Z",
+  "passed": 10,
+  "failed": 0,
+  "total": 10,
+  "scenarios": [
+    {
+      "name": "happy-path",
+      "status": "PASS",
+      "duration_ms": 44
+    },
+    {
+      "name": "template_mismatch",
+      "status": "PASS",
+      "duration_ms": 17
+    },
+    {
+      "name": "edited-brief",
+      "status": "PASS",
+      "duration_ms": 10
+    },
+    {
+      "name": "node_not_dispatched",
+      "status": "PASS",
+      "duration_ms": 4
+    },
+    {
+      "name": "per-project-cap",
+      "status": "PASS",
+      "duration_ms": 26
+    },
+    {
+      "name": "daily-cap",
+      "status": "PASS",
+      "duration_ms": 43
+    },
+    {
+      "name": "FIFO-fairness",
+      "status": "PASS",
+      "duration_ms": 46
+    },
+    {
+      "name": "TTL-expiry",
+      "status": "PASS",
+      "duration_ms": 29
+    },
+    {
+      "name": "stale-claim",
+      "status": "PASS",
+      "duration_ms": 28
+    },
+    {
+      "name": "disabled-mode",
+      "status": "PASS",
+      "duration_ms": 11
+    }
+  ]
+}
