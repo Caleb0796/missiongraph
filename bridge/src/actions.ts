@@ -528,10 +528,10 @@ export class ActionExecutor {
         this.clearRenewal(nodeId);
         const current = this.stateStore.state.workers[nodeId];
         if (current) {
-          current.status = current.thread_id ? "idle" : "dead";
           delete current.pid;
           delete current.process_start_time;
           await this.clearReporterCredential(current);
+          current.status = current.thread_id ? "idle" : "dead";
           await this.stateStore.save();
         }
       })
@@ -562,11 +562,11 @@ export class ActionExecutor {
         current?.pid === identity.pid &&
         current.process_start_time === identity.starttime
       ) {
-        current.status = current.thread_id ? "idle" : "dead";
         delete current.pid;
         delete current.process_start_time;
         this.clearRenewal(nodeId);
         await this.clearReporterCredential(current);
+        current.status = current.thread_id ? "idle" : "dead";
         await this.stateStore.save();
       }
     })().catch((error: unknown) => {
@@ -638,11 +638,11 @@ export class ActionExecutor {
       try {
         if (running && this.running.get(nodeId) === running) {
           this.running.delete(nodeId);
-          worker.status = "idle";
           delete worker.pid;
           delete worker.process_start_time;
           this.clearRenewal(nodeId);
           await this.clearReporterCredential(worker);
+          worker.status = "idle";
           await this.stateStore.save();
         } else if (!running) {
           this.clearRenewal(nodeId);
@@ -755,13 +755,13 @@ export class ActionExecutor {
       const identity = workerIdentity(worker);
       if (identity) await terminateProcess(identity, { lookup: this.processStartTime });
     }
-    worker.status = worker.thread_id ? "idle" : "dead";
     delete worker.pid;
     delete worker.process_start_time;
     this.running.delete(nodeId);
     this.clearRenewal(nodeId);
     try {
       await this.clearReporterCredential(worker);
+      worker.status = worker.thread_id ? "idle" : "dead";
       await this.stateStore.save();
     } finally {
       this.releaseLease(nodeId);
