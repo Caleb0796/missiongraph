@@ -75,7 +75,12 @@ if (brief.startsWith("MISSIONGRAPH SUPERVISOR")) {
   agent({ actions: [] });
 } else {
   if (!includesPair("-s", "workspace-write") || !args.includes("sandbox_workspace_write.network_access=true")) process.exit(8);
-  const nodeId = brief.match(/Node ID: ([^\n]+)/)?.[1] ?? createHash("sha1").update(brief).digest("hex").slice(0, 8);
+  const nodeIdField = brief.match(/Node ID: ([^\n]+)/)?.[1];
+  let nodeId = nodeIdField ?? createHash("sha1").update(brief).digest("hex").slice(0, 8);
+  try {
+    const parsed = JSON.parse(nodeId);
+    if (typeof parsed === "string") nodeId = parsed;
+  } catch {}
   emit({ type: "thread.started", thread_id: `mock-worker-${nodeId}` });
   agent({ worker_complete: true });
 }
