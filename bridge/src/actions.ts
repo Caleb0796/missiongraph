@@ -45,6 +45,15 @@ async function writeReporterConfig(path: string, token: string): Promise<void> {
   await rename(temporary, path);
 }
 
+async function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return await new Promise<T>((resolvePromise, rejectPromise) => {
+    const abort = () => rejectPromise(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(resolvePromise, rejectPromise).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
 const reporterRenewalLeadMs = 5 * 60_000;
 const reporterRenewalRetryMs = 5_000;
 const maximumTimerDelayMs = 2_147_483_647;
@@ -95,6 +104,7 @@ export class ActionExecutor {
   private readonly reporter: ReporterClient;
   private pendingTimer: NodeJS.Timeout | undefined;
   private pendingDrain: Promise<void> = Promise.resolve();
+  private readonly shutdown = new AbortController();
   private stopping = false;
 
   constructor(
@@ -219,6 +229,7 @@ export class ActionExecutor {
 
   beginShutdown(): void {
     this.stopping = true;
+    this.shutdown.abort(new Error("bridge is shutting down"));
     if (this.pendingTimer) clearTimeout(this.pendingTimer);
     this.pendingTimer = undefined;
     for (const timer of this.renewalTimers.values()) clearTimeout(timer);
@@ -419,6 +430,9 @@ export class ActionExecutor {
     fleet: boolean,
     signal?: AbortSignal,
   ): Promise<RunningCodex> {
+    const launchSignal = signal
+      ? AbortSignal.any([signal, this.shutdown.signal])
+      : this.shutdown.signal;
     const { nodeId, workerKey } = assignment;
     const workerConfig = assignment.projectId === this.config.projectId
       ? this.config
@@ -430,14 +444,14 @@ export class ActionExecutor {
     const worktree = join(root, `${basename(this.config.targetRepoPath)}-${nodeSlug}-${suffix}`);
     const reporterConfigPath = `${worktree}.reporter.conf`;
     try {
-      signal?.throwIfAborted();
-      const credential = await new ReporterClient(workerConfig, this.dryRun).issue(`worker:${nodeId}`, signal);
-      signal?.throwIfAborted();
+      launchSignal.throwIfAborted();
+      const credential = await new ReporterClient(workerConfig, this.dryRun).issue(`worker:${nodeId}`, launchSignal);
+      launchSignal.throwIfAborted();
       await writeReporterConfig(reporterConfigPath, credential.token);
-      signal?.throwIfAborted();
+      launchSignal.throwIfAborted();
       await mkdir(root, { recursive: true });
-      await runGit(["worktree", "add", worktree, "-b", branch], this.config.targetRepoPath, signal);
-      signal?.throwIfAborted();
+      await runGit(["worktree", "add", worktree, "-b", branch], this.config.targetRepoPath, launchSignal);
+      launchSignal.throwIfAborted();
       const state: WorkerState = {
         status: "spawning",
         worktree,
@@ -455,6 +469,10 @@ export class ActionExecutor {
       await this.stateStore.save();
 
       let running: RunningCodex | undefined;
+      let abortTermination: Promise<void> | undefined;
+      const abortLaunch = () => {
+        if (running) abortTermination ??= this.terminateFailedLaunch(workerKey, running);
+      };
       try {
         const prompt = fleet
           ? adoptedWorkerBrief(nodeId, assignment.title, assignment.brief, worktree)
@@ -462,20 +480,21 @@ export class ActionExecutor {
         running = this.codex.startWorker(nodeId, prompt, worktree, reporterConfigPath, workerConfig);
         this.running.set(workerKey, running);
         this.leases.set(workerKey, lease);
-        const abortLaunch = () => void running?.terminate().catch(() => undefined);
-        signal?.addEventListener("abort", abortLaunch, { once: true });
-        const identity = await running.identity;
+        launchSignal.addEventListener("abort", abortLaunch, { once: true });
+        const identity = await abortable(running.identity, launchSignal);
         state.pid = identity.pid;
         state.process_start_time = identity.starttime;
         await this.stateStore.save();
-        signal?.throwIfAborted();
+        launchSignal.throwIfAborted();
         running.begin();
-        state.thread_id = await running.threadId;
-        signal?.removeEventListener("abort", abortLaunch);
+        state.thread_id = await abortable(running.threadId, launchSignal);
+        launchSignal.removeEventListener("abort", abortLaunch);
         state.status = "live";
         await this.stateStore.save();
       } catch (error) {
-        if (running) await this.terminateFailedLaunch(workerKey, running);
+        launchSignal.removeEventListener("abort", abortLaunch);
+        if (abortTermination) await abortTermination;
+        else if (running) await this.terminateFailedLaunch(workerKey, running);
         state.status = "dead";
         delete state.pid;
         delete state.process_start_time;
@@ -587,7 +606,7 @@ export class ActionExecutor {
     }
     let running: RunningCodex | undefined;
     try {
-      await this.ensureCredential(nodeId, worker);
+      await this.ensureCredential(nodeId, worker, this.shutdown.signal);
       if (this.stopping) throw new Error("bridge is shutting down");
       const reporterConfigPath = worker.reporter_config_path ?? `${worker.worktree}.reporter.conf`;
       running = this.codex.resumeWorker(
@@ -599,13 +618,16 @@ export class ActionExecutor {
       );
       this.running.set(nodeId, running);
       this.leases.set(nodeId, lease);
-      const identity = await running.identity;
+      const abortLaunch = () => void running?.terminate().catch(() => undefined);
+      this.shutdown.signal.addEventListener("abort", abortLaunch, { once: true });
+      const identity = await abortable(running.identity, this.shutdown.signal);
       worker.pid = identity.pid;
       worker.process_start_time = identity.starttime;
       worker.status = "spawning";
       await this.stateStore.save();
       running.begin();
-      await running.threadId;
+      await abortable(running.threadId, this.shutdown.signal);
+      this.shutdown.signal.removeEventListener("abort", abortLaunch);
       worker.status = "live";
       await this.stateStore.save();
       await running.completed;
@@ -619,6 +641,10 @@ export class ActionExecutor {
           worker.status = "idle";
           delete worker.pid;
           delete worker.process_start_time;
+          this.clearRenewal(nodeId);
+          await this.clearReporterCredential(worker);
+          await this.stateStore.save();
+        } else if (!running) {
           this.clearRenewal(nodeId);
           await this.clearReporterCredential(worker);
           await this.stateStore.save();
@@ -640,14 +666,14 @@ export class ActionExecutor {
     }
   }
 
-  private async ensureCredential(nodeId: string, worker: WorkerState): Promise<void> {
+  private async ensureCredential(nodeId: string, worker: WorkerState, signal: AbortSignal): Promise<void> {
     const reporterExpires = Date.parse(worker.reporter_expires ?? "");
     if (
       !worker.reporter_credential ||
       !Number.isFinite(reporterExpires) ||
       reporterExpires - Date.now() < reporterRenewalLeadMs
     ) {
-      const credential = await this.reporterFor(worker).issue(`worker:${worker.node_id ?? nodeId}`);
+      const credential = await this.reporterFor(worker).issue(`worker:${worker.node_id ?? nodeId}`, signal);
       if (this.stopping) throw new Error("bridge is shutting down");
       worker.reporter_credential = credential.token;
       worker.reporter_expires = credential.expires;

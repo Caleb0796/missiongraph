@@ -318,7 +318,7 @@ export class FleetAdoptionLoop {
       }
       await this.beginCompletion(adoption, result.outcome, "note" in result ? result.note : undefined);
     } finally {
-      if (!launchAttempted && claimAbort.signal.reason === "shutdown") lease.release();
+      if (!launchAttempted) lease.release();
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       clearTimeout(watchdogTimer);
       this.abort.signal.removeEventListener("abort", abortForShutdown);

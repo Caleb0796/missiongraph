@@ -458,6 +458,61 @@ describe("ActionExecutor", () => {
     }
   });
 
+  it("interrupts a worker launch whose process identity never settles during shutdown", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-identity-shutdown-"));
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).endsWith("/reporter-credentials")) return Response.json({ seq: 1 });
+      const body = JSON.parse(String(init?.body)) as { actor: string };
+      return Response.json({ token: "worker-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+    }));
+    let resolveIdentity!: (identity: { pid: number; starttime: string }) => void;
+    let resolveThread!: (threadId: string) => void;
+    let launched!: () => void;
+    const launchStarted = new Promise<void>((resolvePromise) => { launched = resolvePromise; });
+    let terminated = false;
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    try {
+      const bridgeConfig = config(root);
+      await initializeRepo(bridgeConfig.targetRepoPath);
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, lockProcessStartTime);
+      const codex = {
+        startWorker: (): RunningCodex => {
+          launched();
+          return {
+            pid: 40_001,
+            identity: new Promise((resolvePromise) => { resolveIdentity = resolvePromise; }),
+            threadId: new Promise((resolvePromise) => { resolveThread = resolvePromise; }),
+            completed: Promise.resolve({ stdout: "", stderr: "" }),
+            begin: () => undefined,
+            terminate: async () => { terminated = true; },
+          };
+        },
+        resumeWorker: () => { throw new Error("not used"); },
+      };
+      executor = new ActionExecutor(bridgeConfig, state, codex, new TestLogger());
+      const execution = executor.execute({ actions: [{ act: "spawn_worker", node_id: "a", brief: "Build A." }] });
+      await launchStarted;
+      executor.beginShutdown();
+      const stoppedPromptly = await Promise.race([
+        execution.then(() => true),
+        new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 150)),
+      ]);
+      resolveIdentity({ pid: 40_001, starttime: "worker-start" });
+      resolveThread("worker-a");
+      await execution;
+
+      expect(stoppedPromptly).toBe(true);
+      expect(terminated).toBe(true);
+    } finally {
+      await executor?.terminateAll();
+      await executor?.stop();
+      await state?.close();
+      vi.unstubAllGlobals();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reconciles mismatched processes and recreates renewal for matching live identities", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-reconcile-"));
     const issued: string[] = [];

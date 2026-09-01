@@ -6,7 +6,6 @@ import { parseThreadId } from "./decision.js";
 import {
   identifyProcess,
   readProcessStartTime,
-  terminateProcess,
   type ProcessIdentity,
   type ProcessStartTimeLookup,
 } from "./process.js";
@@ -314,10 +313,18 @@ export class CodexClient {
         begun = true;
         child.stdin?.end("start\n");
       },
-      terminate: () => termination ??= identity.then(async (current) => {
-        await terminateProcess(current, { lookup: this.processStartTime });
+      terminate: () => termination ??= (async () => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+        const ended = await Promise.race([
+          completed.then(() => true, () => true),
+          new Promise<false>((resolvePromise) => {
+            const timer = setTimeout(() => resolvePromise(false), 10_000);
+            timer.unref();
+          }),
+        ]);
+        if (!ended && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
         await completed.catch(() => undefined);
-      }),
+      })(),
     };
     this.children.add(running);
     void completed.catch(() => undefined).finally(() => this.children.delete(running));
