@@ -1,5 +1,9 @@
 import type { DisplayState } from '../model/graph'
-import type { ConnectionMode } from '../store/mission-store'
+import {
+  selectReplaySequenceLength,
+  useMissionStore,
+  type ConnectionMode,
+} from '../store/mission-store'
 
 interface PulseBarProps {
   eta: number
@@ -46,6 +50,9 @@ export function PulseBar({
   linkErrorHasStoredIdentity,
   contextualToolsDegraded,
 }: PulseBarProps) {
+  const replaySequenceLength = useMissionStore(selectReplaySequenceLength)
+  const replayTotal = replayProgress?.total ?? replaySequenceLength
+
   return (
     <header className="pulse-bar">
       <div className="flex min-w-0 items-center gap-3">
@@ -107,10 +114,12 @@ export function PulseBar({
           className="catch-up-chip"
           onClick={onCatchUp}
         >
-          <span className="catch-up-count">{replayProgress?.total ?? 6}</span>
+          {replayTotal !== null && (
+            <span className="catch-up-count">{replayTotal}</span>
+          )}
           {replaying && replayProgress
             ? `Replaying changes · ${replayProgress.step}/${replayProgress.total}`
-            : 'Since you left'}
+            : 'Recent changes'}
         </button>
         <div className={`live-indicator live-indicator--${connectionMode}`}>
           <span className="live-dot" />

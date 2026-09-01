@@ -12,6 +12,7 @@ import {
   foldTaskSplit,
   getBlastRadius,
   getCriticalPath,
+  getEventNodeId,
   isNonIdle,
   pruneEdgeLineage,
   refreshReadySince,
@@ -106,6 +107,23 @@ export interface StructuralConfirmationResult {
 }
 
 export type ConnectionMode = 'loading' | 'live' | 'fixture' | 'link-error'
+
+export function selectReplaySequenceLength(state: {
+  events: MissionEvent[]
+  edges: GraphEdge[]
+  connectionMode: ConnectionMode
+}) {
+  if (state.connectionMode === 'loading' || state.connectionMode === 'link-error') {
+    return null
+  }
+  return state.events
+    .filter((event) => !['NODE_MOVED', 'SELECTION_CHANGED'].includes(event.type))
+    .slice(-12)
+    .map((event) => getEventNodeId(event, state.edges))
+    .filter((id): id is string => Boolean(id))
+    .filter((id, index, all) => all.indexOf(id) === index)
+    .slice(-6).length
+}
 
 export interface MutationOptions {
   actor?: 'human' | 'browser_agent'
