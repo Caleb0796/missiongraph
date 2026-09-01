@@ -330,15 +330,10 @@ async function bootstrapWebMcp(
     },
   )
   scope.addCleanup(() => nextDynamicController.dispose())
-  const contextualTools = [
-    ...new Map(
-      currentContextualDefinitions().map((definition) => [
-        definition.name,
-        definition,
-      ]),
-    ).values(),
-  ]
-  await nextDynamicController.update(contextualTools.map(wrapTool), true)
+  dynamicController = nextDynamicController
+  scope.addCleanup(() => {
+    if (dynamicController === nextDynamicController) dynamicController = null
+  })
   const nextUnsubscribeContext = useMissionStore.subscribe((state, previous) => {
     if (
       state.selectedId !== previous.selectedId ||
@@ -348,13 +343,21 @@ async function bootstrapWebMcp(
       void refreshContextualTools(state.selectedId !== previous.selectedId)
     }
   })
-  scope.addCleanup(nextUnsubscribeContext)
-  dynamicController = nextDynamicController
   unsubscribeContext = nextUnsubscribeContext
+  scope.addCleanup(nextUnsubscribeContext)
   scope.addCleanup(() => {
-    if (dynamicController === nextDynamicController) dynamicController = null
     if (unsubscribeContext === nextUnsubscribeContext) unsubscribeContext = null
   })
+  const contextualTools = [
+    ...new Map(
+      currentContextualDefinitions().map((definition) => [
+        definition.name,
+        definition,
+      ]),
+    ).values(),
+  ]
+  await nextDynamicController.update(contextualTools.map(wrapTool), true)
+  await refreshContextualTools(true)
 
   console.info(
     `[MissionGraph] WebMCP namespace=${runtime.namespace}; dynamic-tools tier=${dynamicToolsTier}`,

@@ -11,11 +11,16 @@ import {
   contentSafeAnnotations,
   contentSafeEnvelope,
 } from '../src/webmcp/content-policy.ts'
+import { DynamicToolController } from '../src/webmcp/dynamic-tools.ts'
 import { addTaskWithDependencies } from '../src/webmcp/task-mutations.ts'
 import { buildSplitPlan } from '../src/webmcp/split.ts'
 
 const toolsSource = readFileSync(
   new URL('../src/webmcp/tools.ts', import.meta.url),
+  'utf8',
+)
+const registrySource = readFileSync(
+  new URL('../src/webmcp/registry.ts', import.meta.url),
   'utf8',
 )
 
@@ -281,4 +286,64 @@ test('list_ready returns client-estimated path distance in live and fixture mode
     listReadySource,
     /connectionMode === 'fixture'[\s\S]*remaining_path_min/,
   )
+})
+
+test('contextual registration observes selection changes during delayed initial registration', async () => {
+  const active = new Set()
+  let releaseInitial
+  const modelContext = {
+    async registerTool(tool, options = {}) {
+      if (tool.name === 'selected-a') {
+        await new Promise((resolve) => {
+          releaseInitial = resolve
+        })
+      }
+      if (options.signal?.aborted) return
+      active.add(tool.name)
+      options.signal?.addEventListener(
+        'abort',
+        () => active.delete(tool.name),
+        { once: true },
+      )
+    },
+  }
+  const controller = new DynamicToolController(
+    modelContext,
+    'abort-controller',
+    [],
+  )
+  let selected = 'selected-a'
+  const listeners = new Set()
+  const unsubscribe = (listener) => {
+    listeners.add(listener)
+    return () => listeners.delete(listener)
+  }
+  const reconcile = () => controller.update([{ name: selected }], true)
+
+  const removeSubscription = unsubscribe(() => void reconcile())
+  const initial = reconcile()
+  while (!releaseInitial) await Promise.resolve()
+  selected = 'selected-b'
+  listeners.forEach((listener) => listener())
+  releaseInitial()
+  await initial
+  await reconcile()
+
+  assert.deepEqual([...active], ['selected-b'])
+  const subscribeAt = registrySource.indexOf(
+    'const nextUnsubscribeContext = useMissionStore.subscribe',
+  )
+  const initialUpdateAt = registrySource.indexOf(
+    'await nextDynamicController.update',
+    subscribeAt,
+  )
+  const reconciliationAt = registrySource.indexOf(
+    'await refreshContextualTools(true)',
+    initialUpdateAt,
+  )
+  assert.ok(subscribeAt > -1 && subscribeAt < initialUpdateAt)
+  assert.ok(initialUpdateAt < reconciliationAt)
+
+  removeSubscription()
+  await controller.dispose()
 })
