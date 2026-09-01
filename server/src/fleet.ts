@@ -36,6 +36,10 @@ export class FleetQueueError extends Error {
   }
 }
 
+type FleetEligibility =
+  | { eligible: true; node: GraphNode }
+  | { eligible: false; code: string; message: string };
+
 const workerLifecycleTypes = new Set([
   "NODE_STATE_CHANGED",
   "PAUSE_ACKED",
@@ -188,13 +192,14 @@ export class FleetQueue {
         const request = row(found);
         const eligibility = this.eligibility(request.project_id, request.node_id);
         if (!eligibility.eligible) {
+          const outcome = eligibility.code === "template_mismatch" ? eligibility.code : "stale";
           this.store.database
             .prepare(
               `UPDATE fleet_requests
-               SET status = 'failed', outcome = 'stale', finished_at = ?
+               SET status = 'failed', outcome = ?, note = ?, finished_at = ?
                WHERE id = ? AND status = 'queued'`,
             )
-            .run(timestamp, request.id);
+            .run(outcome, eligibility.message, timestamp, request.id);
           continue;
         }
         this.store.database
@@ -233,11 +238,16 @@ export class FleetQueue {
       if (!found) throw new FleetQueueError(404, "fleet_request_not_found", "Fleet request does not exist.");
       const request = row(found);
       if (request.status === "adopted") {
-        this.store.database.prepare("UPDATE fleet_requests SET status = 'running' WHERE id = ?").run(requestId);
+        this.store.database
+          .prepare("UPDATE fleet_requests SET status = 'running', adopted_at = ? WHERE id = ?")
+          .run(timestamp, requestId);
         request.status = "running";
       } else if (request.status !== "running") {
         throw new FleetQueueError(409, "fleet_request_state", `Fleet request is ${request.status}.`);
+      } else {
+        this.store.database.prepare("UPDATE fleet_requests SET adopted_at = ? WHERE id = ?").run(timestamp, requestId);
       }
+      request.adopted_at = timestamp;
       this.store.database.exec("COMMIT");
       return request;
     } catch (error) {
@@ -279,17 +289,42 @@ export class FleetQueue {
   private eligibility(
     projectId: string,
     requestedNodeId: string,
-  ): { eligible: true; node: GraphNode } | { eligible: false; code: string } {
+  ): FleetEligibility {
     const events = this.store.listEvents(projectId);
     const state = fold(events);
     const requested = state.nodes[requestedNodeId];
-    if (!requested || requested.record_type !== "task") return { eligible: false, code: "node_not_found" };
-    if (projectId === this.options.seedProjectId) return { eligible: false, code: "template_mismatch" };
+    if (!requested || requested.record_type !== "task") {
+      return { eligible: false, code: "node_not_found", message: `Node ${requestedNodeId} does not exist.` };
+    }
+    if (projectId === this.options.seedProjectId) {
+      return {
+        eligible: false,
+        code: "template_mismatch",
+        message: "The seed template project itself is not fleet-eligible.",
+      };
+    }
     const hasWorkerLifecycle = events.some(
       (event) => workerLifecycleTypes.has(event.type) && nodeId(event) === requestedNodeId,
     );
     if (requested.state !== "queued" || !requested.assigned || hasWorkerLifecycle) {
-      return { eligible: false, code: "node_not_dispatched" };
+      return {
+        eligible: false,
+        code: "node_not_dispatched",
+        message: "The node is not dispatched or already has worker events.",
+      };
+    }
+    const hasBriefOverride = events.some(
+      (event) =>
+        event.type === "DISPATCHED" &&
+        event.payload.node_id === requestedNodeId &&
+        event.payload.brief_override !== undefined,
+    );
+    if (hasBriefOverride) {
+      return {
+        eligible: false,
+        code: "template_mismatch",
+        message: "A DISPATCHED brief_override is not fleet-eligible; dispatch the canonical template title and brief.",
+      };
     }
     const templateEvents = this.options.seedProjectId && this.store.hasProject(this.options.seedProjectId)
       ? this.store.listEvents(this.options.seedProjectId)
@@ -299,7 +334,13 @@ export class FleetQueue {
     const matchesTemplate = Object.values(templateState.nodes).some(
       (template) => template.record_type === "task" && templateHash(template) === requestedHash,
     );
-    if (!matchesTemplate) return { eligible: false, code: "template_mismatch" };
+    if (!matchesTemplate) {
+      return {
+        eligible: false,
+        code: "template_mismatch",
+        message: "The node does not match the seed template registry.",
+      };
+    }
     return { eligible: true, node: requested };
   }
 
@@ -308,11 +349,11 @@ export class FleetQueue {
     if (result.eligible) return result.node;
     switch (result.code) {
       case "node_not_found":
-        throw new FleetQueueError(404, "node_not_found", `Node ${requestedNodeId} does not exist.`);
+        throw new FleetQueueError(404, "node_not_found", result.message);
       case "template_mismatch":
-        throw new FleetQueueError(400, "template_mismatch", "The node does not match the seed template registry.");
+        throw new FleetQueueError(400, "template_mismatch", result.message);
       default:
-        throw new FleetQueueError(400, "node_not_dispatched", "The node is not dispatched or already has worker events.");
+        throw new FleetQueueError(400, "node_not_dispatched", result.message);
     }
   }
 

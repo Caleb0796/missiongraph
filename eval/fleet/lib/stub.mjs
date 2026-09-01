@@ -227,7 +227,7 @@ export async function startFleetStub({
             if (!node) return fleetError(response, 400, "invalid_event", "unknown dispatch node");
             node.assigned = true;
             node.dispatched = true;
-            if (typeof body.payload.brief_override === "string") node.effective_brief = body.payload.brief_override;
+            if (typeof body.payload.brief_override === "string") node.brief_override = body.payload.brief_override;
             const event = append(project, "human", "DISPATCHED", body.payload, body.idem_key);
             return json(response, 200, { seq: event.seq });
           }
@@ -285,8 +285,10 @@ export async function startFleetStub({
             const body = await requestBody(request);
             const node = project.nodes.get(body.node_id);
             if (!node) return fleetError(response, 404, "node_not_found");
-            const effectiveBrief = node.effective_brief ?? node.brief;
-            if (!hashes.has(templateHash(node.title, effectiveBrief))) return fleetError(response, 400, "template_mismatch");
+            if (node.brief_override !== undefined) {
+              return fleetError(response, 400, "template_mismatch", "A DISPATCHED brief_override is not fleet-eligible.");
+            }
+            if (!hashes.has(templateHash(node.title, node.brief))) return fleetError(response, 400, "template_mismatch");
             if (!node.dispatched || node.lifecycle) return fleetError(response, 400, "node_not_dispatched");
             if ([...requests.values()].some((item) => item.project_id === project.id && item.node_id === node.id)) {
               return fleetError(response, 409, "fleet_request_exists");
@@ -327,8 +329,14 @@ export async function startFleetStub({
             if (!item) return empty(response);
             const project = projects.get(item.project_id);
             const node = project?.nodes.get(item.node_id);
-            const effectiveBrief = node?.effective_brief ?? node?.brief;
-            if (!project || !node || !node.dispatched || node.lifecycle || !hashes.has(templateHash(node.title, effectiveBrief))) {
+            if (node?.brief_override !== undefined) {
+              item.status = "failed";
+              item.outcome = "template_mismatch";
+              item.note = "A DISPATCHED brief_override is not fleet-eligible.";
+              item.finished_at = nowMs;
+              continue;
+            }
+            if (!project || !node || !node.dispatched || node.lifecycle || !hashes.has(templateHash(node.title, node.brief))) {
               item.status = "failed";
               item.outcome = "stale";
               item.finished_at = nowMs;
@@ -341,7 +349,7 @@ export async function startFleetStub({
               request_id: item.id,
               project_id: project.id,
               node_id: node.id,
-              node: { title: node.title, brief: effectiveBrief, estimate: node.estimate_min },
+              node: { title: node.title, brief: node.brief, estimate: node.estimate_min },
               visitor_token: project.token,
             });
           }
@@ -351,6 +359,7 @@ export async function startFleetStub({
         if (request.method === "POST" && parts[3] === "heartbeat") {
           if (item.status === "adopted") item.status = "running";
           if (item.status !== "running") return fleetError(response, 409, "fleet_request_not_active");
+          item.adopted_at = nowMs;
           return json(response, 200, { id: item.id, status: item.status });
         }
         if (request.method === "POST" && parts[3] === "complete") {

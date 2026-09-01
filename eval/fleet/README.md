@@ -36,11 +36,13 @@ FLEET_EVAL_TIMEOUT_MS=180000
 
 The one-minute adoption TTL keeps both expiry checks bounded. The longer bridge poll interval gives the harness time to exercise supervisor claim routes after the bridge proves the happy path. `FLEET_EVAL_TIMEOUT_MS` configures harness polling only; the other values configure the integrated server or bridge and must be set when those processes start.
 
+In production, keep `FLEET_RUN_TTL_MIN` below `FLEET_ADOPT_TTL_MIN` as defense in depth. Accepted heartbeats refresh the adoption timestamp used by the server sweep, so only silent claims expire; the bridge watchdog should still terminate a wedged worker before the server lease can expire.
+
 ## Scenario matrix
 
 1. `happy-path`: clone, human-presence dispatch, enqueue, adoption, worker lifecycle events in the clone ledger, and terminal `done`.
 2. `template_mismatch`: a dispatched judge-authored custom task is rejected without changing queue depth.
-3. `edited-brief`: a template clone dispatched with a changed brief is rejected as `template_mismatch`.
+3. `edited-brief`: a template clone dispatched with `brief_override` is rejected as `template_mismatch`, even when the override exactly equals the canonical brief. Contract v0 has no event that edits a task's canonical title or brief after creation, so this scenario cannot retain a separate canonical-edit variant.
 4. `node_not_dispatched`: an otherwise matching template node is rejected before dispatch.
 5. `per-project-cap`: the second request is capped, then accepted after the first adopted request expires.
 6. `daily-cap`: the reported remaining UTC-day capacity is exhausted and the next request gets `fleet_daily_cap`.
@@ -52,3 +54,5 @@ The one-minute adoption TTL keeps both expiry checks bounded. The longer bridge 
 All responses are checked for the known supervisor token. The raw human-confirmation capability is allowed only in the action-confirmation response that contractually mints it, then every other response is checked for that value; fleet responses are also rejected if they expose privileged credential field names. Every clone ledger is re-read at scenario teardown and verified to contain only its own `project_id`, and the happy path checks a sibling clone does not gain worker events.
 
 The real happy path intentionally waits for the running bridge. The other claim-oriented scenarios call the supervisor endpoints directly to make FIFO, TTL, and stale-skip assertions deterministic; use the recommended poll interval and a disposable stack.
+
+Contract v0 interpretations exercised by the harness: raw human capability material appears only in the confirmation mint response; the global UTC daily cap counts every accepted request and never refunds; FIFO means one claim per call returns queued requests in enqueue order; and a judge-authored node that is an exact canonical title+brief copy of a seed template is accepted. That exact-copy behavior is a documented v0 limitation of content-hash eligibility.

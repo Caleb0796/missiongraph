@@ -141,8 +141,13 @@ export const scenarios = [
     async run({ client }) {
       const { clone, nodes } = await cloneNodes(client);
       const node = nodes[0];
-      await client.dispatch(clone, node.id, { briefOverride: `${node.brief} Judge edit.` });
-      expectError(await client.enqueue(clone, node.id), 400, "template_mismatch", "reject edited clone brief");
+      await client.dispatch(clone, node.id, { briefOverride: node.brief });
+      const rejected = await client.enqueue(clone, node.id);
+      expectError(rejected, 400, "template_mismatch", "reject dispatched brief_override");
+      assert(
+        rejected.body?.error?.message?.includes("brief_override"),
+        "brief_override rejection message does not name brief_override",
+      );
     },
   },
   {

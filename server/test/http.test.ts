@@ -133,6 +133,7 @@ function addFleetNode(
   title: string,
   brief: string,
   dispatched: boolean,
+  briefOverride?: string,
 ) {
   store.append(project, {
     actor: "human",
@@ -146,7 +147,11 @@ function addFleetNode(
     store.append(project, {
       actor: "human",
       type: "DISPATCHED",
-      payload: { node_id: nodeId, bypass_cap: true },
+      payload: {
+        node_id: nodeId,
+        bypass_cap: true,
+        ...(briefOverride === undefined ? {} : { brief_override: briefOverride }),
+      },
       idem_key: `dispatch-${project}-${nodeId}`,
     });
   }
@@ -1742,7 +1747,7 @@ describe("HTTP and streaming contract", () => {
     expect(status.json()).toEqual({
       id: request.id,
       status: "done",
-      adopted_at: "2026-08-30T10:00:10.000Z",
+      adopted_at: "2026-08-30T10:00:20.000Z",
       finished_at: "2026-08-30T10:00:30.000Z",
       outcome: "done",
     });
@@ -1767,6 +1772,71 @@ describe("HTTP and streaming contract", () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json()).toMatchObject({ error: { code: "template_mismatch" } });
+  });
+
+  it("rejects a dispatched brief_override at enqueue even when it equals the canonical brief", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+    store.createProject("project", "visitor-token", "2026-08-30T09:30:00.000Z", { seedProjectId: "seed" });
+    addFleetNode(store, "seed", "template", "Build API", "Canonical brief.", false);
+    addFleetNode(store, "project", "task", "Build API", "Canonical brief.", true, "Canonical brief.");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: { node_id: "task" },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: {
+        code: "template_mismatch",
+        message: expect.stringContaining("brief_override"),
+      },
+    });
+  });
+
+  it("rejects a queued brief_override during claim revalidation and continues to the next item", async () => {
+    const clock = new Date("2026-08-30T10:00:00.000Z");
+    const { app, store } = server({
+      fleetMode: true,
+      seedProjectId: "seed",
+      fleetPerProjectCap: 2,
+      now: () => clock,
+    });
+    prepareFleet(store, [
+      { project: "project", token: "visitor-token", nodeId: "eligible", title: "Build API", brief: "Canonical brief." },
+    ]);
+    addFleetNode(store, "project", "overridden", "Build API", "Canonical brief.", true, "Canonical brief.");
+    store.database.prepare(
+      `INSERT INTO fleet_requests
+        (id, project_id, node_id, status, outcome, note, created_at, adopted_at, finished_at)
+       VALUES (?, ?, ?, 'queued', NULL, NULL, ?, NULL, NULL)`,
+    ).run("overridden-request", "project", "overridden", "2026-08-30T09:59:00.000Z");
+    const enqueued = await app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: { node_id: "eligible" },
+    });
+
+    const claimed = await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+
+    expect(claimed.json()).toMatchObject({ request_id: enqueued.json<{ id: string }>().id, node_id: "eligible" });
+    expect(
+      store.database
+        .prepare("SELECT status, outcome, note FROM fleet_requests WHERE id = ?")
+        .get("overridden-request"),
+    ).toEqual({
+      status: "failed",
+      outcome: "template_mismatch",
+      note: expect.stringContaining("brief_override"),
+    });
   });
 
   it("rejects a template node that has not been dispatched", async () => {
@@ -1923,7 +1993,7 @@ describe("HTTP and streaming contract", () => {
     expect(staleStatus.json()).toMatchObject({ id: stale.id, status: "failed", outcome: "stale" });
   });
 
-  it("expires adopted requests when their fleet TTL elapses", async () => {
+  it("keeps a heartbeating request alive past its original adoption TTL", async () => {
     let clock = new Date("2026-08-30T10:00:00.000Z");
     const { app, store } = server({
       fleetMode: true,
@@ -1946,9 +2016,55 @@ describe("HTTP and streaming contract", () => {
       url: "/api/fleet/next",
       headers: { "x-mg-reporter": "reporter-secret" },
     });
+    clock = new Date("2026-08-30T10:00:45.000Z");
     await app.inject({
       method: "POST",
       url: `/api/fleet/${requestId}/heartbeat`,
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    clock = new Date("2026-08-30T10:01:30.000Z");
+    const heartbeat = await app.inject({
+      method: "POST",
+      url: `/api/fleet/${requestId}/heartbeat`,
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    clock = new Date("2026-08-30T10:02:15.000Z");
+
+    const status = await app.inject({
+      method: "GET",
+      url: `/api/p/project/fleet-requests/${requestId}`,
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect(heartbeat.statusCode).toBe(200);
+    expect(status.json()).toEqual({
+      id: requestId,
+      status: "running",
+      adopted_at: "2026-08-30T10:01:30.000Z",
+    });
+  });
+
+  it("expires an adopted request after a full TTL of silence", async () => {
+    let clock = new Date("2026-08-30T10:00:00.000Z");
+    const { app, store } = server({
+      fleetMode: true,
+      seedProjectId: "seed",
+      fleetAdoptTtlMin: 1,
+      now: () => clock,
+    });
+    prepareFleet(store, [
+      { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
+    ]);
+    const enqueued = await app.inject({
+      method: "POST",
+      url: "/api/p/project/fleet-requests",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: { node_id: "task" },
+    });
+    const { id: requestId } = enqueued.json<{ id: string }>();
+    await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
       headers: { "x-mg-reporter": "reporter-secret" },
     });
     clock = new Date("2026-08-30T10:01:01.000Z");
