@@ -187,6 +187,76 @@ export const scenarios = [
     },
   },
   {
+    name: "post-baseline-authored-enqueue",
+    async run({ client }) {
+      const { clone, nodes } = await cloneNodes(client);
+      const nodeId = await client.addTask(clone, {
+        title: nodes[0].title,
+        brief: nodes[0].brief,
+        estimate: nodes[0].estimate_min,
+      });
+      await client.dispatch(clone, nodeId);
+      expectError(
+        await client.enqueue(clone, nodeId),
+        400,
+        "template_mismatch",
+        "reject post-baseline exact-copy task at enqueue",
+      );
+    },
+  },
+  {
+    name: "post-baseline-authored-claim",
+    stubOnly: true,
+    async run({ client, controls }) {
+      const authored = await cloneNodes(client);
+      const nodeId = await client.addTask(authored.clone, {
+        title: authored.nodes[0].title,
+        brief: authored.nodes[0].brief,
+        estimate: authored.nodes[0].estimate_min,
+      });
+      await client.dispatch(authored.clone, nodeId);
+      const authoredRequest = controls.enqueueUnchecked(authored.clone.project, nodeId);
+      const inherited = await cloneNodes(client);
+      const inheritedRequest = await dispatchAndEnqueue(client, inherited.clone, inherited.nodes[0]);
+
+      await claimExpected(client, {
+        id: inheritedRequest.id,
+        clone: inherited.clone,
+        node: inherited.nodes[0],
+      });
+      const mismatch = client.expectStatus(
+        await client.getRequest(authored.clone, authoredRequest.id),
+        200,
+        "read post-baseline claim rejection",
+      );
+      assertEqual(mismatch.status, "failed", "post-baseline claim rejection status");
+      assertEqual(mismatch.outcome, "template_mismatch", "post-baseline claim rejection outcome");
+      await finishClaim(client, inheritedRequest.id);
+    },
+  },
+  {
+    name: "post-baseline-split-child",
+    stubOnly: true,
+    async run({ client, controls }) {
+      const { clone, nodes } = await cloneNodes(client);
+      const child = controls.addSplitChild(clone.project, nodes[0].id, {
+        id: `fleet-eval-split-${randomUUID()}`,
+        title: nodes[0].title,
+        brief: nodes[0].brief,
+        estimate_min: nodes[0].estimate_min,
+        tags: ["fleet-eval"],
+        state: "queued",
+      });
+      await client.dispatch(clone, child.id);
+      expectError(
+        await client.enqueue(clone, child.id),
+        400,
+        "template_mismatch",
+        "reject post-baseline split child",
+      );
+    },
+  },
+  {
     name: "edited-brief",
     async run({ client }) {
       const { clone, nodes } = await cloneNodes(client);
