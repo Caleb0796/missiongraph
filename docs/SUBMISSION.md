@@ -12,10 +12,10 @@ Parallel agent fleets are fast — and illegible. Linear chat loops are legible 
 MissionGraph is a live task-DAG canvas shared by three kinds of minds:
 
 - **You** drag, annotate, dispatch, and approve on the canvas.
-- **Your browser agent** (ChatGPT via WebMCP) plans missions onto the graph, narrates everything you missed, clears approval queues under policies you state in one sentence and visibly confirm (the agent cannot self-authorize — one confirmation mints a nonce-bound, multi-use grant, and every approval records the policy it cited), finds idle work, and re-engineers the graph mid-flight — through 26 WebMCP tools.
+- **Your browser agent** (ChatGPT via WebMCP) plans missions onto the graph, narrates everything you missed, clears approval queues under policies you state in one sentence and visibly confirm (the agent cannot self-authorize — one confirmation mints a nonce-bound, multi-use grant, and every approval records the policy it cited), finds idle work, and re-engineers the graph mid-flight — through a 25-tool always-on core plus 5 contextual tools keyed to selection and failure state. Dynamic-capable runtimes register only the applicable contextual tools; the static fallback keeps all 5 registered and returns not-applicable results when their state does not match.
 - **A real Codex worker fleet** executes tasks in isolated git worktrees, reporting lifecycle, logs, and structured handoffs through node-bound short-lived credentials, coordinated by a Codex supervisor whose every scheduling decision is a recorded, auditable turn.
 
-Three scenarios: S1 Genesis (co-planning a paragraph into a DAG), S2 Flight (co-supervision of live workers), S3 Rewire (mid-flight re-engineering with blast-radius previews).
+Three scenarios: S1 Genesis (co-planning a paragraph into a DAG), S2 Flight (co-supervision of live workers), S3 Rewire (recording a mid-flight split after previewing its stale/pausing-work blast radius, re-routing edges, and recomputing the critical path). A running worker keeps its original brief until it exits; the supervisor can then re-brief the idle thread.
 
 ## Why WebMCP (the challenge question)
 
@@ -25,11 +25,13 @@ What people and agents can do together that was difficult or impossible before: 
 
 ## How we built it
 
-Event-sourced core (Node 22 / Fastify / SQLite append-only ledger, fold reducer, actor-labeled events), React Flow + elkjs canvas folded from the same ledger over WS/SSE, WebMCP tool surface with live-probed tier detection and an indefinite runtime waiter (AbortController tier verified in ChatGPT's built-in browser and flagged Chrome; `provideContext` replacement fallback; the page keeps polling so tools appear even when site tools are enabled minutes after load), and a bridge daemon that pumps structural events to a Codex supervisor session (`codex exec resume`, one in-flight turn, session memory) and mechanically executes its JSON decisions — spawn/pause/rebrief/kill workers in git worktrees.
+Event-sourced core (Node 22 / Fastify / SQLite append-only ledger, fold reducer, actor-labeled events), React Flow + elkjs canvas folded from the same ledger over WS/SSE, WebMCP tool surface with live-probed tier detection and an indefinite runtime waiter (AbortController tier verified in ChatGPT's built-in browser and flagged Chrome; `provideContext` replacement fallback; the page keeps polling so tools appear even when site tools are enabled minutes after load), and a bridge daemon that pumps structural events to a Codex supervisor session (`codex exec resume`, one in-flight turn, session memory) and mechanically executes its JSON decisions — spawn/pause/resume/rebrief/kill workers in git worktrees and record journal notes.
 
 A human-presence capability layer separates agent proposals from human authorization: consequential actions stage a visible confirmation dialog (exact text, SHA-256 binding, expiry, use budget); one confirmation mints a nonce-bound grant, and the audit ledger records the capability reference and use nonce on every consequential event.
 
 Every tool result carries `cursor` + `changes_since` (the digest pattern), so an agent that was away is fully caught up by its next call.
+
+The package suites pass 251 tests (server 69 / bridge 77 / app 105); the fleet stub passes 19 acceptance scenarios.
 
 ## Challenges / what we're proud of
 
@@ -40,7 +42,7 @@ Every tool result carries `cursor` + `changes_since` (the digest pattern), so an
 
 ## What's next
 
-Server-side FIFO with delivery leases, timeline scrubbing (time travel over the ledger), multiplayer cameo, conflict-edge auto-detection.
+Timeline scrubbing (time travel over the ledger), multiplayer cameo, conflict-edge auto-detection.
 
 WebMCP today is pull-only: a page cannot wake the agent — only tool results and toolchange-driven tool-list updates carry information from page to agent, seen on its next turn. MissionGraph is engineered for exactly that reality (every tool result carries a cursor plus `changes_since`), and for the day it changes: if WebMCP maps MCP's resources-and-subscriptions model into the browser, the mission ledger is already the subscribable event stream — the graph becomes a pager for the visitor's agent, with zero redesign. And the substrate is not code-specific: the task DAG, lifecycle, human-presence grants, handoffs, and audit trail apply to any long-running mission — research pipelines, ops runbooks, content production; a Codex fleet is simply today's most demanding tenant.
 

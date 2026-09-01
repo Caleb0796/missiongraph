@@ -12,7 +12,7 @@ Parallel agent fleets are fast — and illegible. A linear chat loop is legible 
 
 - **S1 · Genesis** — describe the mission in a paragraph; your browser agent plans it as a dependency DAG on the canvas (`plan_seed`), you drag, it splits oversized nodes; the critical path ignites.
 - **S2 · Flight** — real Codex workers execute in parallel. Ask your agent to *catch you up* (`graph_digest` narrates everything you missed), state a one-sentence approval policy and let the agent clear the review queue under it (`policy_ref` on every agent approval — auditable), staff the idle branch the radar found.
-- **S3 · Rewire** — mid-flight you split a running task: the blast radius (stale/pausing work) is previewed before anything applies, workers get re-briefed, the critical path re-routes live.
+- **S3 · Rewire** — mid-flight you split a running task: the split is recorded after the blast radius (stale/pausing work) is previewed, edges re-route, and the critical path recomputes. A running worker keeps its original brief until it exits; the supervisor can then re-brief the idle thread.
 
 ## Architecture
 
@@ -20,7 +20,7 @@ Parallel agent fleets are fast — and illegible. A linear chat loop is legible 
  human ──── canvas UI (React Flow + elkjs) ────┐
                                                │ WS / HTTP (event-sourced)
  browser agent (ChatGPT / any WebMCP client)   │
-   └── 20+ WebMCP tools on document.modelContext ──► server (Node 22 · Fastify · SQLite)
+   └── 25 core always-on + 5 state-aware contextual tools ──► server (Node 22 · Fastify · SQLite)
                                                │      append-only event ledger
                                                │      fold reducer · digest ranking
  Codex fleet ── bridge daemon ── SSE + `codex exec resume`
@@ -30,7 +30,7 @@ Parallel agent fleets are fast — and illegible. A linear chat loop is legible 
 
 - **One event ledger** is the single source of truth. Every actor is labeled (`human`, `browser_agent`, `supervisor`, `worker:<id>`); every state you see is a fold of the ledger; any client resumes from any cursor.
 - **Digest pattern**: every tool result carries `cursor` + `changes_since`, so a browser agent that was away five minutes is fully caught up by its next call — the page never needs to wake it.
-- **Supervisor = brain, server = hands**: the Codex supervisor only ever emits structured decisions (spawn / pause / rebrief / note); the bridge executes them mechanically, so *every scheduling decision is an auditable recorded turn*.
+- **Supervisor = brain, server = hands**: the Codex supervisor only ever emits structured decisions (spawn / pause / resume / rebrief / kill / note); the bridge executes them mechanically, so *every scheduling decision is an auditable recorded turn*.
 - **Audit-first UX**: nodes and edges open into dossiers (Brief / Handoff / Deviations / Decisions / Log — prose first, never bare IDs). Workers must file structured handoffs; deviations feed the rewire radar; everything else lands in the project journal.
 - **Real history only (C5)**: the demo seed every visitor clones is an export of a *real* run — actual Codex workers, actual commits, actual approvals. Nothing is fabricated.
 
@@ -65,15 +65,15 @@ pnpm dev
 
 ## Testing
 
-232 tests across the three packages (CI runs them on every push):
+251 tests across the three packages (CI runs them on pushes to `main`/`track/**` and on pull requests):
 
 ```sh
-cd server && pnpm test   # 63 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, and the fleet queue
-cd bridge && pnpm test   # 74 — decision validation, crash replay, PID/lock safety, credential renewal, lease and watchdog behaviour, the worker-launch handshake, and human-confirmed dispatch integrations against the real server
-cd app    && pnpm test   # 95 — tool envelopes, identity fencing/recovery, split confirmation, S2 policy/action dialogs, late WebMCP injection, tier detection, fleet-off dispatch invariants, and real-server HTTP paths
+cd server && pnpm test   # 69 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, and the fleet queue
+cd bridge && pnpm test   # 77 — decision validation, crash replay, PID/lock safety, credential renewal, lease and watchdog behaviour, the worker-launch handshake, and human-confirmed dispatch integrations against the real server
+cd app    && pnpm test   # 105 — tool envelopes, identity fencing/recovery, split confirmation, S2 policy/action dialogs, late WebMCP injection, tier detection, fleet-off dispatch invariants, and real-server HTTP paths
 ```
 
-The fleet contract has its own scenario harness on top of those: `node eval/fleet/run.mjs --stub` runs 16
+The fleet contract has its own scenario harness on top of those: `node eval/fleet/run.mjs --stub` runs 19
 acceptance scenarios against an in-process mirror of the server, and `--real` runs them against a live
 server and bridge.
 
