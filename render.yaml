@@ -36,7 +36,34 @@ services:
         sync: false
       # Confirm the model available to the API key ON the VM before enabling the
       # bridge (`codex -m <model> exec 'say ok'`); do not assume ChatGPT-account models.
+      # Measured on the fleet arbitration harness — one template task per run: edit the repo,
+      # commit, and file the full lifecycle + handoff + approval protocol. Pass means the judge
+      # actually gets a review item; a run that commits but never files APPROVAL_CREATED looks
+      # successful and leaves the review queue empty, which is worse than a visible failure.
+      #   gpt-5.6-sol   / high    2/2 pass   ~230s      — what the laptop uses for the video
+      #   gpt-5.6-sol   / medium  3/3 pass   146-208s   — chosen here: same model, cheaper effort
+      #   gpt-5.4-mini  / medium  3/4 pass   156-210s   — cheapest tier, and the vaguest prose
+      #   gpt-5.6-luna  / medium  2/3 pass   90-172s    — unreliable
+      #   gpt-5.6-luna  / high    0/3 pass   122-168s   — more reasoning does NOT fix it
+      #   gpt-5.6-luna  / low     0/1 pass   110s
+      # The failures are a model property, not an effort setting: raising luna to high made it
+      # worse, while sol stayed reliable at medium. Re-measure before changing this value.
       - key: MG_CODEX_MODEL
-        sync: false
+        value: gpt-5.6-sol
       - key: MG_CODEX_EFFORT
         value: medium
+      # Judge fleet (a clone may borrow the bridge for ONE human-confirmed, template-bound task).
+      # Everything below is inert while FLEET_MODE is 0 — the merged code changes nothing here.
+      - key: FLEET_MODE
+        value: "0"
+      # Worst-case spend is bounded by daily cap x judging days, so keep the cap low and ALSO set
+      # a hard spend limit on the API key itself — that limit is the backstop that does not
+      # depend on this code being correct.
+      - key: FLEET_DAILY_CAP
+        value: "5"
+      - key: FLEET_PER_PROJECT_CAP
+        value: "1"
+      - key: FLEET_ADOPT_TTL_MIN
+        value: "20"
+      - key: FLEET_RUN_TTL_MIN
+        value: "15"
