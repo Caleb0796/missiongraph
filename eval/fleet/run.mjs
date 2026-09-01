@@ -136,6 +136,7 @@ async function main() {
 
   const passed = results.filter((result) => result.status === "PASS").length;
   const failed = results.filter((result) => result.status === "FAIL").length;
+  const skipped = results.filter((result) => result.status === "SKIP").length;
   const summary = {
     version: 1,
     mode: selected.mode,
@@ -144,13 +145,14 @@ async function main() {
     finished_at: new Date().toISOString(),
     passed,
     failed,
+    skipped,
     total: results.length,
     scenarios: results,
   };
   await writeFile(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
 
   printTable(results);
-  console.log(`\n${passed}/${results.length} passed`);
+  console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped`);
   console.log(`JSON summary: ${summaryPath}`);
   if (failed > 0) process.exitCode = 1;
 }

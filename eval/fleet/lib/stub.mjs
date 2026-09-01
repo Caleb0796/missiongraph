@@ -64,9 +64,7 @@ export async function startFleetStub({
     { title: "Fleet template B", brief: "Execute the second bounded fleet template.", estimate_min: 1 },
     { title: "Fleet template C", brief: "Execute the third bounded fleet template.", estimate_min: 1 },
   ];
-  const hashes = new Set(seedTemplates.map((node) => templateHash(node.title, node.brief)));
   let nowMs = Date.parse("2026-08-31T12:00:00.000Z");
-  let dailyUsed = 0;
   let sequence = 0;
 
   function append(project, actor, type, payload, idemKey = randomUUID()) {
@@ -80,10 +78,6 @@ export async function startFleetStub({
       idem_key: idemKey,
     };
     project.events.push(event);
-    if (lifecycleTypes.has(type) && typeof payload.node_id === "string") {
-      const node = project.nodes.get(payload.node_id);
-      if (node) node.lifecycle = true;
-    }
     return event;
   }
 
@@ -102,8 +96,6 @@ export async function startFleetStub({
       record_type: "task",
       availability: "ready",
       assigned: false,
-      dispatched: false,
-      lifecycle: false,
     };
     seedProject.nodes.set(node.id, node);
     append(seedProject, "human", "TASK_ADDED", {
@@ -125,15 +117,13 @@ export async function startFleetStub({
     const project = { id, token, nodes: new Map(), events: [] };
     [...seedProject.nodes.values()].forEach((template, index) => {
       const node = {
-        id: `clone-node-${index + 1}-${randomUUID()}`,
         ...template,
+        id: `clone-node-${index + 1}-${randomUUID()}`,
         tags: ["fleet-template"],
         state: "queued",
         record_type: "task",
         availability: "ready",
         assigned: false,
-        dispatched: false,
-        lifecycle: false,
       };
       project.nodes.set(node.id, node);
       append(project, "human", "TASK_ADDED", {
@@ -151,6 +141,59 @@ export async function startFleetStub({
     return project;
   }
 
+  function dailyUsed() {
+    const at = new Date(nowMs);
+    const start = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate());
+    const end = start + 24 * 60 * 60_000;
+    return [...requests.values()].filter((item) => item.created_at >= start && item.created_at < end).length;
+  }
+
+  function eligibility(project, nodeId) {
+    const node = project?.nodes.get(nodeId);
+    if (!node || node.record_type !== "task") {
+      return { eligible: false, code: "node_not_found", message: `Node ${nodeId} does not exist.` };
+    }
+    if (project.id === seedProject.id) {
+      return {
+        eligible: false,
+        code: "template_mismatch",
+        message: "The seed template project itself is not fleet-eligible.",
+      };
+    }
+    const hasWorkerLifecycle = project.events.some(
+      (event) => lifecycleTypes.has(event.type) && event.payload?.node_id === nodeId,
+    );
+    if (node.state !== "queued" || !node.assigned || hasWorkerLifecycle) {
+      return {
+        eligible: false,
+        code: "node_not_dispatched",
+        message: "The node is not dispatched or already has worker events.",
+      };
+    }
+    const hasBriefOverride = project.events.some(
+      (event) => event.type === "DISPATCHED" && event.payload?.node_id === nodeId && event.payload.brief_override !== undefined,
+    );
+    if (hasBriefOverride) {
+      return {
+        eligible: false,
+        code: "template_mismatch",
+        message: "A DISPATCHED brief_override is not fleet-eligible; dispatch the canonical template title and brief.",
+      };
+    }
+    const requestedHash = templateHash(node.title, node.brief);
+    const matchesTemplate = [...seedProject.nodes.values()].some(
+      (template) => template.record_type === "task" && templateHash(template.title, template.brief) === requestedHash,
+    );
+    if (!matchesTemplate) {
+      return {
+        eligible: false,
+        code: "template_mismatch",
+        message: "The node does not match the seed template registry.",
+      };
+    }
+    return { eligible: true, node };
+  }
+
   function supervisorAuthorized(request) {
     return request.headers["x-mg-reporter"] === reporterToken;
   }
@@ -164,7 +207,6 @@ export async function startFleetStub({
         nowMs - request.adopted_at >= ttlMs
       ) {
         request.status = "expired";
-        request.outcome = "expired";
         request.finished_at = nowMs;
       }
     }
@@ -258,8 +300,6 @@ export async function startFleetStub({
             const node = project.nodes.get(body.payload?.node_id);
             if (!node) return fleetError(response, 400, "invalid_event", "unknown dispatch node");
             node.assigned = true;
-            node.dispatched = true;
-            if (typeof body.payload.brief_override === "string") node.brief_override = body.payload.brief_override;
             const event = append(project, "human", "DISPATCHED", body.payload, body.idem_key);
             return json(response, 200, { seq: event.seq });
           }
@@ -270,8 +310,6 @@ export async function startFleetStub({
               record_type: "task",
               availability: "ready",
               assigned: false,
-              dispatched: false,
-              lifecycle: false,
             };
             project.nodes.set(node.id, node);
             const event = append(project, "human", "TASK_ADDED", body.payload, body.idem_key);
@@ -306,7 +344,7 @@ export async function startFleetStub({
           return json(response, 200, {
             enabled: true,
             queue_depth: [...requests.values()].filter((item) => item.status === "queued").length,
-            daily_remaining: Math.max(0, dailyCap - dailyUsed),
+            daily_remaining: Math.max(0, dailyCap - dailyUsed()),
             project_remaining: Math.max(0, perProjectCap - projectUsed),
           });
         }
@@ -315,29 +353,28 @@ export async function startFleetStub({
           sweep();
           if (request.method === "POST" && parts.length === 4) {
             const body = await requestBody(request);
-            const node = project.nodes.get(body.node_id);
-            if (!node) return fleetError(response, 404, "node_not_found");
-            if (node.brief_override !== undefined) {
-              return fleetError(response, 400, "template_mismatch", "A DISPATCHED brief_override is not fleet-eligible.");
+            const result = eligibility(project, body.node_id);
+            if (!result.eligible) {
+              const status = result.code === "node_not_found" ? 404 : 400;
+              return fleetError(response, status, result.code, result.message);
             }
-            if (!hashes.has(templateHash(node.title, node.brief))) return fleetError(response, 400, "template_mismatch");
-            if (!node.dispatched || node.lifecycle) return fleetError(response, 400, "node_not_dispatched");
-            if ([...requests.values()].some((item) => item.project_id === project.id && item.node_id === node.id)) {
+            if ([...requests.values()].some(
+              (item) => item.project_id === project.id && item.node_id === result.node.id && item.status !== "expired",
+            )) {
               return fleetError(response, 409, "fleet_request_exists");
             }
             const projectUsed = [...requests.values()].filter((item) => item.project_id === project.id && item.status !== "expired").length;
             if (projectUsed >= perProjectCap) return fleetError(response, 429, "fleet_project_cap");
-            if (dailyUsed >= dailyCap) return fleetError(response, 429, "fleet_daily_cap");
+            if (dailyUsed() >= dailyCap) return fleetError(response, 429, "fleet_daily_cap");
             const item = {
               id: `fleet-request-${randomUUID()}`,
               project_id: project.id,
-              node_id: node.id,
+              node_id: result.node.id,
               status: "queued",
               created_at: nowMs,
               order: requests.size + 1,
             };
             requests.set(item.id, item);
-            dailyUsed += 1;
             sweep();
             return json(response, 200, { id: item.id, status: "queued", position: item.position });
           }
@@ -360,17 +397,11 @@ export async function startFleetStub({
               .sort((left, right) => left.order - right.order)[0];
             if (!item) return empty(response);
             const project = projects.get(item.project_id);
-            const node = project?.nodes.get(item.node_id);
-            if (node?.brief_override !== undefined) {
+            const result = eligibility(project, item.node_id);
+            if (!result.eligible) {
               item.status = "failed";
-              item.outcome = "template_mismatch";
-              item.note = "A DISPATCHED brief_override is not fleet-eligible.";
-              item.finished_at = nowMs;
-              continue;
-            }
-            if (!project || !node || !node.dispatched || node.lifecycle || !hashes.has(templateHash(node.title, node.brief))) {
-              item.status = "failed";
-              item.outcome = "stale";
+              item.outcome = result.code === "template_mismatch" ? result.code : "stale";
+              item.note = result.message;
               item.finished_at = nowMs;
               continue;
             }
@@ -380,8 +411,8 @@ export async function startFleetStub({
             return json(response, 200, {
               request_id: item.id,
               project_id: project.id,
-              node_id: node.id,
-              node: { title: node.title, brief: node.brief, estimate: node.estimate_min },
+              node_id: result.node.id,
+              node: { title: result.node.title, brief: result.node.brief, estimate: result.node.estimate_min },
               visitor_token: project.token,
             });
           }
@@ -436,8 +467,6 @@ export async function startFleetStub({
         record_type: "task",
         availability: "ready",
         assigned: false,
-        dispatched: false,
-        lifecycle: false,
       };
       seedProject.nodes.set(node.id, node);
       append(seedProject, "human", "TASK_ADDED", {
@@ -465,7 +494,6 @@ export async function startFleetStub({
       const project = projects.get(projectId);
       const node = project?.nodes.get(nodeId);
       if (!project || !node) throw new Error("cannot invalidate unknown stub node");
-      node.lifecycle = true;
       append(project, `worker:${nodeId}`, "WORKER_LOG", { node_id: nodeId, lines: ["invalidated before claim"] });
     },
     async close() {
