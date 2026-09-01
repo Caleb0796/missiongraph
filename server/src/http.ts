@@ -282,6 +282,7 @@ function fleetRequestResponse(request: FleetRequest, position?: number): Record<
     ...(request.adopted_at === null ? {} : { adopted_at: request.adopted_at }),
     ...(request.finished_at === null ? {} : { finished_at: request.finished_at }),
     ...(request.outcome === null ? {} : { outcome: request.outcome }),
+    ...(request.note === null ? {} : { note: request.note }),
   };
 }
 

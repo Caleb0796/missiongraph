@@ -1890,6 +1890,7 @@ describe("HTTP and streaming contract", () => {
       adopted_at: "2026-08-30T10:00:20.000Z",
       finished_at: "2026-08-30T10:00:30.000Z",
       outcome: "done",
+      note: "Worker finished cleanly.",
     });
     expect(
       store.database.prepare("SELECT note FROM fleet_requests WHERE id = ?").get(request.id),
