@@ -218,7 +218,6 @@ export class LiveFleetCoordinator {
     try {
       status = await this.probe(session)
     } catch {
-      if (this.isCurrent(session, generation)) this.degrade(nodeId)
       return null
     }
     if (!this.isCurrent(session, generation)) return null

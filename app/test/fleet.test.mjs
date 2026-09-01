@@ -117,6 +117,28 @@ test('fleet-disabled dispatch is byte-compatible and caches the probe per sessio
   assert.deepEqual(calls, [['status', 'project-a', 'session-a']])
 })
 
+test('an initial fleet probe failure is silent and leaves dispatch unchanged', async () => {
+  const { coordinator, displays } = harness({
+    status: async () => {
+      throw new Error('fleet status request timed out')
+    },
+  })
+  const current = {
+    summary: 'Dispatched “Task” to the Codex supervisor.',
+    node_id: 'node-a',
+    bypass_cap: true,
+  }
+  const before = JSON.stringify(current)
+
+  const fleet = await coordinator.dispatch('node-a')
+  const result = withFleetMetadata(current, fleet)
+
+  assert.equal(fleet, null)
+  assert.equal(result, current)
+  assert.equal(JSON.stringify(result), before)
+  assert.deepEqual(displays.filter(Boolean), [])
+})
+
 test('a hanging fleet probe cannot delay or change the dispatch tool result', () => {
   const { coordinator } = harness({
     status: () => new Promise(() => {}),
