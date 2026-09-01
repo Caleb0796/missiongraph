@@ -42,6 +42,8 @@ Every tool result carries `cursor` + `changes_since` (the digest pattern), so an
 
 Server-side FIFO with delivery leases, timeline scrubbing (time travel over the ledger), multiplayer cameo, conflict-edge auto-detection.
 
+WebMCP today is pull-only: a page cannot wake the agent — only tool results and toolchange-driven tool-list updates carry information from page to agent, seen on its next turn. MissionGraph is engineered for exactly that reality (every tool result carries a cursor plus `changes_since`), and for the day it changes: if WebMCP maps MCP's resources-and-subscriptions model into the browser, the mission ledger is already the subscribable event stream — the graph becomes a pager for the visitor's agent, with zero redesign. And the substrate is not code-specific: the task DAG, lifecycle, human-presence grants, handoffs, and audit trail apply to any long-running mission — research pipelines, ops runbooks, content production; a Codex fleet is simply today's most demanding tenant.
+
 ---
 
 ### Submission fields checklist (§10)
