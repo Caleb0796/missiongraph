@@ -10,6 +10,13 @@ const lifecycleTypes = new Set([
   "APPROVAL_CREATED",
 ]);
 
+const nodeTitleByteLimit = 256;
+const nodeBriefByteLimit = 16 * 1024;
+
+function textExceeds(value, limit) {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") > limit;
+}
+
 function templateHash(title, brief) {
   return createHash("sha256").update(`${title}\n${brief}`).digest("hex");
 }
@@ -309,6 +316,9 @@ export async function startFleetStub({
         if (request.method === "POST" && parts[3] === "mutations") {
           const body = await requestBody(request);
           if (body.type === "DISPATCHED") {
+            if (textExceeds(body.payload?.brief_override, nodeBriefByteLimit)) {
+              return fleetError(response, 413, "node_brief_too_large");
+            }
             const capability = capabilities.get(request.headers["x-mg-capability-ref"]);
             if (!capability || capability.used || capability.project_id !== project.id || capability.token !== request.headers["x-mg-capability"]) {
               return fleetError(response, 403, "capability_required");
@@ -322,6 +332,12 @@ export async function startFleetStub({
           }
           if (body.type === "TASK_ADDED") {
             const input = body.payload?.node;
+            if (textExceeds(input?.title, nodeTitleByteLimit)) {
+              return fleetError(response, 413, "node_title_too_large");
+            }
+            if (textExceeds(input?.brief, nodeBriefByteLimit)) {
+              return fleetError(response, 413, "node_brief_too_large");
+            }
             const node = {
               ...input,
               record_type: "task",

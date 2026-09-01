@@ -264,7 +264,78 @@ const workerStateTransitions = new Set([
   "running->failed",
 ]);
 
+const fieldByteLimits = {
+  policyText: 4 * 1024,
+  workerLog: 64 * 1024,
+  nodeTitle: 256,
+  nodeBrief: 16 * 1024,
+  handoffSummary: 16 * 1024,
+  annotation: 8 * 1024,
+  journalNote: 8 * 1024,
+} as const;
+
+function validateTextSize(value: string, limit: number, code: string, label: string): void {
+  if (Buffer.byteLength(value, "utf8") <= limit) return;
+  throw new IngressPolicyError(
+    413,
+    code,
+    `${label} must be at most ${limit} UTF-8 bytes.`,
+  );
+}
+
+function validateNodeSize(node: { title: string; brief: string }): void {
+  validateTextSize(node.title, fieldByteLimits.nodeTitle, "node_title_too_large", "Node title");
+  validateTextSize(node.brief, fieldByteLimits.nodeBrief, "node_brief_too_large", "Node brief");
+}
+
+function validateEventSizes(input: EventInput): void {
+  switch (input.type) {
+    case "TASK_ADDED":
+      validateNodeSize(input.payload.node);
+      break;
+    case "TASK_SPLIT":
+      for (const child of input.payload.children) validateNodeSize(child);
+      break;
+    case "DISPATCHED":
+      if (input.payload.brief_override !== undefined) {
+        validateTextSize(
+          input.payload.brief_override,
+          fieldByteLimits.nodeBrief,
+          "node_brief_too_large",
+          "Node brief override",
+        );
+      }
+      break;
+    case "ANNOTATED":
+      validateTextSize(input.payload.note, fieldByteLimits.annotation, "annotation_too_large", "Annotation");
+      break;
+    case "JOURNAL_NOTE":
+      validateTextSize(input.payload.text, fieldByteLimits.journalNote, "journal_note_too_large", "Journal note");
+      break;
+    case "WORKER_LOG": {
+      const size = input.payload.lines.reduce((total, line) => total + Buffer.byteLength(line, "utf8"), 0);
+      if (size > fieldByteLimits.workerLog) {
+        throw new IngressPolicyError(
+          413,
+          "worker_log_too_large",
+          `Worker log lines must total at most ${fieldByteLimits.workerLog} UTF-8 bytes.`,
+        );
+      }
+      break;
+    }
+    case "HANDOFF_FILED":
+      validateTextSize(
+        input.payload.handoff.summary,
+        fieldByteLimits.handoffSummary,
+        "handoff_summary_too_large",
+        "Handoff summary",
+      );
+      break;
+  }
+}
+
 function validateReporterIngress(events: readonly Event[], input: EventInput): void {
+  validateEventSizes(input);
   if (input.type === "NODE_STATE_CHANGED") {
     if (input.payload.to === "done") {
       throw new IngressPolicyError(
@@ -627,6 +698,12 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       if (typeof body.text !== "string" || body.text.trim() === "") {
         throw new EventValidationError("text must not be empty");
       }
+      validateTextSize(
+        body.text,
+        fieldByteLimits.policyText,
+        "policy_text_too_large",
+        "Policy text",
+      );
       const maxUses = body.max_uses === undefined ? 4 : body.max_uses;
       if (!Number.isSafeInteger(maxUses) || (maxUses as number) < 1 || (maxUses as number) > 20) {
         throw new EventValidationError("max_uses must be an integer between 1 and 20");
@@ -706,6 +783,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       } else {
         inputs = [parseEventInput({ ...mutation, actor: "human", idem_key: id() })];
       }
+      for (const input of inputs) validateEventSizes(input);
       const action = actionForMutation(inputs, store.listEvents(project));
       if (!action) throw new EventValidationError("mutation does not require human-presence confirmation");
       const displayText = typeof body.summary === "string" && body.summary.trim() !== ""
@@ -876,11 +954,15 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
               }
             }
           : undefined;
+        const beforeAppend = () => {
+          for (const input of inputs) validateEventSizes(input);
+          authorize?.();
+        };
         if (batchIdemKey) {
           const result = store.appendBatch(project, inputs, batchIdemKey, {
             ...(baseSeq === undefined ? {} : { baseSeq }),
             ...(sessionId === undefined ? {} : { sessionId }),
-            ...(authorize ? { authorize } : {}),
+            authorize: beforeAppend,
             ts: now().toISOString(),
           });
           return reply.send({ seqs: result.events.map((event) => event.seq) });
@@ -888,7 +970,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
         const result = store.append(project, inputs[0]!, {
           ...(baseSeq === undefined ? {} : { baseSeq }),
           ...(sessionId === undefined ? {} : { sessionId }),
-          ...(authorize ? { authorize } : {}),
+          authorize: beforeAppend,
           ts: now().toISOString(),
         });
         return reply.send({ seq: result.event.seq });

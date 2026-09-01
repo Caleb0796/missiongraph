@@ -4,6 +4,7 @@ import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createServer, type MissionGraphServer, type ServerOptions } from "../src/http.js";
+import { fold } from "../src/reducer.js";
 import { baseHandoff } from "./fixtures.js";
 
 const openServers: MissionGraphServer[] = [];
@@ -305,6 +306,106 @@ describe("HTTP and streaming contract", () => {
     expect(JSON.stringify(stored)).not.toContain(session.session_proof);
     expect(store.browserSessionMatches("project", session.session_id, session.session_proof, issuedAt)).toBe(true);
     expect(store.browserSessionMatches("project", session.session_id, "wrong", issuedAt)).toBe(false);
+  });
+
+  it("bounds policy text by UTF-8 bytes at the draft ingress", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    const stage = (text: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/policy-drafts",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+      },
+      payload: { text },
+    });
+
+    const atLimit = await stage("é".repeat(2_048));
+    const overLimit = await stage(`${"é".repeat(2_048)}x`);
+
+    expect(atLimit.statusCode).toBe(200);
+    expect(overLimit.statusCode).toBe(413);
+    expect(overLimit.json()).toMatchObject({ error: { code: "policy_text_too_large" } });
+    expect(
+      (store.database.prepare("SELECT COUNT(*) AS count FROM human_drafts").get() as { count: number }).count,
+    ).toBe(1);
+  });
+
+  it("bounds task titles and briefs by UTF-8 bytes at mutation ingress", async () => {
+    const { app, store } = server();
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    const add = (id: string, title: string, brief: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: {
+        type: "TASK_ADDED",
+        payload: { node: { id, title, brief, estimate_min: 10, tags: [], state: "queued" } },
+        idem_key: `add-${id}`,
+      },
+    });
+
+    const titleAtLimit = await add("title-limit", "é".repeat(128), "Brief.");
+    const titleOverLimit = await add("title-over", `${"é".repeat(128)}x`, "Brief.");
+    const briefAtLimit = await add("brief-limit", "Brief limit", "é".repeat(8_192));
+    const briefOverLimit = await add("brief-over", "Brief over", `${"é".repeat(8_192)}x`);
+
+    expect([titleAtLimit.statusCode, briefAtLimit.statusCode]).toEqual([200, 200]);
+    expect([titleOverLimit.statusCode, briefOverLimit.statusCode]).toEqual([413, 413]);
+    expect(titleOverLimit.json()).toMatchObject({ error: { code: "node_title_too_large" } });
+    expect(briefOverLimit.json()).toMatchObject({ error: { code: "node_brief_too_large" } });
+    expect(Object.keys(fold(store.listEvents("project")).nodes)).toEqual(["title-limit", "brief-limit"]);
+  });
+
+  it("bounds annotations and journal notes by UTF-8 bytes at mutation and report ingress", async () => {
+    const { app, store } = server();
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.append("project", {
+      actor: "human",
+      type: "TASK_ADDED",
+      payload: {
+        node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+      },
+      idem_key: "add-a",
+    });
+    const mutate = (type: "ANNOTATED" | "JOURNAL_NOTE", payload: Record<string, unknown>, idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/p/project/mutations",
+        headers: { "x-mg-token": "visitor-token" },
+        payload: { type, payload, idem_key: idemKey },
+      });
+    const journalReport = (text: string, idemKey: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: "Bearer reporter-secret" },
+      payload: { actor: "supervisor", type: "JOURNAL_NOTE", payload: { text }, idem_key: idemKey },
+    });
+
+    const annotationAtLimit = await mutate(
+      "ANNOTATED",
+      { target_id: "a", note: "é".repeat(4_096) },
+      "annotation-limit",
+    );
+    const annotationOverLimit = await mutate(
+      "ANNOTATED",
+      { target_id: "a", note: `${"é".repeat(4_096)}x` },
+      "annotation-over",
+    );
+    const journalAtLimit = await journalReport("é".repeat(4_096), "journal-limit");
+    const journalOverLimit = await mutate(
+      "JOURNAL_NOTE",
+      { text: `${"é".repeat(4_096)}x` },
+      "journal-over",
+    );
+
+    expect([annotationAtLimit.statusCode, journalAtLimit.statusCode]).toEqual([200, 200]);
+    expect([annotationOverLimit.statusCode, journalOverLimit.statusCode]).toEqual([413, 413]);
+    expect(annotationOverLimit.json()).toMatchObject({ error: { code: "annotation_too_large" } });
+    expect(journalOverLimit.json()).toMatchObject({ error: { code: "journal_note_too_large" } });
   });
 
   it("applies mutation batches atomically with server-assigned ids", async () => {
@@ -1567,6 +1668,79 @@ describe("HTTP and streaming contract", () => {
     expect(unauthorized.statusCode).toBe(401);
     expect(supervisorTokenAsWorker.statusCode).toBe(401);
     expect(authorized.json()).toEqual({ seq: 2 });
+  });
+
+  it("bounds worker log payloads and handoff summaries by UTF-8 bytes at report ingress", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    for (const nodeId of ["log", "handoff-limit", "handoff-over"]) {
+      store.issueReporterCredential(
+        "project",
+        `worker:${nodeId}`,
+        "2026-08-30T10:00:00.000Z",
+        `worker-${nodeId}-token`,
+      );
+      store.append("project", {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: {
+            id: nodeId,
+            title: `Task ${nodeId}`,
+            brief: `Build ${nodeId}.`,
+            estimate_min: 10,
+            tags: [],
+            state: nodeId === "log" ? "queued" : "running",
+          },
+        },
+        idem_key: `add-${nodeId}`,
+      });
+    }
+    const report = (nodeId: string, type: string, payload: Record<string, unknown>, idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/p/project/report",
+        headers: { authorization: `Bearer worker-${nodeId}-token` },
+        payload: { actor: `worker:${nodeId}`, type, payload, idem_key: idemKey },
+      });
+
+    const logAtLimit = await report(
+      "log",
+      "WORKER_LOG",
+      { node_id: "log", lines: ["é".repeat(16_384), "x".repeat(32_768)] },
+      "log-limit",
+    );
+    const logOverLimit = await report(
+      "log",
+      "WORKER_LOG",
+      { node_id: "log", lines: ["é".repeat(16_384), `${"x".repeat(32_768)}y`] },
+      "log-over",
+    );
+    const handoffAtLimit = await report(
+      "handoff-limit",
+      "HANDOFF_FILED",
+      {
+        node_id: "handoff-limit",
+        handoff: { ...baseHandoff, summary: "é".repeat(8_192) },
+      },
+      "handoff-limit",
+    );
+    const handoffOverLimit = await report(
+      "handoff-over",
+      "HANDOFF_FILED",
+      {
+        node_id: "handoff-over",
+        handoff: { ...baseHandoff, summary: `${"é".repeat(8_192)}x` },
+      },
+      "handoff-over",
+    );
+
+    expect([logAtLimit.statusCode, handoffAtLimit.statusCode]).toEqual([200, 200]);
+    expect([logOverLimit.statusCode, handoffOverLimit.statusCode]).toEqual([413, 413]);
+    expect(logOverLimit.json()).toMatchObject({ error: { code: "worker_log_too_large" } });
+    expect(handoffOverLimit.json()).toMatchObject({ error: { code: "handoff_summary_too_large" } });
+    expect(store.listEvents("project").map((event) => event.idem_key)).not.toContain("log-over");
+    expect(store.listEvents("project").map((event) => event.idem_key)).not.toContain("handoff-over");
   });
 
   it("prevents a worker from approving itself while preserving the approval happy path", async () => {
