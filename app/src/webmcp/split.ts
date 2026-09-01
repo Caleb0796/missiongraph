@@ -28,6 +28,7 @@ export function buildSplitPlan(
   parent: TaskNode,
   subtasks: SplitSubtask[],
   edges: GraphEdge[],
+  createId: () => string = () => crypto.randomUUID(),
 ): SplitPlan {
   const ids = new Set(subtasks.map((subtask) => subtask.temp_id))
   if (subtasks.length < 2) throw new Error('subtasks must contain at least two tasks.')
@@ -54,7 +55,7 @@ export function buildSplitPlan(
   }
 
   const childId = new Map(
-    subtasks.map((subtask) => [subtask.temp_id, crypto.randomUUID()]),
+    subtasks.map((subtask) => [subtask.temp_id, createId()]),
   )
   const children: TaskNode[] = subtasks.map((subtask) => ({
     id: childId.get(subtask.temp_id)!,
@@ -77,14 +78,15 @@ export function buildSplitPlan(
     (edge) => edge.upstream === parent.id || edge.downstream === parent.id,
   )
   const edgeRemap = incident.map((edge) => {
-    const newTarget = (
+    const targets =
       edge.kind === 'conflicts'
         ? children.map((child) => child.id)
         : edge.downstream === parent.id
           ? entryIds
           : terminalIds
-    )[0]!
+    const newTarget = targets[0]!
     return {
+      targets,
       edgeId: edge.edge_id,
       upstream: edge.upstream === parent.id ? newTarget : edge.upstream,
       downstream: edge.downstream === parent.id ? newTarget : edge.downstream,
@@ -92,6 +94,28 @@ export function buildSplitPlan(
       newTarget,
     }
   })
+  const clonedEdges: GraphEdge[] = []
+  const previewEdgeRemap = edgeRemap.flatMap(({ targets, ...stable }) => [
+    stable,
+    ...targets.slice(1).map((newTarget) => {
+      const clone = {
+        edge_id: createId(),
+        upstream:
+          stable.upstream === stable.newTarget ? newTarget : stable.upstream,
+        downstream:
+          stable.downstream === stable.newTarget ? newTarget : stable.downstream,
+        kind: stable.kind,
+      }
+      clonedEdges.push(clone)
+      return {
+        edgeId: clone.edge_id,
+        upstream: clone.upstream,
+        downstream: clone.downstream,
+        kind: clone.kind,
+        newTarget,
+      }
+    }),
+  ])
   const batch: MutationBatchItem[] = [
     {
       type: 'TASK_SPLIT',
@@ -104,13 +128,17 @@ export function buildSplitPlan(
         })),
       },
     },
+    ...clonedEdges.map((edge) => ({
+      type: 'EDGE_ADDED' as const,
+      payload: edge,
+    })),
   ]
   for (const subtask of subtasks) {
     for (const dependency of subtask.deps) {
       batch.push({
         type: 'EDGE_ADDED',
         payload: {
-          edge_id: crypto.randomUUID(),
+          edge_id: createId(),
           upstream: childId.get(dependency)!,
           downstream: childId.get(subtask.temp_id)!,
           kind: 'depends',
@@ -119,5 +147,11 @@ export function buildSplitPlan(
     }
   }
 
-  return { batch, children, entryIds, terminalIds, edgeRemap }
+  return {
+    batch,
+    children,
+    entryIds,
+    terminalIds,
+    edgeRemap: previewEdgeRemap,
+  }
 }

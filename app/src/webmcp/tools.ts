@@ -27,8 +27,10 @@ import {
   type MutationBatchItem,
 } from '../transport/client'
 import { withFleetMetadata } from '../transport/fleet'
+import { policyConfirmationNextStep } from './agent-guidance'
 import type { ToolDefinition, ToolOutcome } from './registry'
 import { buildSplitPlan, type SplitSubtask } from './split'
+import { addTaskWithDependencies } from './task-mutations'
 
 interface SeedTask {
   temp_id: string
@@ -461,23 +463,11 @@ const addTask: ToolDefinition = {
     const tags = inputs.tags === undefined ? [] : strings(inputs.tags, 'tags')
     deps.forEach(node)
     const id = crypto.randomUUID()
-    await mutate(
-      'TASK_ADDED',
-      { node: { id, title, brief, estimate_min: estimate, tags, state: 'queued' } },
-      { actor: 'browser_agent' },
+    await addTaskWithDependencies(
+      { id, title, brief, estimate_min: estimate, tags, state: 'queued' },
+      deps,
+      mutateBatch,
     )
-    for (const upstream of deps) {
-      await mutate(
-        'EDGE_ADDED',
-        {
-          edge_id: crypto.randomUUID(),
-          upstream,
-          downstream: id,
-          kind: 'depends',
-        },
-        { actor: 'browser_agent' },
-      )
-    }
     return {
       data: { summary: `Added “${title}” with ${deps.length} prerequisites.`, id },
     }
@@ -547,7 +537,7 @@ async function executeSplit(
       ...(currentParent.state === 'running'
         ? {
             notice:
-              'this task is still executing — the supervisor will re-brief its worker after the split',
+              'The split is recorded and the graph rewired; the running worker keeps its original brief until it exits, after which the supervisor can re-brief the idle thread.',
           }
         : {}),
       proposal: {
@@ -581,7 +571,7 @@ async function executeSplit(
 const splitTask: ToolDefinition = {
   name: 'split_task',
   description:
-    'Preview and atomically split a task, remapping prerequisites to entry children and dependents from terminal children.',
+    'Precondition: the task exists and is not already a split parent. First call split_task without confirm to get a blast-radius preview and op_token; after human review, call split_task again with the same id and subtasks plus confirm true and that op_token to apply the atomic rewire.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -850,6 +840,11 @@ function digestData() {
         ? 'fixture-local estimate'
         : state.approvalRankingSource,
     ready_unassigned: ready,
+    human_presence: {
+      pending: state.humanConfirmation !== null,
+      kind: state.humanConfirmation?.kind ?? null,
+      expires_at: state.humanConfirmation?.expiresAt ?? null,
+    },
   }
 }
 
@@ -879,7 +874,8 @@ const graphDigest: ToolDefinition = {
 
 const listReady: ToolDefinition = {
   name: 'list_ready',
-  description: 'List unblocked unassigned tasks that are ready for a worker.',
+  description:
+    'No precondition. List unblocked, unassigned tasks. Next: choose a tasks[].id and call dispatch with it; after the human confirms the staged dispatch in the page, call graph_digest with the returned cursor.',
   inputSchema: emptySchema,
   annotations: { readOnlyHint: true },
   execute() {
@@ -891,28 +887,29 @@ const listReady: ToolDefinition = {
           getDisplayState(current, state.nodes, state.edges) === 'ready' &&
           !(current as TaskNode & { assigned?: boolean }).assigned,
       )
-      .map((current) => ({
-        id: current.id,
-        title: current.title,
-        idle_since:
-          state.readySince[current.id] ??
-          (current as TaskNode & { ready_since?: string }).ready_since ??
-          'just became ready',
-        on_critical_path: critical.nodeIds.includes(current.id),
-        ...(state.connectionMode === 'fixture'
-          ? {
-              remaining_path_min: remainingPathWeight(
-                current.id,
-                state.nodes,
-                state.edges,
-              ),
-              slack_min:
-                critical.eta -
-                remainingPathWeight(current.id, state.nodes, state.edges),
-              distance_source: 'fixture-local estimate',
-            }
-          : { distance_source: 'server critical-path membership' }),
-      }))
+      .map((current) => {
+        const remainingPath = remainingPathWeight(
+          current.id,
+          state.nodes,
+          state.edges,
+        )
+        return {
+          id: current.id,
+          title: current.title,
+          idle_since:
+            state.readySince[current.id] ??
+            (current as TaskNode & { ready_since?: string }).ready_since ??
+            'just became ready',
+          on_critical_path: critical.nodeIds.includes(current.id),
+          remaining_path_min: remainingPath,
+          slack_min: critical.eta - remainingPath,
+          distance_source:
+            state.connectionMode === 'fixture'
+              ? 'fixture-local estimate'
+              : 'client estimate against the server critical path',
+          projection: 'client estimate against the server critical path',
+        }
+      })
     return {
       data: {
         summary:
@@ -960,7 +957,7 @@ const listPendingApprovals: ToolDefinition = {
 const statePolicy: ToolDefinition = {
   name: 'state_policy',
   description:
-    'Stage an approval policy for visible human confirmation in this browser session.',
+    'Precondition: the human has explicitly stated an approval policy. Stage it for visible confirmation, ask the human to confirm in the page, then call graph_digest with the returned cursor and read POLICY_STATED.policy_ref; draft_id is not a policy_ref.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -982,6 +979,9 @@ const statePolicy: ToolDefinition = {
         max_uses: draft.max_uses,
         expires_at: draft.expires_at,
         status: 'pending_human_confirmation',
+        next_step: policyConfirmationNextStep(
+          useMissionStore.getState().cursor,
+        ),
       },
     }
   },
@@ -989,7 +989,8 @@ const statePolicy: ToolDefinition = {
 
 const approve: ToolDefinition = {
   name: 'approve',
-  description: 'Approve pending work under a human-stated session policy.',
+  description:
+    'Preconditions: id is pending and policy_ref came from a POLICY_STATED entry returned by graph_digest after human confirmation. If no policy_ref exists, call state_policy first; never pass its draft_id. Then call approve with the pending approval id and policy_ref.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1061,7 +1062,8 @@ const reject: ToolDefinition = {
 
 const dispatch: ToolDefinition = {
   name: 'dispatch',
-  description: 'Dispatch a ready unassigned task to the Codex supervisor.',
+  description:
+    'Precondition: id is a ready, unassigned task returned by list_ready. Call dispatch to stage human confirmation; ask the human to confirm in the page, then call graph_digest with the returned cursor to verify DISPATCHED.',
   inputSchema: {
     type: 'object',
     properties: {

@@ -11,6 +11,11 @@ import {
   missionClientReadiness,
   type RegistryLifecycleStatus,
 } from './registry-lifecycle'
+import {
+  contentSafeAnnotations,
+  contentSafeEnvelope,
+} from './content-policy'
+import { capabilityRequiredNextStep } from './agent-guidance'
 
 export { executeRegisteredTool } from './dynamic-tools'
 
@@ -187,7 +192,18 @@ async function executeDefinition(
     if (definition !== helloMissionGraph) await requireMissionClient()
     outcome = await definition.execute(inputs, options)
   } catch (error) {
-    outcome = { error: errorShape(error) }
+    const shape = errorShape(error)
+    const nextStep =
+      shape.code === 'capability_required'
+        ? capabilityRequiredNextStep(
+            definition.name,
+            useMissionStore.getState().cursor,
+          )
+        : undefined
+    outcome = {
+      error: shape,
+      ...(nextStep ? { data: { next_step: nextStep } } : {}),
+    }
   }
   const storeAfter = useMissionStore.getState()
   const projectChanged = storeAfter.projectId !== storeBefore.projectId
@@ -195,16 +211,18 @@ async function executeDefinition(
     ? []
     : storeAfter.changes
         .filter((change) => change.seq > Number(since))
-        .slice(-50)
+  const safe = contentSafeEnvelope(outcome, changes)
+  const boundedOutcome = safe.outcome as ToolOutcome
   clientCursor = {
     projectId: storeAfter.projectId,
     cursor: projectChanged ? '0' : storeAfter.cursor,
   }
   return JSON.stringify({
-    ok: !outcome.error,
-    ...outcome,
+    ok: !boundedOutcome.error,
+    ...boundedOutcome,
     cursor: storeAfter.cursor,
-    changes_since: changes,
+    changes_since: safe.changes,
+    content_policy: safe.contentPolicy,
   })
 }
 
@@ -234,7 +252,7 @@ function wrapTool(definition: ToolDefinition): ModelContextTool {
     name: definition.name,
     description: definition.description,
     inputSchema: definition.inputSchema,
-    annotations: definition.annotations,
+    annotations: contentSafeAnnotations(definition.annotations),
     execute(inputs, options) {
       return executeDefinition(definition, inputs, options)
     },
@@ -312,15 +330,10 @@ async function bootstrapWebMcp(
     },
   )
   scope.addCleanup(() => nextDynamicController.dispose())
-  const contextualTools = [
-    ...new Map(
-      currentContextualDefinitions().map((definition) => [
-        definition.name,
-        definition,
-      ]),
-    ).values(),
-  ]
-  await nextDynamicController.update(contextualTools.map(wrapTool), true)
+  dynamicController = nextDynamicController
+  scope.addCleanup(() => {
+    if (dynamicController === nextDynamicController) dynamicController = null
+  })
   const nextUnsubscribeContext = useMissionStore.subscribe((state, previous) => {
     if (
       state.selectedId !== previous.selectedId ||
@@ -330,13 +343,21 @@ async function bootstrapWebMcp(
       void refreshContextualTools(state.selectedId !== previous.selectedId)
     }
   })
-  scope.addCleanup(nextUnsubscribeContext)
-  dynamicController = nextDynamicController
   unsubscribeContext = nextUnsubscribeContext
+  scope.addCleanup(nextUnsubscribeContext)
   scope.addCleanup(() => {
-    if (dynamicController === nextDynamicController) dynamicController = null
     if (unsubscribeContext === nextUnsubscribeContext) unsubscribeContext = null
   })
+  const contextualTools = [
+    ...new Map(
+      currentContextualDefinitions().map((definition) => [
+        definition.name,
+        definition,
+      ]),
+    ).values(),
+  ]
+  await nextDynamicController.update(contextualTools.map(wrapTool), true)
+  await refreshContextualTools(true)
 
   console.info(
     `[MissionGraph] WebMCP namespace=${runtime.namespace}; dynamic-tools tier=${dynamicToolsTier}`,
