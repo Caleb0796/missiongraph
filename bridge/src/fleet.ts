@@ -50,6 +50,36 @@ async function staleFleetResponse(response: Response): Promise<boolean> {
   return body?.error?.code === "fleet_request_state";
 }
 
+interface FleetProtocolEvent {
+  actor: string;
+  type: string;
+  payload: { node_id?: string; to?: string; detail?: string };
+}
+
+interface FleetCompletion {
+  outcome: "done" | "failed";
+  note?: string;
+}
+
+function protocolEvents(value: unknown): FleetProtocolEvent[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("fleet ledger export did not match the MissionGraph contract");
+  }
+  const events = (value as { events?: unknown }).events;
+  if (!Array.isArray(events)) throw new Error("fleet ledger export did not match the MissionGraph contract");
+  return events.filter((event): event is FleetProtocolEvent => {
+    if (typeof event !== "object" || event === null || Array.isArray(event)) return false;
+    const candidate = event as Partial<FleetProtocolEvent>;
+    return (
+      typeof candidate.actor === "string" &&
+      typeof candidate.type === "string" &&
+      typeof candidate.payload === "object" &&
+      candidate.payload !== null &&
+      !Array.isArray(candidate.payload)
+    );
+  });
+}
+
 class FleetClient {
   constructor(private readonly config: BridgeConfig) {}
 
@@ -99,6 +129,51 @@ class FleetClient {
     if (await staleFleetResponse(response)) return false;
     if (!response.ok) throw new Error(`fleet complete POST failed (${response.status}): ${await response.text()}`);
     return true;
+  }
+
+  async protocolCompletion(
+    projectId: string,
+    nodeId: string,
+    visitorToken: string,
+    signal: AbortSignal,
+  ): Promise<FleetCompletion> {
+    const response = await fetch(
+      `${this.config.serverUrl}/api/p/${encodeURIComponent(projectId)}/export`,
+      {
+        headers: { "x-mg-token": visitorToken },
+        signal: requestSignal(signal),
+      },
+    );
+    if (!response.ok) throw new Error(`fleet ledger export GET failed (${response.status}): ${await response.text()}`);
+    const actor = `worker:${nodeId}`;
+    const events = protocolEvents(await response.json()).filter(
+      (event) => event.actor === actor && event.payload.node_id === nodeId,
+    );
+    const terminalState = events.findLast(
+      (event) =>
+        event.type === "NODE_STATE_CHANGED" &&
+        event.payload.to !== undefined &&
+        ["review", "done", "failed"].includes(event.payload.to),
+    );
+    if (terminalState?.payload.to === "failed") {
+      const detail = terminalState.payload.detail;
+      return {
+        outcome: "failed",
+        note: `Fleet worker reported terminal NODE_STATE_CHANGED to failed${detail ? `: ${detail}` : "."}`,
+      };
+    }
+    const missing = [
+      ...(terminalState ? [] : ["terminal NODE_STATE_CHANGED"]),
+      ...(events.some((event) => event.type === "HANDOFF_FILED") ? [] : ["HANDOFF_FILED"]),
+      ...(events.some((event) => event.type === "APPROVAL_CREATED") ? [] : ["APPROVAL_CREATED"]),
+    ];
+    if (missing.length > 0) {
+      return {
+        outcome: "failed",
+        note: `Fleet worker exited cleanly without required server ledger reports: ${missing.join(", ")}.`,
+      };
+    }
+    return { outcome: "done" };
   }
 }
 
@@ -316,7 +391,25 @@ export class FleetAdoptionLoop {
         await this.finishEndedClaim(adoption, result.reason);
         return;
       }
-      await this.beginCompletion(adoption, result.outcome, "note" in result ? result.note : undefined);
+      if (result.outcome === "failed") {
+        await this.beginCompletion(adoption, result.outcome, result.note);
+        return;
+      }
+      let completion: FleetCompletion;
+      try {
+        completion = await this.client.protocolCompletion(
+          adoption.project_id,
+          adoption.node_id,
+          adoption.visitor_token,
+          claimAbort.signal,
+        );
+      } catch (error) {
+        completion = {
+          outcome: "failed",
+          note: `Fleet worker protocol verification failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      await this.beginCompletion(adoption, completion.outcome, completion.note);
     } finally {
       if (!launchAttempted) lease.release();
       if (heartbeatTimer) clearInterval(heartbeatTimer);

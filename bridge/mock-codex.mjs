@@ -150,12 +150,14 @@ if (brief.startsWith("MISSIONGRAPH SUPERVISOR")) {
         artifacts: [],
       },
     });
-    await report("APPROVAL_CREATED", {
-      approval_id: `mock-fleet-approval-${randomUUID()}`,
-      node_id: nodeId,
-      summary: "Review the mock fleet worker handoff.",
-      tests: "green",
-    });
+    if (!brief.includes("MOCK_PARTIAL_PROTOCOL")) {
+      await report("APPROVAL_CREATED", {
+        approval_id: `mock-fleet-approval-${randomUUID()}`,
+        node_id: nodeId,
+        summary: "Review the mock fleet worker handoff.",
+        tests: "green",
+      });
+    }
   }
 }
 await finish();

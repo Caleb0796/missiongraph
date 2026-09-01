@@ -325,6 +325,24 @@ describe("bridge dry-run integration", () => {
                 },
                 idem_key: "fleet-template-add",
               },
+              {
+                seq: 2,
+                project_id: "fleet-template-source",
+                ts: "2026-08-31T12:00:01.000Z",
+                actor: "human",
+                type: "TASK_ADDED",
+                payload: {
+                  node: {
+                    id: "fleet-partial-protocol-node",
+                    title: "Fleet partial protocol template",
+                    brief: "MOCK_REPORT_LIFECYCLE MOCK_PARTIAL_PROTOCOL Execute the partial protocol task.",
+                    estimate_min: 1,
+                    tags: ["fleet-integration"],
+                    state: "queued",
+                  },
+                },
+                idem_key: "fleet-partial-protocol-add",
+              },
             ],
           }),
         });
@@ -337,6 +355,7 @@ describe("bridge dry-run integration", () => {
         await serverWhenReady(serverUrl);
 
         const clone = await cloneWhenReady(serverUrl);
+        const partialClone = await cloneWhenReady(serverUrl);
         const snapshotResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(clone.project)}/snapshot`, {
           headers: { "x-mg-token": clone.token },
         });
@@ -352,6 +371,21 @@ describe("bridge dry-run integration", () => {
             `seeded clone did not contain the fleet integration template; titles=${JSON.stringify(Object.values(snapshot.state.nodes).map((candidate) => candidate.title))}; server=${serverStderr}`,
           );
         }
+        const partialSnapshotResponse = await fetch(
+          `${serverUrl}/api/p/${encodeURIComponent(partialClone.project)}/snapshot`,
+          { headers: { "x-mg-token": partialClone.token } },
+        );
+        if (!partialSnapshotResponse.ok) {
+          throw new Error(
+            `partial clone snapshot failed (${partialSnapshotResponse.status}): ${await partialSnapshotResponse.text()}`,
+          );
+        }
+        const partialSnapshot = await partialSnapshotResponse.json() as {
+          state: { nodes: Record<string, { id: string; title: string; brief: string }> };
+        };
+        const partialNode = Object.values(partialSnapshot.state.nodes)
+          .find((candidate) => candidate.title === "Fleet partial protocol template");
+        if (!partialNode) throw new Error("seeded clone did not contain the partial protocol template");
         await confirmedMutation(
           serverUrl,
           clone.project,
@@ -369,6 +403,28 @@ describe("bridge dry-run integration", () => {
           throw new Error(`fleet enqueue failed (${enqueueResponse.status}): ${await enqueueResponse.text()}`);
         }
         const request = await enqueueResponse.json() as { id: string };
+        await confirmedMutation(
+          serverUrl,
+          partialClone.project,
+          partialClone.token,
+          "DISPATCHED",
+          { node_id: partialNode.id, bypass_cap: true },
+          "fleet-partial-protocol-dispatch",
+        );
+        const partialEnqueueResponse = await fetch(
+          `${serverUrl}/api/p/${encodeURIComponent(partialClone.project)}/fleet-requests`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-mg-token": partialClone.token },
+            body: JSON.stringify({ node_id: partialNode.id }),
+          },
+        );
+        if (!partialEnqueueResponse.ok) {
+          throw new Error(
+            `partial fleet enqueue failed (${partialEnqueueResponse.status}): ${await partialEnqueueResponse.text()}`,
+          );
+        }
+        const partialRequest = await partialEnqueueResponse.json() as { id: string };
 
         const repoPath = join(root, "target-repo");
         await initializeRepo(repoPath);
@@ -403,6 +459,46 @@ describe("bridge dry-run integration", () => {
         }
         expect(requestStatus).toBe("done");
         expect(adoptedAt.size).toBeGreaterThanOrEqual(2);
+
+        let partialRequestStatus = "queued";
+        let partialRequestNote: string | null = null;
+        for (
+          let attempt = 0;
+          attempt < 500 && !["done", "failed"].includes(partialRequestStatus);
+          attempt += 1
+        ) {
+          const response = await fetch(
+            `${serverUrl}/api/p/${encodeURIComponent(partialClone.project)}/fleet-requests/${encodeURIComponent(partialRequest.id)}`,
+            { headers: { "x-mg-token": partialClone.token } },
+          );
+          if (!response.ok) {
+            throw new Error(`partial fleet request poll failed (${response.status}): ${await response.text()}`);
+          }
+          const body = await response.json() as { status: string; note: string | null };
+          partialRequestStatus = body.status;
+          partialRequestNote = body.note;
+          if (!["done", "failed"].includes(partialRequestStatus)) {
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+          }
+        }
+        expect(partialRequestStatus).toBe("failed");
+        expect(partialRequestNote).toContain("APPROVAL_CREATED");
+        const partialLedgerResponse = await fetch(
+          `${serverUrl}/api/p/${encodeURIComponent(partialClone.project)}/export`,
+          { headers: { "x-mg-token": partialClone.token } },
+        );
+        if (!partialLedgerResponse.ok) {
+          throw new Error(
+            `partial clone ledger failed (${partialLedgerResponse.status}): ${await partialLedgerResponse.text()}`,
+          );
+        }
+        const partialLedger = await partialLedgerResponse.json() as {
+          events: { type: string; actor: string; payload: { node_id?: string } }[];
+        };
+        const partialLifecycle = partialLedger.events.filter((event) => event.payload.node_id === partialNode.id);
+        expect(partialLifecycle.some((event) => event.type === "NODE_STATE_CHANGED")).toBe(true);
+        expect(partialLifecycle.some((event) => event.type === "HANDOFF_FILED")).toBe(true);
+        expect(partialLifecycle.some((event) => event.type === "APPROVAL_CREATED")).toBe(false);
 
         const ledgerResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(clone.project)}/export`, {
           headers: { "x-mg-token": clone.token },
