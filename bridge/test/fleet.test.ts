@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { spawn } from "node:child_process";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -668,6 +668,29 @@ describe("FleetAdoptionLoop", () => {
     const worktreeRoot = join(harness.root, ".missiongraph-worktrees");
     const reporterFiles = (await readdir(worktreeRoot)).filter((name) => name.endsWith(".reporter.conf"));
     expect(reporterFiles).toEqual([]);
+  });
+
+  it("removes only a terminal adopted worker worktree while retaining its audit branch", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim("MOCK_DELAY_180"));
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => harness.state.state.workers["fleet:request-1"]?.status === "live");
+    const worker = harness.state.state.workers["fleet:request-1"]!;
+    const worktree = worker.worktree;
+    const branch = worker.branch;
+    expect((await stat(worktree)).isDirectory()).toBe(true);
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    await expect(stat(worktree)).rejects.toMatchObject({ code: "ENOENT" });
+    const branchCheck = spawnSync(
+      "git",
+      ["-C", harness.config.targetRepoPath, "show-ref", "--verify", `refs/heads/${branch}`],
+      { encoding: "utf8" },
+    );
+    expect(branchCheck.status, branchCheck.stderr).toBe(0);
   });
 
   it("uses exactly the flagship OPENAI/CODEX environment allowlist for adopted workers", () => {

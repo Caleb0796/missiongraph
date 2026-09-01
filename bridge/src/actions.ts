@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import type { RunningCodex } from "./codex.js";
@@ -121,6 +121,9 @@ export class ActionExecutor {
   }
 
   async initialize(): Promise<void> {
+    if (await access(this.config.targetRepoPath).then(() => true, () => false)) {
+      await runGit(["worktree", "prune", "--expire", "now"], this.config.targetRepoPath);
+    }
     const recovered: SupervisorAction[] = [];
     let changed = false;
     for (const [nodeId, worker] of Object.entries(this.stateStore.state.workers)) {
@@ -423,6 +426,15 @@ export class ActionExecutor {
   async clearTrackedReporter(workerKey: string): Promise<void> {
     const worker = this.stateStore.state.workers[workerKey];
     if (worker) await this.clearReporterCredential(worker);
+  }
+
+  async removeTrackedWorktree(workerKey: string): Promise<void> {
+    const worker = this.stateStore.state.workers[workerKey];
+    if (!worker) return;
+    await runGit(["worktree", "remove", "--force", worker.worktree], this.config.targetRepoPath).catch((error: unknown) => {
+      if (error instanceof Error && error.message.endsWith("is not a working tree")) return;
+      throw error;
+    });
   }
 
   private async launchWorker(

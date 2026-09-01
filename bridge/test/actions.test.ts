@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -33,6 +34,45 @@ function running(
 }
 
 describe("ActionExecutor", () => {
+  it("prunes stale worktree metadata during startup reconciliation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-worktree-prune-"));
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    try {
+      const bridgeConfig = config(root);
+      await initializeRepo(bridgeConfig.targetRepoPath);
+      const staleWorktree = join(root, "stale-worktree");
+      const add = spawnSync(
+        "git",
+        ["-C", bridgeConfig.targetRepoPath, "worktree", "add", "-b", "work/stale", staleWorktree],
+        { encoding: "utf8" },
+      );
+      expect(add.status, add.stderr).toBe(0);
+      await rm(staleWorktree, { recursive: true, force: true });
+      const before = spawnSync("git", ["-C", bridgeConfig.targetRepoPath, "worktree", "list", "--porcelain"], {
+        encoding: "utf8",
+      });
+      expect(before.stdout).toContain(staleWorktree);
+
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, lockProcessStartTime);
+      executor = new ActionExecutor(bridgeConfig, state, {
+        startWorker: () => { throw new Error("not used"); },
+        resumeWorker: () => { throw new Error("not used"); },
+      }, new TestLogger());
+      await executor.initialize();
+
+      const after = spawnSync("git", ["-C", bridgeConfig.targetRepoPath, "worktree", "list", "--porcelain"], {
+        encoding: "utf8",
+      });
+      expect(after.status, after.stderr).toBe(0);
+      expect(after.stdout).not.toContain(staleWorktree);
+    } finally {
+      await executor?.stop();
+      await state?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("persists process identity, renews before resume, and makes active spawns idempotent", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-actions-"));
     const issued: string[] = [];

@@ -503,6 +503,7 @@ export class FleetAdoptionLoop {
 
   private async detach(adoption: FleetAdoptionState): Promise<void> {
     await this.actions.clearTrackedReporter(adoption.worker_key);
+    await this.actions.removeTrackedWorktree(adoption.worker_key);
     delete this.stateStore.state.workers[adoption.worker_key];
     if (this.stateStore.state.fleet_adoption?.request_id === adoption.request_id) {
       delete this.stateStore.state.fleet_adoption;
