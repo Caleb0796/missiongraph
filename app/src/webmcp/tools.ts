@@ -338,10 +338,7 @@ const planSeed: ToolDefinition = {
       }
     }
     const batchIds = new Map(
-      tasks.map((task) => [
-        task.temp_id,
-        state.connectionMode === 'fixture' ? crypto.randomUUID() : task.temp_id,
-      ]),
+      tasks.map((task) => [task.temp_id, crypto.randomUUID()]),
     )
     const candidateEdges = [...state.edges]
     const addedEdges: GraphEdge[] = []
