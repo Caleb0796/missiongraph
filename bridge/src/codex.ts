@@ -245,6 +245,7 @@ export class CodexClient {
       resolveThread = resolvePromise;
       rejectThread = rejectPromise;
     });
+    void threadId.catch(() => undefined);
     child.stdout!.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
       stdout = retainOutput(stdout, chunk);
