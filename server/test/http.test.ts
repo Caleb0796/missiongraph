@@ -2259,6 +2259,47 @@ describe("HTTP and streaming contract", () => {
     });
   });
 
+  it("rejects queued and terminal fleet heartbeats without changing timestamps", async () => {
+    const { app, store } = server({
+      fleetMode: true,
+      now: () => new Date("2026-08-30T10:05:00.000Z"),
+    });
+    const states = ["queued", "done", "failed", "expired"] as const;
+    const insert = store.database.prepare(
+      `INSERT INTO fleet_requests
+        (id, project_id, node_id, status, outcome, note, created_at, adopted_at, finished_at)
+       VALUES (?, 'project', ?, ?, NULL, NULL, ?, ?, ?)`,
+    );
+    for (const status of states) {
+      insert.run(
+        `${status}-request`,
+        `${status}-node`,
+        status,
+        "2026-08-30T09:00:00.000Z",
+        status === "queued" ? null : "2026-08-30T09:10:00.000Z",
+        status === "queued" ? null : "2026-08-30T09:20:00.000Z",
+      );
+    }
+    const before = store.database
+      .prepare("SELECT id, status, created_at, adopted_at, finished_at FROM fleet_requests ORDER BY id")
+      .all();
+
+    const responses = await Promise.all(states.map((status) => app.inject({
+      method: "POST",
+      url: `/api/fleet/${status}-request/heartbeat`,
+      headers: { "x-mg-reporter": "reporter-secret" },
+    })));
+    const after = store.database
+      .prepare("SELECT id, status, created_at, adopted_at, finished_at FROM fleet_requests ORDER BY id")
+      .all();
+
+    expect(responses.map((response) => response.statusCode)).toEqual([409, 409, 409, 409]);
+    expect(responses.map((response) => response.json())).toEqual(states.map((status) => ({
+      error: { code: "fleet_request_state", message: `Fleet request is ${status}.` },
+    })));
+    expect(after).toEqual(before);
+  });
+
   it("rejects visitor credentials on supervisor fleet routes", async () => {
     const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
     await prepareFleet(app, store, [
