@@ -58,6 +58,17 @@ export function PulseBar({
     isReadyUnassigned(node, nodes, edges),
   ).length
 
+  function confirmReset() {
+    if (
+      !window.confirm(
+        'Start over with a fresh copy of the mission? Your current copy will be abandoned.',
+      )
+    ) {
+      return
+    }
+    onReset()
+  }
+
   return (
     <header className="pulse-bar">
       <div className="flex min-w-0 items-center gap-3">
@@ -175,7 +186,7 @@ export function PulseBar({
         <a href="/compat" className="compat-link">
           Compat
         </a>
-        <button type="button" className="compat-link" onClick={onReset}>
+        <button type="button" className="compat-link" onClick={confirmReset}>
           Reset
         </button>
         {import.meta.env.DEV && (

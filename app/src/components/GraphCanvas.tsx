@@ -853,6 +853,14 @@ function MissionBoard() {
               <p>
                 Expires {new Date(humanConfirmation.expiresAt).toLocaleString()}.
               </p>
+              <details className="structural-confirm-binding">
+                <summary>Binding details</summary>
+                <ul>
+                  {humanConfirmation.binding.map((detail) => (
+                    <li key={detail}>{detail}</li>
+                  ))}
+                </ul>
+              </details>
             </div>
             <div className="structural-confirm-actions">
               <button
@@ -938,10 +946,6 @@ function MissionBoard() {
             ) : (
               <p>No already-briefed downstream work will become stale.</p>
             )}
-            <p className="structural-confirm-token">
-              Preview bound at cursor {structuralPreview.baseCursor} · token{' '}
-              {structuralPreview.opToken.slice(0, 8)}…
-            </p>
             {structuralPreview.blastRadius.pausing.length > 0 && (
               <p>
                 Running workers that may pause:{' '}
@@ -952,6 +956,14 @@ function MissionBoard() {
                   .join(', ')}.
               </p>
             )}
+            <details className="structural-confirm-binding">
+              <summary>Binding details</summary>
+              <ul className="structural-confirm-token">
+                {structuralPreview.binding.map((detail) => (
+                  <li key={detail}>{detail}</li>
+                ))}
+              </ul>
+            </details>
             <div className="structural-confirm-actions">
               <button
                 ref={confirmationCancelRef}

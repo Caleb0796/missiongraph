@@ -1369,11 +1369,13 @@ async function stageActionConfirmation(
       text: actionSummary(action, batch),
       details: [
         `Requested by ${actor === 'browser_agent' ? 'browser agent' : 'native UI'}`,
+        'One use only',
+      ],
+      binding: [
         `Project: ${state.projectId ?? 'shorty-demo'}`,
         `Session: ${state.sessionId}`,
         `Action: ${action}`,
         `Bound request SHA-256: ${subjectHash}`,
-        'One use only',
       ],
       expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
       confirm: async () => {
@@ -1416,11 +1418,13 @@ async function stageActionConfirmation(
     text: draft.summary,
     details: [
       `Requested by ${actor === 'browser_agent' ? 'browser agent' : 'native UI'}`,
+      'One use only',
+    ],
+    binding: [
       `Project: ${draft.project_id}`,
       `Session: ${draft.session_id}`,
       `Action: ${draft.action}`,
       `Bound request SHA-256: ${draft.subject_hash}`,
-      'One use only',
     ],
     expiresAt: draft.expires_at,
     confirm: async () => {
@@ -1645,9 +1649,15 @@ export async function stagePolicyDraft(text: string) {
       title: 'Confirm session approval policy',
       text: draft.text,
       details: [
-        `Policy SHA-256: ${draft.policy_hash}`,
+        'Requested by browser agent',
+        'One use only',
+      ],
+      binding: [
         `Project: ${draft.project_id}`,
         `Session: ${draft.session_id}`,
+        'Action: state policy',
+        `Bound request SHA-256: ${draft.policy_hash}`,
+        `Policy SHA-256: ${draft.policy_hash}`,
         'Scope: session',
         `Allowed actions: ${draft.allowed_actions.join(', ')}`,
         `Maximum uses: ${draft.max_uses}`,
@@ -1707,9 +1717,15 @@ export async function stagePolicyDraft(text: string) {
     title: 'Confirm session approval policy',
     text: draft.text,
     details: [
-      `Policy SHA-256: ${draft.policy_hash}`,
+      'Requested by browser agent',
+      'One use only',
+    ],
+    binding: [
       `Project: ${draft.project_id}`,
       `Session: ${draft.session_id}`,
+      'Action: state policy',
+      `Bound request SHA-256: ${draft.policy_hash}`,
+      `Policy SHA-256: ${draft.policy_hash}`,
       'Scope: session',
       `Allowed actions: ${draft.allowed_actions.join(', ')}`,
       `Maximum uses: ${draft.max_uses}`,

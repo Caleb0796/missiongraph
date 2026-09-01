@@ -69,6 +69,7 @@ interface StructuralPreview {
   key: string
   opToken: string
   baseCursor: string
+  binding: string[]
   blastRadius: { stale: string[]; pausing: string[] }
   notice?: string
   proposal?: StructuralOperationProposal
@@ -81,6 +82,7 @@ export interface HumanConfirmation {
   title: string
   text: string
   details: string[]
+  binding: string[]
   expiresAt: string
   busy?: boolean
   confirm: () => Promise<void>
@@ -1063,6 +1065,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           key: operation.key,
           opToken: operation.opToken,
           baseCursor: operation.baseCursor,
+          binding: [
+            `Preview bound at cursor ${operation.baseCursor} · token ${operation.opToken.slice(0, 8)}…`,
+          ],
           blastRadius: getBlastRadius(ids, state.nodes, state.edges),
           notice: operation.notice,
         },
@@ -1119,6 +1124,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           key: operation.key,
           opToken: operation.opToken,
           baseCursor: operation.baseCursor,
+          binding: [
+            `Preview bound at cursor ${operation.baseCursor} · token ${operation.opToken.slice(0, 8)}…`,
+          ],
           blastRadius: getBlastRadius(ids, state.nodes, state.edges),
           notice: operation.notice,
         },
@@ -1149,6 +1157,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       key: operation.key,
       opToken: operation.opToken,
       baseCursor: operation.baseCursor,
+      binding: [
+        `Preview bound at cursor ${operation.baseCursor} · token ${operation.opToken.slice(0, 8)}…`,
+      ],
       blastRadius: getBlastRadius(operation.ids, state.nodes, state.edges),
       notice: operation.notice,
       proposal: operation.proposal,
@@ -1175,6 +1186,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         key: pending.key,
         opToken: pending.opToken,
         baseCursor: pending.baseCursor,
+        binding: [
+          `Preview bound at cursor ${pending.baseCursor} · token ${pending.opToken.slice(0, 8)}…`,
+        ],
         blastRadius: getBlastRadius(pending.ids, get().nodes, get().edges),
         notice: pending.notice,
         proposal: pending.proposal,
