@@ -10,11 +10,7 @@ export interface FleetClaim {
   request_id: string;
   project_id: string;
   node_id: string;
-  node: {
-    title: string;
-    brief: string;
-    estimate: number;
-  };
+  node: { title: string; brief: string; estimate: number };
   visitor_token: string;
 }
 
@@ -41,34 +37,53 @@ function claimValue(value: unknown): FleetClaim {
   return claim as FleetClaim;
 }
 
+const fleetRequestTimeoutMs = 30_000;
+
+function requestSignal(signal: AbortSignal, timeoutMs = fleetRequestTimeoutMs): AbortSignal {
+  return AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
+}
+
+async function staleFleetResponse(response: Response): Promise<boolean> {
+  if (response.status === 404) return true;
+  if (response.status !== 409) return false;
+  const body = await response.clone().json().catch(() => undefined) as { error?: { code?: unknown } } | undefined;
+  return body?.error?.code === "fleet_request_state";
+}
+
 class FleetClient {
   constructor(private readonly config: BridgeConfig) {}
 
-  async next(): Promise<FleetClaim | undefined> {
+  async next(signal: AbortSignal): Promise<FleetClaim | undefined> {
     const response = await fetch(`${this.config.serverUrl}/api/fleet/next`, {
       method: "POST",
       headers: { "x-mg-reporter": this.config.reporterCredential },
+      signal: requestSignal(signal),
     });
     if (response.status === 204) return undefined;
     if (!response.ok) throw new Error(`fleet next POST failed (${response.status}): ${await response.text()}`);
     return claimValue(await response.json());
   }
 
-  async heartbeat(requestId: string): Promise<boolean> {
+  async heartbeat(requestId: string, signal: AbortSignal): Promise<boolean> {
     const response = await fetch(
       `${this.config.serverUrl}/api/fleet/${encodeURIComponent(requestId)}/heartbeat`,
       {
         method: "POST",
         headers: { "x-mg-reporter": this.config.reporterCredential },
-        signal: AbortSignal.timeout(Math.min(this.config.fleetHeartbeatMs, 30_000)),
+        signal: requestSignal(signal, Math.min(this.config.fleetHeartbeatMs, fleetRequestTimeoutMs)),
       },
     );
-    if (response.status === 404) return false;
+    if (await staleFleetResponse(response)) return false;
     if (!response.ok) throw new Error(`fleet heartbeat POST failed (${response.status}): ${await response.text()}`);
     return true;
   }
 
-  async complete(requestId: string, outcome: "done" | "failed", note?: string): Promise<boolean> {
+  async complete(
+    requestId: string,
+    outcome: "done" | "failed",
+    signal: AbortSignal,
+    note?: string,
+  ): Promise<boolean> {
     const response = await fetch(
       `${this.config.serverUrl}/api/fleet/${encodeURIComponent(requestId)}/complete`,
       {
@@ -78,18 +93,29 @@ class FleetClient {
           "x-mg-reporter": this.config.reporterCredential,
         },
         body: JSON.stringify({ outcome, ...(note ? { note } : {}) }),
+        signal: requestSignal(signal),
       },
     );
-    if (response.status === 404) return false;
+    if (await staleFleetResponse(response)) return false;
     if (!response.ok) throw new Error(`fleet complete POST failed (${response.status}): ${await response.text()}`);
     return true;
   }
+}
+
+type ClaimEnd = "shutdown" | "stale" | "ttl";
+
+function waitForClaimEnd(signal: AbortSignal): Promise<ClaimEnd> {
+  if (signal.aborted) return Promise.resolve(signal.reason as ClaimEnd);
+  return new Promise<ClaimEnd>((resolve) => {
+    signal.addEventListener("abort", () => resolve(signal.reason as ClaimEnd), { once: true });
+  });
 }
 
 const terminalStatuses = new Set<FleetAdoptionState["status"]>(["completed", "abandoned"]);
 
 export class FleetAdoptionLoop {
   private readonly client: FleetClient;
+  private readonly abort = new AbortController();
   private task: Promise<void> | undefined;
   private activeWorker: RunningCodex | undefined;
   private stopping = false;
@@ -117,21 +143,19 @@ export class FleetAdoptionLoop {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.abort.abort("shutdown");
     this.wake?.();
     await this.activeWorker?.terminate().catch((error: unknown) => {
       this.logger.error(`fleet worker termination failed: ${error instanceof Error ? error.message : String(error)}`);
     });
     await this.task;
     const adoption = this.stateStore.state.fleet_adoption;
-    try {
-      if (adoption && !terminalStatuses.has(adoption.status) && adoption.status !== "completing") {
-        await this.actions.killTrackedWorker(adoption.worker_key);
-        await this.beginCompletion(adoption, "failed", "Bridge shutdown terminated the adopted worker.");
-      } else if (adoption?.status === "completing") {
-        await this.finishCompletion(adoption);
-      }
-    } catch (error) {
-      this.logger.error(`fleet completion remains pending after shutdown: ${error instanceof Error ? error.message : String(error)}`);
+    if (adoption && !terminalStatuses.has(adoption.status) && adoption.status !== "completing") {
+      await this.actions.killTrackedWorker(adoption.worker_key);
+      adoption.status = "completing";
+      adoption.outcome = "failed";
+      adoption.note = "Bridge shutdown terminated the adopted worker.";
+      await this.stateStore.save();
     }
   }
 
@@ -142,7 +166,9 @@ export class FleetAdoptionLoop {
         if (adoption && !terminalStatuses.has(adoption.status)) await this.recover(adoption);
         else await this.poll();
       } catch (error) {
-        this.logger.error(`fleet adoption cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+        if (!this.stopping) {
+          this.logger.error(`fleet adoption cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       if (!this.stopping) await this.delay(this.config.fleetPollMs);
     }
@@ -155,10 +181,15 @@ export class FleetAdoptionLoop {
     let claim: FleetClaim | undefined;
     try {
       const previous = this.stateStore.state.fleet_adoption;
-      claim = await this.client.next();
+      claim = await this.client.next(this.abort.signal);
       if (previous && terminalStatuses.has(previous.status)) {
         if (claim?.request_id === previous.request_id) {
-          await this.client.complete(claim.request_id, previous.outcome ?? "failed", previous.note);
+          await this.client.complete(
+            claim.request_id,
+            previous.outcome ?? "failed",
+            this.abort.signal,
+            previous.note,
+          );
         }
         await this.detach(previous);
         if (!claim || claim.request_id === previous.request_id) return;
@@ -184,112 +215,129 @@ export class FleetAdoptionLoop {
   }
 
   private async runClaim(adoption: FleetAdoptionState, lease: ExecutionLease): Promise<void> {
-    let running: RunningCodex;
+    const claimAbort = new AbortController();
+    const abortForShutdown = () => claimAbort.abort("shutdown");
+    this.abort.signal.addEventListener("abort", abortForShutdown, { once: true });
+    if (this.abort.signal.aborted) abortForShutdown();
+    const deadline = Date.parse(adoption.adopted_at) + this.config.fleetRunTtlMs;
+    const watchdogTimer = setTimeout(() => claimAbort.abort("ttl"), Math.max(0, deadline - Date.now()));
+    watchdogTimer.unref();
+    let heartbeatTimer: NodeJS.Timeout | undefined;
+    let launchAttempted = false;
     try {
-      running = await this.actions.spawnFleetWorker({
-        requestId: adoption.request_id,
-        projectId: adoption.project_id,
-        nodeId: adoption.node_id,
-        title: adoption.node.title,
-        brief: adoption.node.brief,
-        workerKey: adoption.worker_key,
-      }, lease);
-    } catch (error) {
-      await this.beginCompletion(
-        adoption,
-        "failed",
-        `Fleet worker launch failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      return;
-    }
-    this.activeWorker = running;
-    let outcome: { outcome: "done" | "failed"; note?: string };
-    try {
+      let accepted: boolean;
+      try {
+        accepted = await this.client.heartbeat(adoption.request_id, claimAbort.signal);
+      } catch (error) {
+        if (claimAbort.signal.aborted) {
+          lease.release();
+          await this.finishEndedClaim(adoption, claimAbort.signal.reason as ClaimEnd);
+          return;
+        }
+        lease.release();
+        await this.beginCompletion(
+          adoption,
+          "failed",
+          `Fleet claim revalidation failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+      if (!accepted) {
+        lease.release();
+        await this.abandon(adoption, "Fleet claim became stale before worker launch.");
+        return;
+      }
+      adoption.heartbeat_at = new Date().toISOString();
+      await this.stateStore.save();
+
+      let heartbeatInFlight = false;
+      const heartbeat = async (): Promise<void> => {
+        if (heartbeatInFlight || claimAbort.signal.aborted) return;
+        heartbeatInFlight = true;
+        try {
+          if (!await this.client.heartbeat(adoption.request_id, claimAbort.signal)) {
+            claimAbort.abort("stale");
+            return;
+          }
+          adoption.heartbeat_at = new Date().toISOString();
+          await this.stateStore.save();
+        } catch (error) {
+          if (!claimAbort.signal.aborted) {
+            this.logger.error(`fleet heartbeat failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        } finally {
+          heartbeatInFlight = false;
+        }
+      };
+      heartbeatTimer = setInterval(() => void heartbeat(), this.config.fleetHeartbeatMs);
+      heartbeatTimer.unref();
+
+      let running: RunningCodex;
+      try {
+        launchAttempted = true;
+        running = await this.actions.spawnFleetWorker({
+          requestId: adoption.request_id,
+          projectId: adoption.project_id,
+          nodeId: adoption.node_id,
+          title: adoption.node.title,
+          brief: adoption.node.brief,
+          workerKey: adoption.worker_key,
+        }, lease, claimAbort.signal);
+      } catch (error) {
+        if (claimAbort.signal.aborted) {
+          await this.finishEndedClaim(adoption, claimAbort.signal.reason as ClaimEnd);
+          return;
+        }
+        await this.beginCompletion(
+          adoption,
+          "failed",
+          `Fleet worker launch failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+
+      this.activeWorker = running;
       adoption.status = "running";
       adoption.started_at = new Date().toISOString();
       await this.stateStore.save();
-      outcome = await this.monitorRunning(adoption, running);
-    } catch (error) {
-      await running.terminate().catch(() => undefined);
-      outcome = {
-        outcome: "failed",
-        note: `Fleet worker monitoring failed: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    } finally {
-      this.activeWorker = undefined;
-    }
-    await this.beginCompletion(adoption, outcome.outcome, outcome.note);
-  }
-
-  private async monitorRunning(
-    adoption: FleetAdoptionState,
-    running: RunningCodex,
-  ): Promise<{ outcome: "done" | "failed"; note?: string }> {
-    let heartbeatInFlight = false;
-    let settleHeartbeat!: (result: { outcome: "failed"; note: string }) => void;
-    const heartbeatFailure = new Promise<{ outcome: "failed"; note: string }>((resolve) => {
-      settleHeartbeat = resolve;
-    });
-    let heartbeatStale = false;
-    const heartbeatStaleFailure = {
-      outcome: "failed" as const,
-      note: "Fleet claim became stale while the worker was running.",
-    };
-    const heartbeat = async (): Promise<void> => {
-      if (heartbeatInFlight) return;
-      heartbeatInFlight = true;
-      try {
-        if (!await this.client.heartbeat(adoption.request_id)) {
-          heartbeatStale = true;
-          await running.terminate();
-          settleHeartbeat(heartbeatStaleFailure);
-          return;
-        }
-        adoption.heartbeat_at = new Date().toISOString();
-        await this.stateStore.save();
-      } catch (error) {
-        this.logger.error(`fleet heartbeat failed: ${error instanceof Error ? error.message : String(error)}`);
-      } finally {
-        heartbeatInFlight = false;
-      }
-    };
-    const heartbeatTimer = setInterval(() => void heartbeat(), this.config.fleetHeartbeatMs);
-    heartbeatTimer.unref();
-    let watchdogTriggered = false;
-    const watchdogFailure = {
-      outcome: "failed" as const,
-      note: "Fleet worker exceeded FLEET_RUN_TTL_MIN and was terminated.",
-    };
-    let watchdogTimer!: NodeJS.Timeout;
-    const watchdog = new Promise<{ outcome: "failed"; note: string }>((resolve) => {
-      const timer = setTimeout(() => {
-        watchdogTriggered = true;
-        void running.terminate().finally(() => resolve(watchdogFailure));
-      }, this.config.fleetRunTtlMs);
-      timer.unref();
-      watchdogTimer = timer;
-    });
-    try {
-      await heartbeat();
-      return await Promise.race([
+      const result = await Promise.race([
         running.completed.then(
-          () => watchdogTriggered
-            ? watchdogFailure
-            : heartbeatStale ? heartbeatStaleFailure : { outcome: "done" as const },
-          (error: unknown) => watchdogTriggered
-            ? watchdogFailure
-            : heartbeatStale ? heartbeatStaleFailure : {
+          () => ({ type: "completed" as const, outcome: "done" as const }),
+          (error: unknown) => ({
+            type: "completed" as const,
             outcome: "failed" as const,
             note: `Fleet worker exited unsuccessfully: ${error instanceof Error ? error.message : String(error)}`,
-          },
+          }),
         ),
-        heartbeatFailure,
-        watchdog,
+        waitForClaimEnd(claimAbort.signal).then((reason) => ({ type: "ended" as const, reason })),
       ]);
+      if (result.type === "ended") {
+        await running.terminate().catch(() => undefined);
+        await this.finishEndedClaim(adoption, result.reason);
+        return;
+      }
+      await this.beginCompletion(adoption, result.outcome, "note" in result ? result.note : undefined);
     } finally {
-      clearInterval(heartbeatTimer);
+      if (!launchAttempted && claimAbort.signal.reason === "shutdown") lease.release();
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
       clearTimeout(watchdogTimer);
+      this.abort.signal.removeEventListener("abort", abortForShutdown);
+      this.activeWorker = undefined;
     }
+  }
+
+  private async finishEndedClaim(adoption: FleetAdoptionState, reason: ClaimEnd): Promise<void> {
+    if (reason === "shutdown") return;
+    await this.actions.killTrackedWorker(adoption.worker_key);
+    if (reason === "stale") {
+      await this.abandon(adoption, "Fleet claim became stale while the worker was running.");
+      return;
+    }
+    await this.beginCompletion(
+      adoption,
+      "failed",
+      "Fleet worker exceeded FLEET_RUN_TTL_MIN and was terminated.",
+    );
   }
 
   private async recover(adoption: FleetAdoptionState): Promise<void> {
@@ -298,8 +346,12 @@ export class FleetAdoptionLoop {
       return;
     }
     const worker = this.stateStore.state.workers[adoption.worker_key];
-    if (!worker || worker.status !== "live" || !worker.pid || !worker.process_start_time) {
+    if (!worker) {
       await this.beginCompletion(adoption, "failed", "Bridge restart found no live process for the adopted claim.");
+      return;
+    }
+    if (worker.status !== "live" || !worker.pid || !worker.process_start_time) {
+      await this.beginCompletion(adoption, "failed", "Recovered fleet worker process was no longer running.");
       return;
     }
     const deadline = Date.parse(adoption.started_at ?? adoption.adopted_at) + this.config.fleetRunTtlMs;
@@ -313,7 +365,7 @@ export class FleetAdoptionLoop {
       await this.beginCompletion(adoption, "failed", "Recovered fleet worker process was no longer running.");
       return;
     }
-    if (!await this.client.heartbeat(adoption.request_id)) {
+    if (!await this.client.heartbeat(adoption.request_id, this.abort.signal)) {
       await this.actions.killTrackedWorker(adoption.worker_key);
       await this.abandon(adoption, "Recovered fleet claim was stale.");
       return;
@@ -337,7 +389,7 @@ export class FleetAdoptionLoop {
 
   private async finishCompletion(adoption: FleetAdoptionState): Promise<void> {
     if (!adoption.outcome) throw new Error("persisted fleet completion is missing its outcome");
-    if (!await this.client.complete(adoption.request_id, adoption.outcome, adoption.note)) {
+    if (!await this.client.complete(adoption.request_id, adoption.outcome, this.abort.signal, adoption.note)) {
       await this.abandon(adoption, adoption.note ?? "Fleet claim disappeared before completion.");
       return;
     }
@@ -350,6 +402,7 @@ export class FleetAdoptionLoop {
   }
 
   private async detach(adoption: FleetAdoptionState): Promise<void> {
+    await this.actions.clearTrackedReporter(adoption.worker_key);
     delete this.stateStore.state.workers[adoption.worker_key];
     if (this.stateStore.state.fleet_adoption?.request_id === adoption.request_id) {
       delete this.stateStore.state.fleet_adoption;

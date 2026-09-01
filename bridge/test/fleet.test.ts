@@ -518,11 +518,8 @@ describe("FleetAdoptionLoop", () => {
     const harness = await createHarness(stub);
     harness.start();
 
-    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
-    expect(stub.completionCalls[0]?.body).toMatchObject({
-      outcome: "failed",
-      note: expect.stringContaining("became stale"),
-    });
+    await waitFor(() => stub.heartbeatTimes.length === 1 && harness.state.state.fleet_adoption === undefined);
+    expect(stub.completionCalls).toEqual([]);
     expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
   });
 
