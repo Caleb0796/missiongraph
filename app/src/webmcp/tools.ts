@@ -29,6 +29,7 @@ import {
 import { withFleetMetadata } from '../transport/fleet'
 import type { ToolDefinition, ToolOutcome } from './registry'
 import { buildSplitPlan, type SplitSubtask } from './split'
+import { addTaskWithDependencies } from './task-mutations'
 
 interface SeedTask {
   temp_id: string
@@ -461,23 +462,11 @@ const addTask: ToolDefinition = {
     const tags = inputs.tags === undefined ? [] : strings(inputs.tags, 'tags')
     deps.forEach(node)
     const id = crypto.randomUUID()
-    await mutate(
-      'TASK_ADDED',
-      { node: { id, title, brief, estimate_min: estimate, tags, state: 'queued' } },
-      { actor: 'browser_agent' },
+    await addTaskWithDependencies(
+      { id, title, brief, estimate_min: estimate, tags, state: 'queued' },
+      deps,
+      mutateBatch,
     )
-    for (const upstream of deps) {
-      await mutate(
-        'EDGE_ADDED',
-        {
-          edge_id: crypto.randomUUID(),
-          upstream,
-          downstream: id,
-          kind: 'depends',
-        },
-        { actor: 'browser_agent' },
-      )
-    }
     return {
       data: { summary: `Added “${title}” with ${deps.length} prerequisites.`, id },
     }
