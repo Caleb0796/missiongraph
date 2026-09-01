@@ -15,6 +15,7 @@ import {
   contentSafeAnnotations,
   contentSafeEnvelope,
 } from './content-policy'
+import { capabilityRequiredNextStep } from './agent-guidance'
 
 export { executeRegisteredTool } from './dynamic-tools'
 
@@ -191,7 +192,18 @@ async function executeDefinition(
     if (definition !== helloMissionGraph) await requireMissionClient()
     outcome = await definition.execute(inputs, options)
   } catch (error) {
-    outcome = { error: errorShape(error) }
+    const shape = errorShape(error)
+    const nextStep =
+      shape.code === 'capability_required'
+        ? capabilityRequiredNextStep(
+            definition.name,
+            useMissionStore.getState().cursor,
+          )
+        : undefined
+    outcome = {
+      error: shape,
+      ...(nextStep ? { data: { next_step: nextStep } } : {}),
+    }
   }
   const storeAfter = useMissionStore.getState()
   const projectChanged = storeAfter.projectId !== storeBefore.projectId

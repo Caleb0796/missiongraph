@@ -3,6 +3,10 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
+  capabilityRequiredNextStep,
+  policyConfirmationNextStep,
+} from '../src/webmcp/agent-guidance.ts'
+import {
   CONTENT_POLICY,
   contentSafeAnnotations,
   contentSafeEnvelope,
@@ -234,4 +238,28 @@ test('running split notice describes the deferred idle-thread re-brief', () => {
     toolsSource,
     /supervisor will re-brief its worker after the split/,
   )
+})
+
+test('policy handshake next steps name the exact follow-up calls and references', () => {
+  assert.equal(
+    policyConfirmationNextStep('42'),
+    'Ask the human to confirm in the page, then call graph_digest with cursor 42; the POLICY_STATED entry carries policy_ref — draft_id is not a policy_ref.',
+  )
+  assert.equal(
+    capabilityRequiredNextStep('approve', '43'),
+    'Call state_policy with the human-stated policy text. Ask the human to confirm it in the page, then call graph_digest with cursor 43; read POLICY_STATED.policy_ref and call approve again with that policy_ref. draft_id is not a policy_ref.',
+  )
+  assert.equal(
+    capabilityRequiredNextStep('dispatch', '44'),
+    'Call list_ready, then call dispatch with a ready task id. Ask the human to confirm the staged dispatch in the page, then call graph_digest with cursor 44 to verify the DISPATCHED entry.',
+  )
+  assert.equal(capabilityRequiredNextStep('reject', '45'), undefined)
+  assert.match(toolsSource, /next_step: policyConfirmationNextStep/)
+  assert.match(toolsSource, /human_presence: \{[\s\S]*pending:/)
+  for (const tool of ['state_policy', 'approve', 'dispatch', 'list_ready', 'split_task']) {
+    const start = toolsSource.indexOf(`name: '${tool}'`)
+    const description = toolsSource.slice(start, start + 700)
+    assert.match(description, /description:/)
+    assert.match(description, /Precondition|No precondition/)
+  }
 })
