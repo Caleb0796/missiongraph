@@ -195,18 +195,22 @@ describe("bridge dry-run integration", () => {
           await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
         }
         await bridge.whenIdle();
+        for (let attempt = 0; attempt < 100 && bridge.getState()?.workers["smoke-node"]?.status !== "idle"; attempt += 1) {
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+        }
         expect(bridge.getState()).toMatchObject({
           cursor: "2",
           supervisor_thread_id: "mock-supervisor",
           workers: {
             "smoke-node": {
+              status: "idle",
               thread_id: "mock-worker-smoke-node",
-              reporter_credential: expect.any(String),
-              reporter_expires: expect.stringMatching(/^2026-/),
-              reporter_config_path: expect.stringMatching(/\.reporter\.conf$/),
             },
           },
         });
+        expect(bridge.getState()?.workers["smoke-node"]).not.toHaveProperty("reporter_credential");
+        expect(bridge.getState()?.workers["smoke-node"]).not.toHaveProperty("reporter_expires");
+        expect(bridge.getState()?.workers["smoke-node"]).not.toHaveProperty("reporter_config_path");
 
         await mutation(
           serverUrl,
