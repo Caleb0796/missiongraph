@@ -52,6 +52,8 @@ Clone one flagship mission (POST `/api/clone-demo`), keep its `project`/`token`.
 
 **Codex ignores `OPENAI_API_KEY` in the environment.** Given only the variable it sends no credential at all and every worker dies on `Missing bearer or basic authentication in header`. `entry.sh` therefore pipes the key into `codex login --with-api-key` on boot, writing the credential to `CODEX_HOME=/data/codex` (700, on the persistent disk, inherited by worker children through the existing `CODEX_`/`OPENAI_` allowlist). It then runs one throwaway `codex exec` to prove the key can actually reach `MG_CODEX_MODEL`, and refuses to start the bridge if it cannot — better one clear boot failure than a stream of adopted tasks dying after the judge already confirmed them. Both steps read the key from stdin, never from argv.
 
+**Zero-downtime deploys and the bridge lock.** During a deploy the old and new instances briefly share `/data`, so the new bridge's first start loses the state lock and exits; `entry.sh` retries on a bounded loop (30 × 30s) and the old instance releases the lock as it shuts down (entry.sh forwards SIGTERM so the bridge's graceful stop actually runs). If the log keeps showing `bridge state lock … is held on host <old-instance>` past ten minutes, the loop moves the leftover lock aside itself; as a manual last resort, delete `/data/bridge-state.json.lock` from a shell and restart the service.
+
 Flip `BRIDGE_ENABLED=1` **last**, after every other variable is in place: while it is `0` there is no worker process on the VM, so nothing can be spent and nothing can execute.
 
 ### Judge fleet (a clone may borrow the bridge for ONE human-confirmed, template-bound task)

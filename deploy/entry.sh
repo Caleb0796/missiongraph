@@ -10,6 +10,17 @@ export DB_PATH
 node server/dist/src/http.js &
 SERVER_PID=$!
 
+# This script is PID 1. Without a trap, container shutdown SIGKILLs every child:
+# the bridge never runs its graceful stop, so the state lock survives on the
+# persistent disk and the NEXT instance (a different hostname) can never take it
+# over. Forward TERM/INT so the bridge exits cleanly and releases the lock.
+BRIDGE_LOOP_PID=""
+on_term() {
+  if [ -n "$BRIDGE_LOOP_PID" ]; then kill -TERM "$BRIDGE_LOOP_PID" 2>/dev/null || true; fi
+  kill -TERM "$SERVER_PID" 2>/dev/null || true
+}
+trap on_term TERM INT
+
 # Nothing below may take the site down. The server is already serving by this point, so a
 # misconfigured or unauthenticated bridge disables the bridge and logs why — it never exits,
 # because exiting here would crash-loop the container and take the public demo offline with it.
@@ -79,12 +90,57 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ] && [ "${codex_ready:-0}" = "1" ]; then
   fi
 
   if [ "$bridge_project_ready" = "1" ]; then
-    MG_SERVER_URL="http://127.0.0.1:${PORT}" \
-    MG_REPORTER_CREDENTIAL="${REPORTER_TOKEN}" \
-    MG_TARGET_REPO=/data/target-repo \
-    MG_BRIDGE_STATE=/data/bridge-state.json \
-    node bridge/dist/src/main.js &
+    # Zero-downtime deploys overlap the old and new instances on the same /data disk,
+    # so the first bridge start typically loses the state lock to the outgoing
+    # instance and exits. Retry on a bounded loop: the old bridge releases the lock
+    # when its instance shuts down. After ten minutes the overlap is long over, so a
+    # lock still naming another host is a leftover from a killed instance — move it
+    # aside (keeping the evidence) and let the next attempt take over. The server is
+    # never affected by anything in this loop.
+    (
+      BRIDGE_PID=""
+      # On shutdown, forward TERM to the bridge and wait for it: its graceful stop is
+      # what deletes the state lock on the shared disk. Exiting without that wait
+      # would let the container runtime SIGKILL the bridge mid-cleanup.
+      trap 'if [ -n "$BRIDGE_PID" ]; then kill -TERM "$BRIDGE_PID" 2>/dev/null || true; wait "$BRIDGE_PID" 2>/dev/null || true; fi; exit 0' TERM INT
+      attempt=0
+      while [ "$attempt" -lt 30 ]; do
+        attempt=$((attempt + 1))
+        MG_SERVER_URL="http://127.0.0.1:${PORT}" \
+        MG_REPORTER_CREDENTIAL="${REPORTER_TOKEN}" \
+        MG_TARGET_REPO=/data/target-repo \
+        MG_BRIDGE_STATE=/data/bridge-state.json \
+        node bridge/dist/src/main.js &
+        BRIDGE_PID=$!
+        bridge_status=0
+        wait "$BRIDGE_PID" || bridge_status=$?
+        BRIDGE_PID=""
+        if [ "$bridge_status" -eq 0 ]; then
+          echo "[entry] bridge exited cleanly; not restarting" >&2
+          break
+        fi
+        echo "[entry] bridge exited with status $bridge_status (attempt $attempt/30); retrying in 30s" >&2
+        if [ "$attempt" -eq 20 ] && [ -f /data/bridge-state.json.lock ]; then
+          echo "[entry] clearing a presumed-stale cross-host bridge lock (evidence kept)" >&2
+          mv /data/bridge-state.json.lock "/data/bridge-state.json.lock.cleared-$(date +%s)" 2>/dev/null || true
+          rm -f /data/bridge-state.json.lock.takeover 2>/dev/null || true
+        fi
+        sleep 30 &
+        wait $! 2>/dev/null || true
+      done
+      if [ "$attempt" -ge 30 ]; then
+        echo "[entry] bridge did not stay up after 30 attempts; the server keeps serving — check the lines above" >&2
+      fi
+    ) &
+    BRIDGE_LOOP_PID=$!
   fi
 fi
 
-wait $SERVER_PID
+# The server is the container's lifeline: when it exits — crash or forwarded TERM —
+# reap the bridge loop (TERM + wait, so the lock release finishes) and let PID 1 exit,
+# which is what makes Render restart a crashed instance.
+wait "$SERVER_PID" || true
+if [ -n "$BRIDGE_LOOP_PID" ]; then
+  kill -TERM "$BRIDGE_LOOP_PID" 2>/dev/null || true
+  wait "$BRIDGE_LOOP_PID" 2>/dev/null || true
+fi
