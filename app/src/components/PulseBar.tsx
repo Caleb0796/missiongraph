@@ -112,7 +112,7 @@ export function PulseBar({
         )}
         {connectionMode === 'fixture' && (
           <span className="offline-badge" title={connectionMessage}>
-            Dev fixture projection
+            {import.meta.env.PROD ? 'Offline demo data' : 'Dev fixture projection'}
           </span>
         )}
         <button

@@ -340,6 +340,8 @@ test('capability links and fixture labeling stay explicit', async () => {
   assert.match(pulse, /Start a fresh mission copy/)
   assert.match(pulse, /Open my stored mission/)
   assert.match(pulse, /connectionMode === 'fixture'/)
+  assert.match(pulse, /import\.meta\.env\.PROD/)
+  assert.match(pulse, /Offline demo data/)
   assert.match(pulse, /Dev fixture projection/)
   assert.doesNotMatch(pulse, /connectionMessage\.includes\('fixture projection'\)/)
 })
