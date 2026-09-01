@@ -23,6 +23,7 @@ export interface RunningCodex {
   identity: Promise<ProcessIdentity>;
   threadId: Promise<string>;
   completed: Promise<CodexResult>;
+  begin(): void;
   terminate(): Promise<void>;
 }
 
@@ -144,6 +145,7 @@ export class CodexClient {
       ],
       this.config.targetRepoPath,
       workerChildEnvironment(workerConfig, nodeId, reporterConfigPath),
+      true,
     );
     void running.completed.catch(() => undefined);
     return running;
@@ -160,6 +162,7 @@ export class CodexClient {
       this.workerResumeArgs(threadId, message),
       worktree,
       workerChildEnvironment(this.config, nodeId, reporterConfigPath),
+      true,
     );
   }
 
@@ -211,12 +214,26 @@ export class CodexClient {
     }
   }
 
-  private start(args: string[], cwd: string, environment: NodeJS.ProcessEnv = {}): RunningCodex {
+  private start(
+    args: string[],
+    cwd: string,
+    environment: NodeJS.ProcessEnv = {},
+    gated = false,
+  ): RunningCodex {
     if (this.stopping) throw new Error("codex client is shutting down");
-    const child = spawn(this.command.executable, [...this.command.prefix, ...args], {
+    const executable = gated ? process.execPath : this.command.executable;
+    const childArgs = gated
+      ? [
+        resolve(bridgePackageRoot, "worker-launcher.mjs"),
+        this.command.executable,
+        ...this.command.prefix,
+        ...args,
+      ]
+      : [...this.command.prefix, ...args];
+    const child = spawn(executable, childArgs, {
       cwd,
       env: codexChildEnvironment(environment),
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [gated ? "pipe" : "ignore", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
@@ -229,7 +246,7 @@ export class CodexClient {
       resolveThread = resolvePromise;
       rejectThread = rejectPromise;
     });
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdout!.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
       stdout = retainOutput(stdout, chunk);
       buffered = retainOutput(buffered, chunk, lineBufferRetentionBytes);
@@ -244,7 +261,7 @@ export class CodexClient {
         }
       }
     });
-    child.stderr.on("data", (chunk: Buffer) => {
+    child.stderr!.on("data", (chunk: Buffer) => {
       stderr = retainOutput(stderr, chunk);
     });
     const completed = new Promise<CodexResult>((resolvePromise, rejectPromise) => {
@@ -286,11 +303,17 @@ export class CodexClient {
     const pid = child.pid ?? -1;
     const identity = identifyProcess(pid, this.processStartTime);
     void identity.catch(() => undefined);
+    let begun = !gated;
     const running: RunningCodex = {
       pid,
       identity,
       threadId,
       completed,
+      begin: () => {
+        if (begun) return;
+        begun = true;
+        child.stdin?.end("start\n");
+      },
       terminate: () => termination ??= identity.then(async (current) => {
         await terminateProcess(current, { lookup: this.processStartTime });
         await completed.catch(() => undefined);

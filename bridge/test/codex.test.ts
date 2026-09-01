@@ -65,9 +65,15 @@ describe("CodexClient", () => {
       (worker as typeof worker & { begin?: () => void }).begin?.();
       await expect(worker.threadId).resolves.toBe("mock-worker-node-a");
       await worker.completed;
-      await expect(
-        client.resumeWorker("node-a", "mock-worker-node-a", "Continue.", bridgeConfig.targetRepoPath, join(root, "reporter.conf")).completed,
-      ).resolves.toMatchObject({ threadId: "mock-worker-node-a" });
+      const resumed = client.resumeWorker(
+        "node-a",
+        "mock-worker-node-a",
+        "Continue.",
+        bridgeConfig.targetRepoPath,
+        join(root, "reporter.conf"),
+      );
+      resumed.begin();
+      await expect(resumed.completed).resolves.toMatchObject({ threadId: "mock-worker-node-a" });
     } finally {
       for (const [name, value] of Object.entries(previous)) {
         if (value === undefined) delete process.env[name];

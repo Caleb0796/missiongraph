@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import type { RunningCodex } from "./codex.js";
@@ -18,9 +18,10 @@ import { ExecutionSlot, type ExecutionLease } from "./slot.js";
 import type { PendingAction, StateStore, WorkerState } from "./state.js";
 import type { Logger, SupervisorAction, SupervisorDecision } from "./types.js";
 
-async function runGit(args: string[], cwd: string): Promise<void> {
+async function runGit(args: string[], cwd: string, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "ignore", "pipe"] });
+    const child = spawn("git", args, { cwd, signal, stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
@@ -114,6 +115,10 @@ export class ActionExecutor {
     for (const [nodeId, worker] of Object.entries(this.stateStore.state.workers)) {
       const identity = workerIdentity(worker);
       if (worker.status === "idle" || worker.status === "dead") {
+        if (worker.reporter_credential || worker.reporter_expires || worker.reporter_config_path) {
+          await this.clearReporterCredential(worker);
+          changed = true;
+        }
         if (worker.pid !== undefined || worker.process_start_time !== undefined) {
           delete worker.pid;
           delete worker.process_start_time;
@@ -125,6 +130,7 @@ export class ActionExecutor {
         worker.status = "dead";
         delete worker.pid;
         delete worker.process_start_time;
+        await this.clearReporterCredential(worker);
         changed = true;
         recovered.push({
           act: "note",
@@ -135,6 +141,7 @@ export class ActionExecutor {
         worker.status = "dead";
         delete worker.pid;
         delete worker.process_start_time;
+        await this.clearReporterCredential(worker);
         changed = true;
         recovered.push({
           act: "note",
@@ -147,6 +154,7 @@ export class ActionExecutor {
           worker.status = "dead";
           delete worker.pid;
           delete worker.process_start_time;
+          await this.clearReporterCredential(worker);
           changed = true;
           recovered.push({
             act: "note",
@@ -155,6 +163,7 @@ export class ActionExecutor {
         } else {
           this.leases.set(nodeId, lease);
           this.scheduleRenewal(nodeId, worker.reporter_expires);
+          this.trackRecoveredCompletion(nodeId, identity, lease);
         }
       }
     }
@@ -382,23 +391,33 @@ export class ActionExecutor {
     );
   }
 
-  async spawnFleetWorker(assignment: FleetWorkerAssignment, lease: ExecutionLease): Promise<RunningCodex> {
+  async spawnFleetWorker(
+    assignment: FleetWorkerAssignment,
+    lease: ExecutionLease,
+    signal?: AbortSignal,
+  ): Promise<RunningCodex> {
     const previous = this.stateStore.state.workers[assignment.workerKey];
     if (previous && previous.status !== "dead") {
       lease.release();
       throw new Error(`fleet worker ${assignment.workerKey} already has a ${previous.status} worker entry`);
     }
-    return await this.launchWorker(assignment, lease, true);
+    return await this.launchWorker(assignment, lease, true, signal);
   }
 
   async killTrackedWorker(workerKey: string): Promise<void> {
     await this.killWorker(workerKey);
   }
 
+  async clearTrackedReporter(workerKey: string): Promise<void> {
+    const worker = this.stateStore.state.workers[workerKey];
+    if (worker) await this.clearReporterCredential(worker);
+  }
+
   private async launchWorker(
     assignment: FleetWorkerAssignment,
     lease: ExecutionLease,
     fleet: boolean,
+    signal?: AbortSignal,
   ): Promise<RunningCodex> {
     const { nodeId, workerKey } = assignment;
     const workerConfig = assignment.projectId === this.config.projectId
@@ -411,10 +430,14 @@ export class ActionExecutor {
     const worktree = join(root, `${basename(this.config.targetRepoPath)}-${nodeSlug}-${suffix}`);
     const reporterConfigPath = `${worktree}.reporter.conf`;
     try {
-      const credential = await new ReporterClient(workerConfig, this.dryRun).issue(`worker:${nodeId}`);
+      signal?.throwIfAborted();
+      const credential = await new ReporterClient(workerConfig, this.dryRun).issue(`worker:${nodeId}`, signal);
+      signal?.throwIfAborted();
       await writeReporterConfig(reporterConfigPath, credential.token);
+      signal?.throwIfAborted();
       await mkdir(root, { recursive: true });
-      await runGit(["worktree", "add", worktree, "-b", branch], this.config.targetRepoPath);
+      await runGit(["worktree", "add", worktree, "-b", branch], this.config.targetRepoPath, signal);
+      signal?.throwIfAborted();
       const state: WorkerState = {
         status: "spawning",
         worktree,
@@ -439,11 +462,16 @@ export class ActionExecutor {
         running = this.codex.startWorker(nodeId, prompt, worktree, reporterConfigPath, workerConfig);
         this.running.set(workerKey, running);
         this.leases.set(workerKey, lease);
+        const abortLaunch = () => void running?.terminate().catch(() => undefined);
+        signal?.addEventListener("abort", abortLaunch, { once: true });
         const identity = await running.identity;
         state.pid = identity.pid;
         state.process_start_time = identity.starttime;
         await this.stateStore.save();
+        signal?.throwIfAborted();
+        running.begin();
         state.thread_id = await running.threadId;
+        signal?.removeEventListener("abort", abortLaunch);
         state.status = "live";
         await this.stateStore.save();
       } catch (error) {
@@ -453,6 +481,7 @@ export class ActionExecutor {
         delete state.process_start_time;
         this.running.delete(workerKey);
         this.releaseLease(workerKey);
+        await this.clearReporterCredential(state);
         await this.stateStore.save();
         throw error;
       }
@@ -461,6 +490,9 @@ export class ActionExecutor {
       this.trackInitialCompletion(workerKey, running, lease);
       return running;
     } catch (error) {
+      await unlink(reporterConfigPath).catch((unlinkError: NodeJS.ErrnoException) => {
+        if (unlinkError.code !== "ENOENT") throw unlinkError;
+      });
       lease.release();
       throw error;
     }
@@ -480,6 +512,7 @@ export class ActionExecutor {
           current.status = current.thread_id ? "idle" : "dead";
           delete current.pid;
           delete current.process_start_time;
+          await this.clearReporterCredential(current);
           await this.stateStore.save();
         }
       })
@@ -490,6 +523,42 @@ export class ActionExecutor {
         if (this.leases.get(nodeId) === lease) this.leases.delete(nodeId);
         lease.release();
       });
+    this.cleanupTasks.add(cleanup);
+    void cleanup.finally(() => this.cleanupTasks.delete(cleanup));
+  }
+
+  private trackRecoveredCompletion(nodeId: string, identity: ProcessIdentity, lease: ExecutionLease): void {
+    let release = false;
+    const cleanup = (async () => {
+      while (!this.stopping && await processMatches(identity, this.processStartTime)) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+      }
+      if (this.stopping) {
+        release = true;
+        return;
+      }
+      release = true;
+      const current = this.stateStore.state.workers[nodeId];
+      if (
+        current?.pid === identity.pid &&
+        current.process_start_time === identity.starttime
+      ) {
+        current.status = current.thread_id ? "idle" : "dead";
+        delete current.pid;
+        delete current.process_start_time;
+        this.clearRenewal(nodeId);
+        await this.clearReporterCredential(current);
+        await this.stateStore.save();
+      }
+    })().catch((error: unknown) => {
+      this.logger.error(
+        `failed to monitor recovered worker ${nodeId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }).finally(() => {
+      if (!release) return;
+      if (this.leases.get(nodeId) === lease) this.leases.delete(nodeId);
+      lease.release();
+    });
     this.cleanupTasks.add(cleanup);
     void cleanup.finally(() => this.cleanupTasks.delete(cleanup));
   }
@@ -533,9 +602,12 @@ export class ActionExecutor {
       const identity = await running.identity;
       worker.pid = identity.pid;
       worker.process_start_time = identity.starttime;
+      worker.status = "spawning";
+      await this.stateStore.save();
+      running.begin();
+      await running.threadId;
       worker.status = "live";
       await this.stateStore.save();
-      await running.threadId;
       await running.completed;
     } catch (error) {
       if (running) await this.terminateFailedLaunch(nodeId, running);
@@ -548,6 +620,7 @@ export class ActionExecutor {
           delete worker.pid;
           delete worker.process_start_time;
           this.clearRenewal(nodeId);
+          await this.clearReporterCredential(worker);
           await this.stateStore.save();
         }
       } finally {
@@ -642,6 +715,10 @@ export class ActionExecutor {
     const worker = this.stateStore.state.workers[nodeId];
     if (!worker || worker.status === "dead") {
       this.logger.warn(`kill_worker ignored because node ${nodeId} has no tracked active process`);
+      if (worker) {
+        await this.clearReporterCredential(worker);
+        await this.stateStore.save();
+      }
       this.releaseLease(nodeId);
       return;
     }
@@ -658,6 +735,7 @@ export class ActionExecutor {
     this.running.delete(nodeId);
     this.clearRenewal(nodeId);
     try {
+      await this.clearReporterCredential(worker);
       await this.stateStore.save();
     } finally {
       this.releaseLease(nodeId);
@@ -667,6 +745,18 @@ export class ActionExecutor {
   private reporterFor(worker: WorkerState): ReporterClient {
     if (!worker.project_id || worker.project_id === this.config.projectId) return this.reporter;
     return new ReporterClient({ ...this.config, projectId: worker.project_id }, this.dryRun);
+  }
+
+  private async clearReporterCredential(worker: WorkerState): Promise<void> {
+    const reporterConfigPath = worker.reporter_config_path;
+    if (reporterConfigPath) {
+      await unlink(reporterConfigPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
+    delete worker.reporter_credential;
+    delete worker.reporter_expires;
+    delete worker.reporter_config_path;
   }
 
   private releaseLease(workerKey: string): void {

@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -26,6 +26,7 @@ function running(
     identity: Promise.resolve({ pid, starttime: `start-${pid}` }),
     threadId: Promise.resolve(threadId),
     completed,
+    begin: () => undefined,
     terminate,
   };
 }
@@ -66,9 +67,21 @@ describe("ActionExecutor", () => {
           expect(JSON.parse(readFileSync(bridgeConfig.statePath, "utf8"))).toMatchObject({
             workers: { "node-a": { status: "spawning" } },
           });
+          const worker = running("worker-node-a", initialCompleted, async () => completeInitial());
           return {
-            ...running("worker-node-a", initialCompleted, async () => completeInitial()),
+            ...worker,
             threadId: initialThread,
+            begin: () => {
+              expect(JSON.parse(readFileSync(bridgeConfig.statePath, "utf8"))).toMatchObject({
+                workers: {
+                  "node-a": {
+                    status: "spawning",
+                    pid: worker.pid,
+                    process_start_time: `start-${worker.pid}`,
+                  },
+                },
+              });
+            },
           };
         },
         resumeWorker: (_nodeId: string, threadId: string, message: string) => {
@@ -118,7 +131,7 @@ describe("ActionExecutor", () => {
         ],
       });
 
-      expect(issued).toEqual(["worker-token-1", "worker-token-2"]);
+      expect(issued).toEqual(["worker-token-1", "worker-token-2", "worker-token-3", "worker-token-4"]);
       expect(state.state.workers["node-a"]).toMatchObject({ status: "idle", thread_id: "worker-node-a" });
       expect(state.state.workers["node-a"]?.pid).toBeUndefined();
       expect(resumed).toHaveLength(3);
@@ -139,7 +152,11 @@ describe("ActionExecutor", () => {
   it("rejects controls for a live worker with journaled notes instead of launching resumes", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-live-control-"));
     const reports: Record<string, unknown>[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/reporter-credentials")) {
+        const body = JSON.parse(String(init?.body)) as { actor: string };
+        return Response.json({ token: "renewed-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+      }
       reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       return Response.json({ seq: reports.length });
     }));
@@ -229,7 +246,11 @@ describe("ActionExecutor", () => {
   it("replays a durable pending action after a simulated crash", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-ledger-replay-"));
     const reports: Record<string, unknown>[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/reporter-credentials")) {
+        const body = JSON.parse(String(init?.body)) as { actor: string };
+        return Response.json({ token: "renewed-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+      }
       reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       return Response.json({ seq: 1 });
     }));
@@ -268,7 +289,11 @@ describe("ActionExecutor", () => {
   it("retries a mechanical failure three times before journaling the action payload", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-action-failure-"));
     const reports: Record<string, unknown>[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/reporter-credentials")) {
+        const body = JSON.parse(String(init?.body)) as { actor: string };
+        return Response.json({ token: "renewed-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+      }
       reports.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
       return Response.json({ seq: 1 });
     }));
@@ -323,8 +348,15 @@ describe("ActionExecutor", () => {
   it("dead-letters an action when permanent-failure journaling fails and continues draining", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-dead-letter-"));
     const reports: Record<string, unknown>[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (String(input).endsWith("/reporter-credentials")) {
+        return Response.json({
+          token: "renewed-token",
+          actor: body.actor,
+          expires: "2099-08-30T10:15:00.000Z",
+        });
+      }
       const text = (body.payload as { text?: string } | undefined)?.text ?? "";
       if (text.includes("Mechanical action permanently failed")) return new Response("journal unavailable", { status: 503 });
       reports.push(body);
@@ -449,11 +481,16 @@ describe("ActionExecutor", () => {
     try {
       const bridgeConfig = config(root);
       state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, processStartTime);
+      const staleReporterConfig = join(root, "stale.reporter.conf");
+      await writeFile(staleReporterConfig, "header = \"Authorization: Bearer stale-token\"\n");
       state.state.workers.stale = {
         status: "live",
         thread_id: "stale-thread",
         worktree: join(root, "stale"),
         branch: "work/stale",
+        reporter_credential: "stale-token",
+        reporter_expires: "2099-08-30T10:15:00.000Z",
+        reporter_config_path: staleReporterConfig,
         pid: 111,
         process_start_time: "old-start",
       };
@@ -485,6 +522,7 @@ describe("ActionExecutor", () => {
       expect(reports).toEqual([
         expect.objectContaining({ type: "JOURNAL_NOTE", payload: { text: expect.stringContaining("marked worker stale dead") } }),
       ]);
+      await expect(readFile(staleReporterConfig, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
       expect(await readFile(state.state.workers.live!.reporter_config_path!, "utf8")).toContain("renewed-token");
       expect((await stat(state.state.workers.live!.reporter_config_path!)).mode & 0o777).toBe(0o600);
     } finally {
