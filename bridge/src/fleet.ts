@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+
 import type { RunningCodex } from "./codex.js";
 import type { BridgeConfig } from "./config.js";
 import type { ActionExecutor } from "./actions.js";
@@ -51,14 +53,44 @@ async function staleFleetResponse(response: Response): Promise<boolean> {
 }
 
 interface FleetProtocolEvent {
+  seq: number;
   actor: string;
   type: string;
-  payload: { node_id?: string; to?: string; detail?: string };
+  payload: {
+    node_id?: string;
+    to?: string;
+    detail?: string;
+    handoff?: { v?: unknown; commits?: unknown };
+  };
 }
 
 interface FleetCompletion {
   outcome: "done" | "failed";
   note?: string;
+}
+
+interface ScopedFleetAdoptionState extends FleetAdoptionState {
+  ledger_seq_at_adoption?: number;
+}
+
+async function gitSucceeds(args: string[], cwd: string, signal: AbortSignal): Promise<boolean> {
+  signal.throwIfAborted();
+  return await new Promise<boolean>((resolvePromise, rejectPromise) => {
+    const child = spawn("git", args, { cwd, signal, stdio: "ignore" });
+    child.once("error", rejectPromise);
+    child.once("close", (code) => resolvePromise(code === 0));
+  });
+}
+
+async function commitExistsOnBranch(
+  commit: string,
+  worktree: string,
+  branch: string,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (!/^[0-9a-f]{7,64}$/i.test(commit)) return false;
+  if (!await gitSucceeds(["cat-file", "-e", `${commit}^{commit}`], worktree, signal)) return false;
+  return await gitSucceeds(["merge-base", "--is-ancestor", commit, branch], worktree, signal);
 }
 
 function protocolEvents(value: unknown): FleetProtocolEvent[] {
@@ -71,6 +103,8 @@ function protocolEvents(value: unknown): FleetProtocolEvent[] {
     if (typeof event !== "object" || event === null || Array.isArray(event)) return false;
     const candidate = event as Partial<FleetProtocolEvent>;
     return (
+      Number.isSafeInteger(candidate.seq) &&
+      (candidate.seq as number) >= 0 &&
       typeof candidate.actor === "string" &&
       typeof candidate.type === "string" &&
       typeof candidate.payload === "object" &&
@@ -138,12 +172,33 @@ class FleetClient {
     return true;
   }
 
+  async ledgerSequence(projectId: string, visitorToken: string, signal: AbortSignal): Promise<number> {
+    const response = await fetch(
+      `${this.config.serverUrl}/api/p/${encodeURIComponent(projectId)}/export`,
+      {
+        headers: { "x-mg-token": visitorToken },
+        signal: requestSignal(signal),
+      },
+    );
+    if (!response.ok) throw new Error(`fleet ledger export GET failed (${response.status}): ${await response.text()}`);
+    return protocolEvents(await response.json()).reduce((latest, event) => Math.max(latest, event.seq), 0);
+  }
+
   async protocolCompletion(
     projectId: string,
     nodeId: string,
     visitorToken: string,
+    ledgerSeqAtAdoption: number | undefined,
+    worktree: string,
+    branch: string,
     signal: AbortSignal,
   ): Promise<FleetCompletion> {
+    if (!Number.isSafeInteger(ledgerSeqAtAdoption) || ledgerSeqAtAdoption! < 0) {
+      return {
+        outcome: "failed",
+        note: "Fleet worker exited cleanly without required server ledger reports: adoption ledger sequence.",
+      };
+    }
     const response = await fetch(
       `${this.config.serverUrl}/api/p/${encodeURIComponent(projectId)}/export`,
       {
@@ -154,13 +209,21 @@ class FleetClient {
     if (!response.ok) throw new Error(`fleet ledger export GET failed (${response.status}): ${await response.text()}`);
     const actor = `worker:${nodeId}`;
     const events = protocolEvents(await response.json()).filter(
-      (event) => event.actor === actor && event.payload.node_id === nodeId,
-    );
-    const terminalState = events.findLast(
       (event) =>
+        event.seq > ledgerSeqAtAdoption! &&
+        event.actor === actor &&
+        event.payload.node_id === nodeId,
+    );
+    const runningState = events.find(
+      (event) => event.type === "NODE_STATE_CHANGED" && event.payload.to === "running",
+    );
+    const terminalState = events.find(
+      (event) =>
+        runningState !== undefined &&
+        event.seq > runningState.seq &&
         event.type === "NODE_STATE_CHANGED" &&
         event.payload.to !== undefined &&
-        ["review", "done", "failed"].includes(event.payload.to),
+        ["review", "failed"].includes(event.payload.to),
     );
     if (terminalState?.payload.to === "failed") {
       const detail = terminalState.payload.detail;
@@ -169,10 +232,30 @@ class FleetClient {
         note: `Fleet worker reported terminal NODE_STATE_CHANGED to failed${detail ? `: ${detail}` : "."}`,
       };
     }
+    const handoff = events.find(
+      (event) =>
+        terminalState !== undefined &&
+        event.seq > terminalState.seq &&
+        event.type === "HANDOFF_FILED" &&
+        event.payload.handoff?.v === 1,
+    );
+    const approvals = events.filter((event) => event.type === "APPROVAL_CREATED");
+    const commits = handoff?.payload.handoff?.commits;
+    const commitList = Array.isArray(commits) && commits.length > 0 && commits.every((commit) => typeof commit === "string")
+      ? commits as string[]
+      : undefined;
+    const invalidCommits: string[] = [];
+    for (const commit of commitList ?? []) {
+      if (!await commitExistsOnBranch(commit, worktree, branch, signal)) invalidCommits.push(commit);
+    }
     const missing = [
-      ...(terminalState ? [] : ["terminal NODE_STATE_CHANGED"]),
-      ...(events.some((event) => event.type === "HANDOFF_FILED") ? [] : ["HANDOFF_FILED"]),
-      ...(events.some((event) => event.type === "APPROVAL_CREATED") ? [] : ["APPROVAL_CREATED"]),
+      ...(runningState && terminalState ? [] : ["ordered NODE_STATE_CHANGED running→review|failed"]),
+      ...(handoff ? [] : ["v1 HANDOFF_FILED"]),
+      ...(commitList ? [] : ["non-empty HANDOFF_FILED commits"]),
+      ...(invalidCommits.length === 0 ? [] : [`valid HANDOFF_FILED commits (${invalidCommits.join(", ")})`]),
+      ...(approvals.length === 1 && handoff && approvals[0]!.seq > handoff.seq
+        ? []
+        : ["exactly one ordered APPROVAL_CREATED"]),
     ];
     if (missing.length > 0) {
       return {
@@ -277,7 +360,23 @@ export class FleetAdoptionLoop {
         if (!claim || claim.request_id === previous.request_id) return;
       }
       if (!claim) return;
-      const adoption: FleetAdoptionState = {
+      let ledgerSeqAtAdoption: number;
+      try {
+        ledgerSeqAtAdoption = await this.client.ledgerSequence(
+          claim.project_id,
+          claim.visitor_token,
+          this.abort.signal,
+        );
+      } catch (error) {
+        await this.client.complete(
+          claim.request_id,
+          "failed",
+          this.abort.signal,
+          `Fleet adoption ledger boundary failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+      const adoption: ScopedFleetAdoptionState = {
         request_id: claim.request_id,
         project_id: claim.project_id,
         node_id: claim.node_id,
@@ -286,6 +385,7 @@ export class FleetAdoptionLoop {
         worker_key: `fleet:${claim.request_id}`,
         status: "adopted",
         adopted_at: new Date().toISOString(),
+        ledger_seq_at_adoption: ledgerSeqAtAdoption,
       };
       this.stateStore.state.fleet_adoption = adoption;
       await this.stateStore.save();
@@ -404,12 +504,21 @@ export class FleetAdoptionLoop {
       }
       let completion: FleetCompletion;
       try {
-        completion = await this.client.protocolCompletion(
-          adoption.project_id,
-          adoption.node_id,
-          adoption.visitor_token,
-          claimAbort.signal,
-        );
+        const worker = this.stateStore.state.workers[adoption.worker_key];
+        completion = worker
+          ? await this.client.protocolCompletion(
+            adoption.project_id,
+            adoption.node_id,
+            adoption.visitor_token,
+            (adoption as ScopedFleetAdoptionState).ledger_seq_at_adoption,
+            worker.worktree,
+            worker.branch,
+            claimAbort.signal,
+          )
+          : {
+            outcome: "failed",
+            note: "Fleet worker exited cleanly without required server ledger reports: persisted worker checkout.",
+          };
       } catch (error) {
         completion = {
           outcome: "failed",

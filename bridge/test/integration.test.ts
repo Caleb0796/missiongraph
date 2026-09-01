@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -10,6 +10,23 @@ import { MissionGraphBridge } from "../src/bridge.js";
 import { config, initializeRepo, TestLogger } from "./helpers.js";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+
+async function committingMockCodex(root: string): Promise<string> {
+  const source = await readFile(join(repositoryRoot, "bridge/mock-codex.mjs"), "utf8");
+  const withImports = source
+    .replace('import { spawn } from "node:child_process";', 'import { execFileSync, spawn } from "node:child_process";')
+    .replace('import { createHash, randomUUID } from "node:crypto";', 'import { createHash, randomUUID } from "node:crypto";\nimport { writeFileSync } from "node:fs";\nimport { join } from "node:path";');
+  const withCommit = withImports.replace(
+    '  if (reportLifecycle) {\n    await report("WORKER_LOG", { node_id: nodeId, lines: ["Mock fleet worker finished."] });',
+    '  if (reportLifecycle) {\n    const workerDirectory = args[args.indexOf("-C") + 1];\n    if (!workerDirectory) throw new Error("mock worker checkout is missing");\n    const artifact = `.missiongraph-mock-${createHash("sha1").update(nodeId).digest("hex").slice(0, 8)}.txt`;\n    writeFileSync(join(workerDirectory, artifact), `Mock completion for ${nodeId}.\\n`);\n    execFileSync("git", ["-C", workerDirectory, "add", artifact]);\n    execFileSync("git", ["-C", workerDirectory, "commit", "-m", `test: complete ${nodeId}`]);\n    const mockCommit = execFileSync("git", ["-C", workerDirectory, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();\n    await report("WORKER_LOG", { node_id: nodeId, lines: ["Mock fleet worker finished."] });',
+  ).replace("        commits: [],", "        commits: [mockCommit],");
+  if (withCommit === source || !withCommit.includes("commits: [mockCommit]")) {
+    throw new Error("test mock patch did not match bridge/mock-codex.mjs");
+  }
+  const path = join(root, "committing-mock-codex.mjs");
+  await writeFile(path, withCommit, { mode: 0o700 });
+  return path;
+}
 
 async function freePort(): Promise<number> {
   const server = createServer();
@@ -428,6 +445,7 @@ describe("bridge dry-run integration", () => {
 
         const repoPath = join(root, "target-repo");
         await initializeRepo(repoPath);
+        const mockCodexPath = await committingMockCodex(root);
         const statePath = join(root, "fleet-state.json");
         const logger = new TestLogger();
         bridge = new MissionGraphBridge({
@@ -436,28 +454,37 @@ describe("bridge dry-run integration", () => {
           projectId: seed.project_id,
           visitorToken: seed.token,
           reporterCredential: reporterToken,
+          codexBinaryPath: mockCodexPath,
           statePath,
           fleetMode: true,
           fleetPollMs: 20,
           fleetHeartbeatMs: 30,
           fleetRunTtlMs: 5_000,
-        }, logger, true, async (pid) => `fleet-integration-${pid}`);
+        }, logger, false, async (pid) => `fleet-integration-${pid}`);
         await bridge.start();
 
         const adoptedAt = new Set<string>();
         let requestStatus = "queued";
-        for (let attempt = 0; attempt < 500 && requestStatus !== "done"; attempt += 1) {
+        let requestNote: string | null = null;
+        for (
+          let attempt = 0;
+          attempt < 500 && !["done", "failed"].includes(requestStatus);
+          attempt += 1
+        ) {
           const response = await fetch(
             `${serverUrl}/api/p/${encodeURIComponent(clone.project)}/fleet-requests/${encodeURIComponent(request.id)}`,
             { headers: { "x-mg-token": clone.token } },
           );
           if (!response.ok) throw new Error(`fleet request poll failed (${response.status}): ${await response.text()}`);
-          const body = await response.json() as { status: string; adopted_at?: string };
+          const body = await response.json() as { status: string; adopted_at?: string; note: string | null };
           requestStatus = body.status;
+          requestNote = body.note;
           if (body.adopted_at) adoptedAt.add(body.adopted_at);
-          if (requestStatus !== "done") await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+          if (!["done", "failed"].includes(requestStatus)) {
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+          }
         }
-        expect(requestStatus).toBe("done");
+        expect(requestStatus, requestNote ?? undefined).toBe("done");
         expect(adoptedAt.size).toBeGreaterThanOrEqual(2);
 
         let partialRequestStatus = "queued";
