@@ -1114,7 +1114,7 @@ const dispatch: ToolDefinition = {
       },
       { actor: 'browser_agent' },
     )
-    const fleet = await fleetResultForDispatch(id)
+    const fleet = fleetResultForDispatch(id)
     return {
       data: withFleetMetadata(
         {
