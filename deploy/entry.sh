@@ -60,6 +60,7 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ]; then
     echo "BRIDGE DISABLED detail: $(printf '%s' "$probe_output" | tail -c 400 | tr '\n' ' ')" >&2
   else
     codex_ready=1
+    echo "[entry] codex $(codex --version 2>/dev/null | head -n 1) ready; model ${MG_CODEX_MODEL:-default}" >&2
   fi
 fi
 
@@ -88,6 +89,20 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ] && [ "${codex_ready:-0}" = "1" ]; then
         bridge_project_ready=0
       fi
     fi
+  fi
+
+  if [ "$bridge_project_ready" = "1" ]; then
+    # Diagnostic only (never disables anything): run one shell command the way a fleet
+    # worker would — workspace-write sandbox with network access — from inside the
+    # cloned repository, and log the tail. On a container where the Linux sandbox or
+    # its network gate does not work, this line is the fastest explanation of why
+    # workers exit without ever reporting.
+    worker_probe=$(codex exec -C /data/target-repo -s workspace-write \
+      -c 'sandbox_workspace_write.network_access=true' -c 'mcp_servers={}' --skip-git-repo-check \
+      ${MG_CODEX_MODEL:+-m "$MG_CODEX_MODEL"} \
+      "Run exactly this shell command and reply with only its raw output: curl -s -m 5 http://127.0.0.1:${PORT}/api/health; printf ' exit=%s' \$?" \
+      </dev/null 2>&1 | tail -c 300 | tr '\n' ' ') || true
+    echo "[entry] worker-mode probe: ${worker_probe:-<no output>}" >&2
   fi
 
   if [ "$bridge_project_ready" = "1" ]; then
