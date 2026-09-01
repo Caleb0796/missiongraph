@@ -14,6 +14,14 @@ function templateHash(title, brief) {
   return createHash("sha256").update(`${title}\n${brief}`).digest("hex");
 }
 
+function createsNode(event, nodeId) {
+  if (event.type === "TASK_ADDED") return event.payload.node.id === nodeId;
+  if (event.type === "TASK_SPLIT") {
+    return event.payload.children.some((child) => child.id === nodeId);
+  }
+  return false;
+}
+
 function json(response, status, body) {
   response.writeHead(status, { "content-type": "application/json" });
   response.end(JSON.stringify(body));
@@ -137,6 +145,7 @@ export async function startFleetStub({
         },
       });
     });
+    project.clone_baseline = project.events.at(-1)?.seq ?? 0;
     projects.set(id, project);
     return project;
   }
@@ -189,6 +198,14 @@ export async function startFleetStub({
         eligible: false,
         code: "template_mismatch",
         message: "The node does not match the seed template registry.",
+      };
+    }
+    const creation = project.events.find((event) => createsNode(event, nodeId));
+    if (project.clone_baseline === undefined || !creation || creation.seq > project.clone_baseline) {
+      return {
+        eligible: false,
+        code: "template_mismatch",
+        message: "Only tasks created as part of the visitor clone are fleet-eligible.",
       };
     }
     return { eligible: true, node };
@@ -489,6 +506,38 @@ export async function startFleetStub({
       const node = projects.get(projectId)?.nodes.get(nodeId);
       if (!node) throw new Error("cannot change unknown stub node");
       Object.assign(node, changes);
+    },
+    addSplitChild(projectId, parentId, input) {
+      const project = projects.get(projectId);
+      if (!project?.nodes.has(parentId)) throw new Error("cannot split unknown stub node");
+      const node = {
+        ...input,
+        record_type: "task",
+        availability: "ready",
+        assigned: false,
+      };
+      project.nodes.set(node.id, node);
+      append(project, "human", "TASK_SPLIT", {
+        parent_id: parentId,
+        children: [input],
+        edge_remap: [],
+      });
+      return node;
+    },
+    enqueueUnchecked(projectId, nodeId) {
+      const project = projects.get(projectId);
+      if (!project?.nodes.has(nodeId)) throw new Error("cannot enqueue unknown stub node");
+      const item = {
+        id: `fleet-request-${randomUUID()}`,
+        project_id: projectId,
+        node_id: nodeId,
+        status: "queued",
+        created_at: nowMs,
+        order: requests.size + 1,
+      };
+      requests.set(item.id, item);
+      sweep();
+      return item;
     },
     invalidate(projectId, nodeId) {
       const project = projects.get(projectId);

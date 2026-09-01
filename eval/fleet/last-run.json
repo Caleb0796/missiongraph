@@ -1,17 +1,17 @@
 {
   "version": 1,
   "mode": "stub",
-  "started_at": "2026-09-01T06:04:13.505Z",
-  "finished_at": "2026-09-01T06:04:13.898Z",
-  "passed": 16,
+  "started_at": "2026-09-01T06:44:31.727Z",
+  "finished_at": "2026-09-01T06:44:32.160Z",
+  "passed": 19,
   "failed": 0,
   "skipped": 0,
-  "total": 16,
+  "total": 19,
   "scenarios": [
     {
       "name": "happy-path",
       "status": "PASS",
-      "duration_ms": 51
+      "duration_ms": 48
     },
     {
       "name": "seed-project-rejection",
@@ -21,22 +21,37 @@
     {
       "name": "seed-registry-addition",
       "status": "PASS",
-      "duration_ms": 17
+      "duration_ms": 14
     },
     {
       "name": "seed-registry-tombstone",
       "status": "PASS",
-      "duration_ms": 11
+      "duration_ms": 10
     },
     {
       "name": "template_mismatch",
       "status": "PASS",
-      "duration_ms": 16
+      "duration_ms": 14
     },
     {
       "name": "undispatched-custom-precedence",
       "status": "PASS",
-      "duration_ms": 4
+      "duration_ms": 6
+    },
+    {
+      "name": "post-baseline-authored-enqueue",
+      "status": "PASS",
+      "duration_ms": 12
+    },
+    {
+      "name": "post-baseline-authored-claim",
+      "status": "PASS",
+      "duration_ms": 28
+    },
+    {
+      "name": "post-baseline-split-child",
+      "status": "PASS",
+      "duration_ms": 10
     },
     {
       "name": "edited-brief",
@@ -46,7 +61,7 @@
     {
       "name": "node_not_dispatched",
       "status": "PASS",
-      "duration_ms": 4
+      "duration_ms": 3
     },
     {
       "name": "eligibility-projection",
@@ -61,22 +76,22 @@
     {
       "name": "daily-cap",
       "status": "PASS",
-      "duration_ms": 60
+      "duration_ms": 59
     },
     {
       "name": "FIFO-fairness",
       "status": "PASS",
-      "duration_ms": 49
+      "duration_ms": 48
     },
     {
       "name": "TTL-expiry",
       "status": "PASS",
-      "duration_ms": 30
+      "duration_ms": 29
     },
     {
       "name": "claim-template-mismatch",
       "status": "PASS",
-      "duration_ms": 26
+      "duration_ms": 28
     },
     {
       "name": "stale-claim",

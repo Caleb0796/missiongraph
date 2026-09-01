@@ -82,6 +82,14 @@ function nodeId(event: Event): string | undefined {
   return "node_id" in event.payload ? event.payload.node_id : undefined;
 }
 
+function createsNode(event: Event, requestedNodeId: string): boolean {
+  if (event.type === "TASK_ADDED") return event.payload.node.id === requestedNodeId;
+  if (event.type === "TASK_SPLIT") {
+    return event.payload.children.some((child) => child.id === requestedNodeId);
+  }
+  return false;
+}
+
 export class FleetQueue {
   constructor(
     private readonly store: EventStore,
@@ -363,6 +371,14 @@ export class FleetQueue {
       };
     }
     const baseline = this.store.cloneBaseline(projectId);
+    const creation = events.find((event) => createsNode(event, requestedNodeId));
+    if (baseline === undefined || !creation || creation.seq > baseline) {
+      return {
+        eligible: false,
+        code: "template_mismatch",
+        message: "Only tasks created as part of the visitor clone are fleet-eligible.",
+      };
+    }
     const authorizedDispatch = events.find((event) => {
       if (
         event.type !== "DISPATCHED" ||
