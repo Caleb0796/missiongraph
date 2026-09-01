@@ -21,6 +21,7 @@ import {
 } from 'react'
 import '@xyflow/react/dist/style.css'
 import {
+  describeEvent,
   getCriticalPath,
   getDisplayState,
   getEventNodeId,
@@ -29,6 +30,7 @@ import {
   isSplitParent,
   type DisplayState,
 } from '../model/graph'
+import type { Actor } from '../model/types'
 import { useMissionStore } from '../store/mission-store'
 import {
   copyCurrentMissionLink,
@@ -60,6 +62,13 @@ const AGENT_PROMPTS = [
   'Ask it to clear the approval queue under a policy you state',
   'Split the rate-limit task into config and enforcement halves — show me the blast radius first.',
 ] as const
+
+function replayActorLabel(actor: Actor) {
+  if (actor === 'human') return 'You'
+  if (actor === 'browser_agent') return 'Your agent'
+  if (actor === 'supervisor') return 'Supervisor'
+  return 'Worker'
+}
 
 async function createLayout(nodeIds: string[], edges: Edge[]) {
   const graph = await elk.layout({
@@ -146,6 +155,10 @@ function MissionBoard() {
     step: number
     total: number
   } | null>(null)
+  const [replayCaption, setReplayCaption] = useState<{
+    actor: string
+    description: string
+  } | null>(null)
   const [relayouting, setRelayouting] = useState(false)
   const [layoutRetry, setLayoutRetry] = useState(0)
   const [layoutReadyFor, setLayoutReadyFor] = useState<{
@@ -154,6 +167,7 @@ function MissionBoard() {
   const [now, setNow] = useState(() => Date.now())
   const [firstRunOpen, setFirstRunOpen] = useState(false)
   const [firstRunMenuOpen, setFirstRunMenuOpen] = useState(false)
+  const [copiedPrompt, setCopiedPrompt] = useState<string | null>(null)
   const initializedFirstRunProject = useRef<string | null>(null)
   const hasLaidOut = useRef(false)
   const layoutRequest = useRef<{
@@ -166,6 +180,8 @@ function MissionBoard() {
   const replayGeneration = useRef(0)
   const replayActive = useRef(false)
   const replayWaitCancel = useRef<(() => void) | null>(null)
+  const confirmationCancelRef = useRef<HTMLButtonElement>(null)
+  const promptCopyTimer = useRef<number | null>(null)
   const { fitView, getViewport, setCenter, setViewport } =
     useReactFlow<TaskFlowNode, Edge>()
   const criticalPath = useMemo(
@@ -191,6 +207,7 @@ function MissionBoard() {
     void setViewport(getViewport(), { duration: 0 })
     setHighlights([])
     setReplayProgress(null)
+    setReplayCaption(null)
     setReplaying(false)
   }, [getViewport, setHighlights, setViewport])
 
@@ -455,6 +472,7 @@ function MissionBoard() {
     () => () => {
       if (relayoutTimer.current !== null) window.clearTimeout(relayoutTimer.current)
       if (layoutDebounce.current !== null) window.clearTimeout(layoutDebounce.current)
+      if (promptCopyTimer.current !== null) window.clearTimeout(promptCopyTimer.current)
       replayActive.current = false
       replayGeneration.current += 1
       replayWaitCancel.current?.()
@@ -498,6 +516,30 @@ function MissionBoard() {
     const timeout = window.setTimeout(clearToast, 3200)
     return () => window.clearTimeout(timeout)
   }, [clearToast, toast])
+
+  useEffect(() => {
+    if (!humanConfirmation && !structuralPreview) return
+    confirmationCancelRef.current?.focus()
+    function handleConfirmationEscape(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      if (humanConfirmation) {
+        denyHumanConfirmation(
+          humanConfirmation.id,
+          humanConfirmation.textHash,
+        )
+      } else {
+        cancelStructural()
+      }
+    }
+    window.addEventListener('keydown', handleConfirmationEscape)
+    return () => window.removeEventListener('keydown', handleConfirmationEscape)
+  }, [
+    cancelStructural,
+    denyHumanConfirmation,
+    humanConfirmation,
+    structuralPreview,
+  ])
 
   const onNodesChange = useCallback((changes: NodeChange<TaskFlowNode>[]) => {
     setNodeDims((current) => {
@@ -548,26 +590,38 @@ function MissionBoard() {
     const reducedMotion = window.matchMedia(
       '(prefers-reduced-motion: reduce)',
     ).matches
-    const recentNodeIds = events
+    const replaySteps = events
       .filter((event) => !['NODE_MOVED', 'SELECTION_CHANGED'].includes(event.type))
       .slice(-12)
-      .map((event) => getEventNodeId(event, edges))
-      .filter((id): id is string => Boolean(id))
-      .filter((id, index, all) => all.indexOf(id) === index)
+      .flatMap((event) => {
+        const nodeId = getEventNodeId(event, edges)
+        return nodeId
+          ? [{
+              nodeId,
+              actor: replayActorLabel(event.actor),
+              description: describeEvent(event, nodes, edges),
+            }]
+          : []
+      })
+      .filter(
+        (step, index, all) =>
+          all.findIndex((candidate) => candidate.nodeId === step.nodeId) === index,
+      )
       .slice(-6)
 
     setReplayProgress(
-      recentNodeIds.length > 0
-        ? { step: 1, total: recentNodeIds.length }
+      replaySteps.length > 0
+        ? { step: 1, total: replaySteps.length }
         : null,
     )
-    setReplaying(recentNodeIds.length > 0)
+    setReplaying(replaySteps.length > 0)
 
-    for (const [index, nodeId] of recentNodeIds.entries()) {
+    for (const [index, step] of replaySteps.entries()) {
       if (replayGeneration.current !== generation) return
-      setReplayProgress({ step: index + 1, total: recentNodeIds.length })
-      setHighlights([nodeId])
-      const point = positions[nodeId]
+      setReplayProgress({ step: index + 1, total: replaySteps.length })
+      setReplayCaption({ actor: step.actor, description: step.description })
+      setHighlights([step.nodeId])
+      const point = positions[step.nodeId]
       if (point) {
         void setCenter(point.x + 122, point.y + 71, {
           zoom: 0.95,
@@ -584,6 +638,7 @@ function MissionBoard() {
       replayActive.current = false
       setHighlights([])
       setReplayProgress(null)
+      setReplayCaption(null)
       setReplaying(false)
     }
   }
@@ -609,17 +664,29 @@ function MissionBoard() {
 
   async function copyAgentPrompt(prompt: string) {
     const copied = await copyText(prompt)
-    useMissionStore
-      .getState()
-      .showToast(
-        copied ? 'Agent prompt copied' : 'Copy this agent prompt manually',
-        'info',
-        copied ? 'Paste it into your browser agent' : prompt,
-      )
+    if (!copied) {
+      useMissionStore
+        .getState()
+        .showToast('Copy this agent prompt manually', 'info', prompt)
+      return
+    }
+    if (promptCopyTimer.current !== null) {
+      window.clearTimeout(promptCopyTimer.current)
+    }
+    setCopiedPrompt(prompt)
+    promptCopyTimer.current = window.setTimeout(() => {
+      setCopiedPrompt((current) => (current === prompt ? null : current))
+      promptCopyTimer.current = null
+    }, 2_000)
   }
 
   function dismissAgentPrompts() {
     if (projectId) dismissFirstRunPrompts(projectId)
+    if (promptCopyTimer.current !== null) {
+      window.clearTimeout(promptCopyTimer.current)
+      promptCopyTimer.current = null
+    }
+    setCopiedPrompt(null)
     setFirstRunOpen(false)
     setFirstRunMenuOpen(false)
   }
@@ -693,9 +760,15 @@ function MissionBoard() {
                   className="agent-prompt-chip"
                   onClick={() => void copyAgentPrompt(prompt)}
                 >
-                  {prompt}
+                  <span className="agent-prompt-copy">Copy</span>
+                  <span>{prompt}</span>
                 </button>
               ))}
+              {copiedPrompt && (
+                <span className="agent-prompt-confirmation" role="status">
+                  Copied — paste it to your agent
+                </span>
+              )}
             </div>
             <button
               type="button"
@@ -744,22 +817,34 @@ function MissionBoard() {
           />
           <Controls showInteractive={false} position="bottom-left" />
         </ReactFlow>
+        {replayCaption && (
+          <div className="replay-caption" role="status">
+            <strong>{replayCaption.actor}</strong>
+            <span>{replayCaption.description}</span>
+          </div>
+        )}
         <div className="canvas-legend">
           <span><i className="legend-line legend-line--critical" />Critical path</span>
           <span><i className="legend-line legend-line--conflict" />File conflict</span>
           <span className="hidden xl:inline">Drag to arrange · connect ports to depend · delete to tombstone</span>
         </div>
-        <FlightPanel now={correctedNow} />
+        {connectionMode !== 'loading' && <FlightPanel now={correctedNow} />}
         {humanConfirmation && (
-          <section className="structural-confirm" role="dialog" aria-modal="true">
+          <section
+            className="structural-confirm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirmation-title"
+            aria-describedby="confirmation-description"
+          >
             <p className="structural-confirm-kicker">
               {humanConfirmation.kind === 'policy'
                 ? 'Human policy confirmation'
                 : 'Human action confirmation'}
             </p>
-            <h2>{humanConfirmation.title}</h2>
+            <h2 id="confirmation-title">{humanConfirmation.title}</h2>
             <div className="structural-confirm-plan">
-              <p>{humanConfirmation.text}</p>
+              <p id="confirmation-description">{humanConfirmation.text}</p>
               <ul>
                 {humanConfirmation.details.map((detail) => (
                   <li key={detail}>{detail}</li>
@@ -771,6 +856,7 @@ function MissionBoard() {
             </div>
             <div className="structural-confirm-actions">
               <button
+                ref={confirmationCancelRef}
                 type="button"
                 className="action-secondary"
                 onClick={() =>
@@ -800,10 +886,20 @@ function MissionBoard() {
           </section>
         )}
         {!humanConfirmation && structuralPreview && (
-          <section className="structural-confirm" role="dialog" aria-modal="true">
+          <section
+            className="structural-confirm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirmation-title"
+            aria-describedby="confirmation-description"
+          >
             <p className="structural-confirm-kicker">Blast-radius preview</p>
-            <h2>{structuralPreview.title}</h2>
-            {structuralPreview.notice && <p>{structuralPreview.notice}.</p>}
+            <h2 id="confirmation-title">{structuralPreview.title}</h2>
+            <p id="confirmation-description">
+              {structuralPreview.notice
+                ? `${structuralPreview.notice}.`
+                : 'Review this structural change and its blast radius before confirming.'}
+            </p>
             {structuralPreview.proposal && (
               <div className="structural-confirm-plan">
                 <p>
@@ -857,7 +953,12 @@ function MissionBoard() {
               </p>
             )}
             <div className="structural-confirm-actions">
-              <button type="button" className="action-secondary" onClick={cancelStructural}>
+              <button
+                ref={confirmationCancelRef}
+                type="button"
+                className="action-secondary"
+                onClick={cancelStructural}
+              >
                 Cancel
               </button>
               <button type="button" className="action-primary" onClick={confirmStructural}>

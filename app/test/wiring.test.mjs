@@ -208,6 +208,29 @@ test('confirmation metadata wraps without sharing the action row layout', async 
   assert.doesNotMatch(styles, /\.structural-confirm > div \{/)
 })
 
+test('judge-facing stylesheet text never drops below 10px', async () => {
+  const styles = await source('../src/index.css')
+  const undersized = [...styles.matchAll(/font-size: ([0-9.]+)px/g)]
+    .map((match) => Number(match[1]))
+    .filter((size) => size < 10)
+  assert.deepEqual(undersized, [])
+  assert.match(styles, /\.approval-facts \{[^}]*font-size: 10\.5px;/)
+  assert.match(styles, /\.structural-confirm-token \{[^}]*font-size: 10\.5px;/)
+})
+
+test('confirmation dialogs are named, described, focused, and escape-dismissible', async () => {
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  assert.equal(canvas.match(/aria-labelledby="confirmation-title"/g)?.length, 2)
+  assert.equal(canvas.match(/aria-describedby="confirmation-description"/g)?.length, 2)
+  assert.equal(canvas.match(/id="confirmation-title"/g)?.length, 2)
+  assert.equal(canvas.match(/id="confirmation-description"/g)?.length, 2)
+  assert.equal(canvas.match(/ref=\{confirmationCancelRef\}/g)?.length, 2)
+  assert.match(canvas, /confirmationCancelRef\.current\?\.focus\(\)/)
+  assert.match(canvas, /event\.key !== 'Escape'/)
+  assert.match(canvas, /denyHumanConfirmation\(/)
+  assert.match(canvas, /cancelStructural\(\)/)
+})
+
 test('identity recovery is source-aware and realtime resumes with fenced backoff', async () => {
   const client = await source('../src/transport/client.ts')
   const linkedBranch = client.slice(
@@ -287,6 +310,32 @@ test('WebMCP cursor and bootstrap retries are project-scoped', async () => {
   assert.match(client, /initialization = null/)
   assert.match(client, /export function reconnectMission\(\)/)
   assert.match(pulse, />\s*Reconnect\s*</)
+})
+
+test('mission bootstrap requests time out and loading hides fixture flight cards', async () => {
+  const client = await source('../src/transport/client.ts')
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  const cloneDemo = client.slice(
+    client.indexOf('async function cloneDemo()'),
+    client.indexOf('function storedIdentity()'),
+  )
+  const snapshot = client.slice(
+    client.indexOf('async function getSnapshot'),
+    client.indexOf('async function issueBrowserSession'),
+  )
+  const browserSession = client.slice(
+    client.indexOf('async function issueBrowserSession'),
+    client.indexOf('function activeBrowserSession'),
+  )
+  assert.match(client, /const BOOTSTRAP_TIMEOUT_MS = 20_000/)
+  for (const request of [cloneDemo, snapshot, browserSession]) {
+    assert.match(request, /signal: AbortSignal\.timeout\(BOOTSTRAP_TIMEOUT_MS\)/)
+  }
+  assert.match(client, /catch \(error\) \{\s*enterFixtureWithRetry\(error\)/)
+  assert.match(
+    canvas,
+    /connectionMode !== 'loading' && <FlightPanel now=\{correctedNow\} \/>/,
+  )
 })
 
 test('WebMCP discovery starts in parallel with mission-client initialization', async () => {
@@ -390,11 +439,15 @@ test('judge first-run prompts and WebMCP guidance are wired into the canvas', as
   assert.match(canvas, /claimFirstRunPrompts\(projectId\)/)
   assert.match(canvas, /dismissFirstRunPrompts\(projectId\)/)
   assert.match(canvas, /copyText\(prompt\)/)
+  assert.match(canvas, /className="agent-prompt-copy">Copy</)
+  assert.match(canvas, /Copied — paste it to your agent/)
+  assert.match(canvas, /}, 2_000\)/)
   assert.match(pulse, /aria-label="Show agent prompt suggestions"/)
-  assert.match(
+  assert.doesNotMatch(
     styles,
     /first-run-prompts:not\(\.first-run-prompts--menu-open\) \{ display: none; \}/,
   )
+  assert.match(styles, /\.first-run-prompts > div \{ display: grid; \}/)
   assert.match(canvas, /ChatGPT&apos;s built-in browser works natively/)
   assert.match(canvas, /Enable site tools/)
   assert.match(canvas, /chrome:\/\/flags\/#enable-webmcp-testing/)
@@ -503,10 +556,15 @@ test('canvas gates first paint and replays changes with visible cancellable paci
   assert.match(replay, /duration: reducedMotion \? 0 : 420/)
   assert.match(replay, /await waitForReplay\(420\)/)
   assert.match(replay, /await waitForReplay\(900\)/)
+  assert.match(replay, /description: describeEvent\(event, nodes, edges\)/)
+  assert.match(replay, /actor: replayActorLabel\(event\.actor\)/)
+  assert.match(replay, /setReplayCaption\(\{ actor: step\.actor, description: step\.description \}\)/)
   assert.match(canvas, /canvas--replaying/)
   assert.match(canvas, /mission-flow-node--replay-focus/)
+  assert.match(canvas, /className="replay-caption" role="status"/)
   assert.match(styles, /canvas--replaying \.react-flow__node,/)
   assert.match(styles, /mission-flow-node--replay-focus/)
+  assert.match(styles, /\.replay-caption \{[^}]*position: absolute;/)
   assert.match(pulse, /Replaying changes · \$\{replayProgress\.step\}\/\$\{replayProgress\.total\}/)
   assert.match(pulse, /Recent changes/)
   assert.match(pulse, /useMissionStore\(selectReplaySequenceLength\)/)
