@@ -774,7 +774,7 @@ function MissionBoard() {
           <span><i className="legend-line legend-line--conflict" />File conflict</span>
           <span className="hidden xl:inline">Drag to arrange · connect ports to depend · delete to tombstone</span>
         </div>
-        <FlightPanel now={correctedNow} />
+        {connectionMode !== 'loading' && <FlightPanel now={correctedNow} />}
         {humanConfirmation && (
           <section
             className="structural-confirm"

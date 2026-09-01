@@ -39,6 +39,7 @@ import {
 
 const IDENTITY_KEY = 'missiongraph.visitor-identity'
 const fixtureSessionId = crypto.randomUUID()
+const BOOTSTRAP_TIMEOUT_MS = 20_000
 
 interface CloneResponse extends ClientIdentity {
   cursor: string
@@ -341,7 +342,10 @@ async function valueHash(value: unknown) {
 
 async function cloneDemo() {
   return jsonResponse<CloneResponse>(
-    await fetch(endpoint('/api/clone-demo'), { method: 'POST' }),
+    await fetch(endpoint('/api/clone-demo'), {
+      method: 'POST',
+      signal: AbortSignal.timeout(BOOTSTRAP_TIMEOUT_MS),
+    }),
   )
 }
 
@@ -386,7 +390,10 @@ async function getSnapshot(client = identity) {
   }
   const response = await fetch(
     endpoint(`/api/p/${encodeURIComponent(resolved.project)}/snapshot`),
-    { headers: { 'x-mg-token': resolved.token } },
+    {
+      headers: { 'x-mg-token': resolved.token },
+      signal: AbortSignal.timeout(BOOTSTRAP_TIMEOUT_MS),
+    },
   )
   const receivedAt = Date.now()
   const snapshot = await jsonResponse<SnapshotResponse>(response)
@@ -405,6 +412,7 @@ async function issueBrowserSession(candidate: ActiveIdentity) {
       {
         method: 'POST',
         headers: { 'x-mg-token': candidate.client.token },
+        signal: AbortSignal.timeout(BOOTSTRAP_TIMEOUT_MS),
       },
     ),
   )

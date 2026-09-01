@@ -302,6 +302,32 @@ test('WebMCP cursor and bootstrap retries are project-scoped', async () => {
   assert.match(pulse, />\s*Reconnect\s*</)
 })
 
+test('mission bootstrap requests time out and loading hides fixture flight cards', async () => {
+  const client = await source('../src/transport/client.ts')
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  const cloneDemo = client.slice(
+    client.indexOf('async function cloneDemo()'),
+    client.indexOf('function storedIdentity()'),
+  )
+  const snapshot = client.slice(
+    client.indexOf('async function getSnapshot'),
+    client.indexOf('async function issueBrowserSession'),
+  )
+  const browserSession = client.slice(
+    client.indexOf('async function issueBrowserSession'),
+    client.indexOf('function activeBrowserSession'),
+  )
+  assert.match(client, /const BOOTSTRAP_TIMEOUT_MS = 20_000/)
+  for (const request of [cloneDemo, snapshot, browserSession]) {
+    assert.match(request, /signal: AbortSignal\.timeout\(BOOTSTRAP_TIMEOUT_MS\)/)
+  }
+  assert.match(client, /catch \(error\) \{\s*enterFixtureWithRetry\(error\)/)
+  assert.match(
+    canvas,
+    /connectionMode !== 'loading' && <FlightPanel now=\{correctedNow\} \/>/,
+  )
+})
+
 test('WebMCP discovery starts in parallel with mission-client initialization', async () => {
   const app = await source('../src/App.tsx')
   const registry = await source('../src/webmcp/registry.ts')
