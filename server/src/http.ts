@@ -36,6 +36,11 @@ export interface ServerOptions {
   fleetDailyCap?: number;
   fleetPerProjectCap?: number;
   fleetAdoptTtlMin?: number;
+  cloneDemoHourlyCap?: number;
+  browserSessionHourlyCap?: number;
+  actionDraftHourlyCap?: number;
+  fleetEnqueueHourlyCap?: number;
+  fleetGlobalDailyCap?: number;
   logger?: boolean;
 }
 
@@ -399,6 +404,90 @@ function positiveInteger(value: number | string | undefined, fallback: number, n
   return parsed;
 }
 
+interface TokenBucketState {
+  tokens: number;
+  updatedAt: number;
+}
+
+class TokenBucket {
+  private readonly buckets = new Map<string, TokenBucketState>();
+
+  constructor(
+    private readonly capacity: number,
+    private readonly refillWindowMs: number,
+  ) {}
+
+  private state(key: string, at: number): TokenBucketState {
+    const existing = this.buckets.get(key);
+    if (!existing) {
+      const created = { tokens: this.capacity, updatedAt: at };
+      this.buckets.set(key, created);
+      return created;
+    }
+    const elapsed = Math.max(0, at - existing.updatedAt);
+    existing.tokens = Math.min(
+      this.capacity,
+      existing.tokens + elapsed * this.capacity / this.refillWindowMs,
+    );
+    existing.updatedAt = Math.max(existing.updatedAt, at);
+    return existing;
+  }
+
+  consume(key: string, at: number): { allowed: true } | { allowed: false; retryAfter: number } {
+    const state = this.state(key, at);
+    if (state.tokens >= 1) {
+      state.tokens -= 1;
+      return { allowed: true };
+    }
+    const waitMs = (1 - state.tokens) * this.refillWindowMs / this.capacity;
+    return { allowed: false, retryAfter: Math.max(1, Math.ceil(waitMs / 1_000)) };
+  }
+
+  refund(key: string, at: number): void {
+    const state = this.state(key, at);
+    state.tokens = Math.min(this.capacity, state.tokens + 1);
+  }
+}
+
+class DailyCounter {
+  private dayStart = -1;
+  private used = 0;
+
+  constructor(private readonly capacity: number) {}
+
+  consume(at: number): { allowed: true } | { allowed: false; retryAfter: number } {
+    const dayStart = Math.floor(at / (24 * 60 * 60_000)) * 24 * 60 * 60_000;
+    if (dayStart !== this.dayStart) {
+      this.dayStart = dayStart;
+      this.used = 0;
+    }
+    if (this.used < this.capacity) {
+      this.used += 1;
+      return { allowed: true };
+    }
+    return {
+      allowed: false,
+      retryAfter: Math.max(1, Math.ceil((dayStart + 24 * 60 * 60_000 - at) / 1_000)),
+    };
+  }
+
+  refund(at: number): void {
+    const dayStart = Math.floor(at / (24 * 60 * 60_000)) * 24 * 60 * 60_000;
+    if (dayStart === this.dayStart && this.used > 0) this.used -= 1;
+  }
+}
+
+function rateLimitReply(
+  reply: FastifyReply,
+  code: string,
+  retryAfter: number,
+): FastifyReply {
+  return reply
+    .header("retry-after", String(retryAfter))
+    .code(429)
+    .send({ error: { code, message: "Rate limit exceeded. Retry later." } });
+}
+
 function fleetRequestResponse(request: FleetRequest, position?: number): Record<string, unknown> {
   return {
     id: request.id,
@@ -538,6 +627,31 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
   const fleetAdoptTtlMin = fleetMode
     ? positiveInteger(options.fleetAdoptTtlMin ?? process.env.FLEET_ADOPT_TTL_MIN, 20, "FLEET_ADOPT_TTL_MIN")
     : 20;
+  const cloneDemoHourlyCap = positiveInteger(
+    options.cloneDemoHourlyCap ?? process.env.CLONE_DEMO_HOURLY_CAP,
+    30,
+    "CLONE_DEMO_HOURLY_CAP",
+  );
+  const browserSessionHourlyCap = positiveInteger(
+    options.browserSessionHourlyCap ?? process.env.BROWSER_SESSION_HOURLY_CAP,
+    60,
+    "BROWSER_SESSION_HOURLY_CAP",
+  );
+  const actionDraftHourlyCap = positiveInteger(
+    options.actionDraftHourlyCap ?? process.env.ACTION_DRAFT_HOURLY_CAP,
+    120,
+    "ACTION_DRAFT_HOURLY_CAP",
+  );
+  const fleetEnqueueHourlyCap = positiveInteger(
+    options.fleetEnqueueHourlyCap ?? process.env.FLEET_ENQUEUE_HOURLY_CAP,
+    3,
+    "FLEET_ENQUEUE_HOURLY_CAP",
+  );
+  const fleetGlobalDailyCap = positiveInteger(
+    options.fleetGlobalDailyCap ?? process.env.FLEET_GLOBAL_DAILY_CAP,
+    20,
+    "FLEET_GLOBAL_DAILY_CAP",
+  );
   const fixtureSeedProjectId = "demo-seed";
   const allowedOrigins = new Set(
     options.allowedOrigins ??
@@ -554,7 +668,12 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     adoptTtlMin: fleetAdoptTtlMin,
     id,
   });
-  const app = Fastify({ logger: options.logger ?? false });
+  const cloneDemoLimiter = new TokenBucket(cloneDemoHourlyCap, 60 * 60_000);
+  const browserSessionLimiter = new TokenBucket(browserSessionHourlyCap, 60 * 60_000);
+  const actionDraftLimiter = new TokenBucket(actionDraftHourlyCap, 60 * 60_000);
+  const fleetEnqueueLimiter = new TokenBucket(fleetEnqueueHourlyCap, 60 * 60_000);
+  const fleetGlobalLimiter = new DailyCounter(fleetGlobalDailyCap);
+  const app = Fastify({ logger: options.logger ?? false, trustProxy: 1 });
 
   app.addHook("onRequest", async (request, reply) => {
     const origin = textHeader(request.headers.origin);
@@ -597,7 +716,24 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       if (typeof body.node_id !== "string" || body.node_id.length === 0) {
         throw new EventValidationError("node_id must not be empty");
       }
-      const result = fleet.enqueue(project, body.node_id, now());
+      const requestTime = now();
+      const perIpLimit = fleetEnqueueLimiter.consume(request.ip, requestTime.getTime());
+      if (!perIpLimit.allowed) {
+        return rateLimitReply(reply, "fleet_enqueue_rate_limited", perIpLimit.retryAfter);
+      }
+      const globalLimit = fleetGlobalLimiter.consume(requestTime.getTime());
+      if (!globalLimit.allowed) {
+        fleetEnqueueLimiter.refund(request.ip, requestTime.getTime());
+        return rateLimitReply(reply, "fleet_global_rate_limited", globalLimit.retryAfter);
+      }
+      let result: ReturnType<FleetQueue["enqueue"]>;
+      try {
+        result = fleet.enqueue(project, body.node_id, requestTime);
+      } catch (error) {
+        fleetEnqueueLimiter.refund(request.ip, requestTime.getTime());
+        fleetGlobalLimiter.refund(requestTime.getTime());
+        throw error;
+      }
       return reply.send({ id: result.request.id, status: "queued", position: result.position });
     } catch (error) {
       return errorReply(error, reply);
@@ -671,6 +807,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
     try {
       const createdAt = now();
+      const limit = browserSessionLimiter.consume(request.ip, createdAt.getTime());
+      if (!limit.allowed) {
+        return rateLimitReply(reply, "browser_session_rate_limited", limit.retryAfter);
+      }
       const session = store.issueBrowserSession({
         id: id(),
         token: id(),
@@ -773,6 +913,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       const body = record(request.body, "body");
       const mutation = record(body.mutation, "mutation");
       const createdAt = now();
+      const limit = actionDraftLimiter.consume(request.ip, createdAt.getTime());
+      if (!limit.allowed) {
+        return rateLimitReply(reply, "action_draft_rate_limited", limit.retryAfter);
+      }
       const sessionId = requiredBrowserSession(store, request, project, createdAt.toISOString());
       let inputs: EventInput[];
       if (mutation.batch !== undefined) {
@@ -822,6 +966,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
     try {
       const confirmedAt = now().toISOString();
+      const limit = actionDraftLimiter.consume(request.ip, Date.parse(confirmedAt));
+      if (!limit.allowed) {
+        return rateLimitReply(reply, "action_draft_rate_limited", limit.retryAfter);
+      }
       const sessionId = requiredBrowserSession(store, request, project, confirmedAt);
       const capability = store.confirmHumanDraft({
         projectId: project,
@@ -1104,11 +1252,15 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     }
   });
 
-  app.post("/api/clone-demo", async (_request, reply) => {
-    const project = id();
-    const token = id();
+  app.post("/api/clone-demo", async (request, reply) => {
     const created = now();
     try {
+      const limit = cloneDemoLimiter.consume(request.ip, created.getTime());
+      if (!limit.allowed) {
+        return rateLimitReply(reply, "clone_demo_rate_limited", limit.retryAfter);
+      }
+      const project = id();
+      const token = id();
       let sourceProjectId = fixtureSeedProjectId;
       if (configuredSeedProjectId) {
         if (store.hasProject(configuredSeedProjectId)) {
