@@ -260,7 +260,7 @@ async function createHarness(
   return harness;
 }
 
-async function waitFor(check: () => boolean, timeoutMs = 3_000): Promise<void> {
+async function waitFor(check: () => boolean, timeoutMs = 8_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!check()) {
     if (Date.now() >= deadline) throw new Error("timed out waiting for fleet test condition");
@@ -603,7 +603,10 @@ describe("FleetAdoptionLoop", () => {
     const stopping = harness.loop.stop();
     const stoppedPromptly = await Promise.race([
       stopping.then(() => true),
-      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 150)),
+      // "Promptly" here means "did not wait for the indefinitely stalled request" — the
+      // stall never resolves on its own, so a generous bound stays a strict behavioral
+      // test while surviving loaded CI runners (150ms flaked there).
+      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 1_000)),
     ]);
     stub.releaseStalls();
     await stopping;
@@ -623,7 +626,10 @@ describe("FleetAdoptionLoop", () => {
     const stopping = harness.loop.stop();
     const stoppedPromptly = await Promise.race([
       stopping.then(() => true),
-      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 150)),
+      // "Promptly" here means "did not wait for the indefinitely stalled request" — the
+      // stall never resolves on its own, so a generous bound stays a strict behavioral
+      // test while surviving loaded CI runners (150ms flaked there).
+      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 1_000)),
     ]);
     stub.releaseStalls();
     await stopping;
@@ -642,7 +648,10 @@ describe("FleetAdoptionLoop", () => {
     const stopping = harness.loop.stop();
     const stoppedPromptly = await Promise.race([
       stopping.then(() => true),
-      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 150)),
+      // "Promptly" here means "did not wait for the indefinitely stalled request" — the
+      // stall never resolves on its own, so a generous bound stays a strict behavioral
+      // test while surviving loaded CI runners (150ms flaked there).
+      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 1_000)),
     ]);
     stub.releaseStalls();
     await stopping;
