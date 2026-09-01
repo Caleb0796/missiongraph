@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://missiongraph.local/evals/webmcp/result.schema.json",
+  "title": "MissionGraph WebMCP evaluation result",
+  "type": "object",
+  "required": [
+    "run_id",
+    "case_id",
+    "model",
+    "reasoning",
+    "source_commit",
+    "environment",
+    "browser_version",
+    "viewport",
+    "discovered_tools",
+    "tool_calls",
+    "event_assertions",
+    "ui_assertions",
+    "console_errors",
+    "failed_requests",
+    "screenshots",
+    "final_answer",
+    "graders",
+    "verdict",
+    "notes"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "case_id": { "type": "string", "minLength": 1 },
+    "repetition": { "type": "integer", "minimum": 1 },
+    "model": { "const": "gpt-5.6-sol" },
+    "reasoning": { "const": "high" },
+    "source_commit": { "type": "string", "minLength": 7 },
+    "environment": {
+      "enum": ["local", "iab-native", "chrome-stable", "production"]
+    },
+    "browser_version": { "type": "string" },
+    "viewport": { "type": "string" },
+    "project_id": { "type": "string" },
+    "pre_cursor": { "type": "integer", "minimum": 0 },
+    "post_cursor": { "type": "integer", "minimum": 0 },
+    "discovered_tools": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string" }
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/toolCall" }
+    },
+    "event_assertions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/eventAssertion" }
+    },
+    "ui_assertions": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "console_errors": { "$ref": "#/$defs/stringArray" },
+    "failed_requests": { "$ref": "#/$defs/stringArray" },
+    "screenshots": { "$ref": "#/$defs/stringArray" },
+    "final_answer": { "type": "string" },
+    "graders": {
+      "type": "object",
+      "properties": {
+        "protocol_discovery": { "type": "boolean" },
+        "state_function": { "type": "boolean" },
+        "hitl_security": { "type": "boolean" },
+        "recovery_compat": { "type": "boolean" },
+        "final_answer_evidence": { "type": "boolean" },
+        "envelope_valid": { "type": "boolean" },
+        "production_real_commit_verified": { "type": "boolean" },
+        "hard_failures": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "verdict": {
+      "enum": ["PASS", "FAIL", "BLOCKED", "EXPECTED_UNSUPPORTED"]
+    },
+    "notes": { "$ref": "#/$defs/stringArray" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "stringArray": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "toolCall": {
+      "type": "object",
+      "required": [
+        "index",
+        "name",
+        "redacted_args",
+        "args_sha256",
+        "result_ok"
+      ],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string" },
+        "redacted_args": { "type": "object" },
+        "args_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "result_ok": { "type": "boolean" },
+        "cursor": { "type": "integer", "minimum": 0 },
+        "error_code": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "eventAssertion": {
+      "type": "object",
+      "required": ["seq", "type", "actor"],
+      "properties": {
+        "seq": { "type": "integer", "minimum": 0 },
+        "type": { "type": "string" },
+        "actor": { "type": "string" },
+        "policy_ref": { "type": "string" },
+        "authorization": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

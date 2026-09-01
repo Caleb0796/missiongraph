@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <link rel="icon" href="data:," />
+    <title>WebMCP signed-submission eval fixture</title>
+    <style>
+      :root {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: #e8edf5;
+        background: #09111b;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+
+      main {
+        width: min(760px, 100%);
+        border: 1px solid #314154;
+        border-radius: 16px;
+        padding: 24px;
+        background: #0d1825;
+        box-shadow: 0 24px 80px rgb(0 0 0 / 35%);
+      }
+
+      h1 {
+        margin: 0 0 10px;
+        font: 600 clamp(22px, 4vw, 34px) ui-sans-serif, system-ui, sans-serif;
+      }
+
+      p,
+      li {
+        color: #aebdd0;
+        line-height: 1.55;
+      }
+
+      code,
+      pre {
+        overflow-wrap: anywhere;
+      }
+
+      .warning {
+        border: 1px solid #8d6a24;
+        border-radius: 10px;
+        padding: 12px;
+        color: #ffd479;
+        background: #211a0e;
+      }
+
+      .facts {
+        display: grid;
+        gap: 8px;
+        margin: 20px 0;
+      }
+
+      .fact {
+        display: grid;
+        grid-template-columns: 170px minmax(0, 1fr);
+        gap: 12px;
+      }
+
+      button {
+        border: 1px solid #4e7399;
+        border-radius: 8px;
+        padding: 10px 16px;
+        color: #f4f8fc;
+        background: #183551;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      button:focus-visible {
+        outline: 3px solid #6fcaff;
+        outline-offset: 3px;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      button.secondary {
+        margin-left: 8px;
+        background: transparent;
+      }
+
+      pre {
+        min-height: 170px;
+        padding: 14px;
+        border-radius: 10px;
+        color: #b7d5ed;
+        background: #07101a;
+        white-space: pre-wrap;
+      }
+
+      #runtime-status[data-state='ready'] {
+        color: #69e5b3;
+      }
+
+      #runtime-status[data-state='missing'] {
+        color: #ffbd67;
+      }
+
+      @media (max-width: 560px) {
+        .fact {
+          grid-template-columns: 1fr;
+          gap: 2px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Signed submission eval fixture</h1>
+      <p class="warning">
+        Eval-only local fixture. The commit below is synthetic; this page is not
+        part of MissionGraph production and must never be presented as a real Git
+        claim.
+      </p>
+      <p>
+        First call <code>submission</code> before signing and observe
+        <code>signature_required</code>. A human must then use the visible Sign
+        button. Only after that, give the model the “I have signed” prompt.
+      </p>
+      <div class="facts" aria-label="Fixture constants">
+        <div class="fact"><strong>submission_id</strong><code>sub-eval-001</code></div>
+        <div class="fact"><strong>commit_sha</strong><code>0123456789abcdef0123456789abcdef01234567</code></div>
+        <div class="fact"><strong>signer</strong><code>human:eval-signer via native-ui</code></div>
+        <div class="fact"><strong>WebMCP</strong><span id="runtime-status">checking…</span></div>
+      </div>
+      <p>
+        <button id="sign" type="button">Sign submission</button>
+        <button id="reset" type="button" class="secondary">Reset fixture</button>
+      </p>
+      <h2>Server state</h2>
+      <pre id="state" aria-live="polite">Loading…</pre>
+    </main>
+    <script type="module" src="/fixture.js"></script>
+  </body>
+</html>

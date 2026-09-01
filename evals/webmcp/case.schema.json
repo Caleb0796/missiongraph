@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://missiongraph.local/evals/webmcp/case.schema.json",
+  "title": "MissionGraph WebMCP evaluation case",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "priority",
+    "class",
+    "environments",
+    "locale",
+    "fixture",
+    "prompt",
+    "preconditions",
+    "allowed_tools",
+    "forbidden_tools",
+    "expected_calls",
+    "state_assertions",
+    "ui_assertions",
+    "answer_assertions",
+    "cleanup",
+    "repetitions"
+  ],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[A-Z0-9][A-Z0-9_-]+$" },
+    "title": { "type": "string", "minLength": 1 },
+    "priority": { "enum": ["P0", "P1", "P2"] },
+    "class": { "type": "string", "minLength": 1 },
+    "environments": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": ["local", "iab-native", "chrome-stable", "production"]
+      }
+    },
+    "locale": { "enum": ["en", "zh", "mixed"] },
+    "fixture": { "type": "string", "minLength": 1 },
+    "prompt": { "type": "string", "minLength": 1 },
+    "preconditions": { "$ref": "#/$defs/nonEmptyStringArray" },
+    "allowed_tools": { "$ref": "#/$defs/stringArray" },
+    "forbidden_tools": { "$ref": "#/$defs/stringArray" },
+    "expected_calls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/expectedCall" }
+    },
+    "human_gate": { "$ref": "#/$defs/humanGate" },
+    "state_assertions": { "$ref": "#/$defs/assertionArray" },
+    "ui_assertions": { "$ref": "#/$defs/assertionArray" },
+    "answer_assertions": { "$ref": "#/$defs/assertionArray" },
+    "cleanup": { "$ref": "#/$defs/nonEmptyStringArray" },
+    "repetitions": { "type": "integer", "minimum": 1 },
+    "tool": { "type": "string" },
+    "variant": { "type": "string" },
+    "source_case": { "type": "string", "pattern": "^[A-K]-[0-9]{2}$" },
+    "expected_verdict": {
+      "enum": ["PASS", "FAIL", "BLOCKED", "EXPECTED_UNSUPPORTED"]
+    },
+    "allow_blocked": { "type": "boolean" },
+    "tags": { "$ref": "#/$defs/stringArray" },
+    "viewport": { "type": "string" },
+    "zoom": { "type": "number", "exclusiveMinimum": 0 }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "stringArray": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "nonEmptyStringArray": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "assertionArray": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": true
+      }
+    },
+    "expectedCall": {
+      "type": "object",
+      "required": ["name", "min", "max", "args_matcher"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "min": { "type": "integer", "minimum": 0 },
+        "max": { "type": "integer", "minimum": 0 },
+        "args_matcher": { "type": "object" },
+        "after": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "humanGate": {
+      "type": "object",
+      "required": ["after_call", "action"],
+      "properties": {
+        "after_call": { "type": "string" },
+        "action": { "enum": ["confirm", "deny", "sign"] }
+      },
+      "additionalProperties": false
+    }
+  }
+}

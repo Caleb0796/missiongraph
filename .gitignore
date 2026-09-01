@@ -13,3 +13,4 @@ bridge/state.json
 bridge/state.json.lock
 bridge/state.json.*.tmp
 bridge/state.json.corrupt-*
+output/playwright/webmcp-eval/
