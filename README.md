@@ -20,7 +20,7 @@ Parallel agent fleets are fast — and illegible. A linear chat loop is legible 
  human ──── canvas UI (React Flow + elkjs) ────┐
                                                │ WS / HTTP (event-sourced)
  browser agent (ChatGPT / any WebMCP client)   │
-   └── 25 always-on + up to 5 contextual WebMCP tools ──► server (Node 22 · Fastify · SQLite)
+   └── 25 core always-on + 5 state-aware contextual tools ──► server (Node 22 · Fastify · SQLite)
                                                │      append-only event ledger
                                                │      fold reducer · digest ranking
  Codex fleet ── bridge daemon ── SSE + `codex exec resume`
@@ -30,7 +30,7 @@ Parallel agent fleets are fast — and illegible. A linear chat loop is legible 
 
 - **One event ledger** is the single source of truth. Every actor is labeled (`human`, `browser_agent`, `supervisor`, `worker:<id>`); every state you see is a fold of the ledger; any client resumes from any cursor.
 - **Digest pattern**: every tool result carries `cursor` + `changes_since`, so a browser agent that was away five minutes is fully caught up by its next call — the page never needs to wake it.
-- **Supervisor = brain, server = hands**: the Codex supervisor only ever emits structured decisions (spawn / pause / rebrief / note); the bridge executes them mechanically, so *every scheduling decision is an auditable recorded turn*.
+- **Supervisor = brain, server = hands**: the Codex supervisor only ever emits structured decisions (spawn / pause / resume / rebrief / kill / note); the bridge executes them mechanically, so *every scheduling decision is an auditable recorded turn*.
 - **Audit-first UX**: nodes and edges open into dossiers (Brief / Handoff / Deviations / Decisions / Log — prose first, never bare IDs). Workers must file structured handoffs; deviations feed the rewire radar; everything else lands in the project journal.
 - **Real history only (C5)**: the demo seed every visitor clones is an export of a *real* run — actual Codex workers, actual commits, actual approvals. Nothing is fabricated.
 
@@ -65,7 +65,7 @@ pnpm dev
 
 ## Testing
 
-251 tests across the three packages (CI runs them on every push):
+251 tests across the three packages (CI runs them on pushes to `main`/`track/**` and on pull requests):
 
 ```sh
 cd server && pnpm test   # 69 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, and the fleet queue

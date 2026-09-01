@@ -58,7 +58,7 @@ Flip `BRIDGE_ENABLED=1` **last**, after every other variable is in place: while 
 
 ### Judge fleet (a clone may borrow the bridge for ONE human-confirmed, template-bound task)
 
-Set `FLEET_MODE=1` on the same service to open the fleet routes and the bridge's adoption loop; `FLEET_DAILY_CAP`, `FLEET_PER_PROJECT_CAP`, `FLEET_ADOPT_TTL_MIN` and `FLEET_RUN_TTL_MIN` carry the defaults declared in `render.yaml`. With `FLEET_MODE` unset or `0` every fleet route returns `fleet_disabled` and the bridge never polls, so the merged code is inert.
+Set `FLEET_MODE=1` on the same service to open the fleet routes and the bridge's adoption loop; `FLEET_DAILY_CAP`, `FLEET_PER_PROJECT_CAP`, `FLEET_ADOPT_TTL_MIN` and `FLEET_RUN_TTL_MIN` carry the defaults declared in `render.yaml`. With `FLEET_MODE` unset or `0`, the status route reports `enabled: false`, request and worker routes return `fleet_disabled`, and the bridge never polls, so the merged code is inert.
 
 Worst-case spend is bounded by `FLEET_DAILY_CAP` × judging days. Set a hard spend limit on the API key itself as well — that limit is the only backstop that does not depend on this code being correct.
 
