@@ -22,6 +22,8 @@ describe("CodexClient", () => {
         CODEX_HOME: "/home/test/.codex",
         CODEX_API_KEY: "codex-provider",
         OPENAI_API_KEY: "openai-provider",
+        OPENAI_BASE_URL: "https://api.example.test/v1",
+        OPENAI_ACCESS_TOKEN: "openai-token",
         SSL_CERT_FILE: "/certs/root.pem",
         NODE_EXTRA_CA_CERTS: "/certs/extra.pem",
         HTTPS_PROXY: "http://proxy.test",
@@ -36,14 +38,15 @@ describe("CodexClient", () => {
       PATH: "/usr/bin:/bin",
       HOME: "/home/test",
       CODEX_HOME: "/home/test/.codex",
-      CODEX_API_KEY: "codex-provider",
-      OPENAI_API_KEY: "openai-provider",
+      OPENAI_BASE_URL: "https://api.example.test/v1",
       SSL_CERT_FILE: "/certs/root.pem",
       NODE_EXTRA_CA_CERTS: "/certs/extra.pem",
       HTTPS_PROXY: "http://proxy.test",
       MG_REPORT_URL: "http://127.0.0.1/report",
       MG_NODE_ID: "node-a",
     });
+    expect(environment.OPENAI_API_KEY).toBeUndefined();
+    expect(environment.OPENAI_BASE_URL).toBe("https://api.example.test/v1");
 
     const root = await mkdtemp(join(tmpdir(), "missiongraph-codex-env-"));
     const previous = {
@@ -134,18 +137,28 @@ describe("CodexClient", () => {
     expect(retained.endsWith("tail")).toBe(true);
   });
 
-  it("resume invocations never pass -s: codex exec resume only accepts sandbox_mode via -c", async () => {
+  it("applies the shell secret filter to every invocation and keeps resume sandbox config-compatible", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-codex-args-"));
     try {
       const bridgeConfig = config(root);
       const client = new CodexClient(bridgeConfig, new TestLogger(), true) as unknown as {
+        supervisorStartArgs(brief: string): string[];
+        workerStartArgs(brief: string, worktree: string): string[];
         supervisorResumeArgs(threadId: string, message: string): string[];
         workerResumeArgs(threadId: string, message: string): string[];
       };
-      for (const args of [
+      const starts = [
+        client.supervisorStartArgs("brief"),
+        client.workerStartArgs("brief", root),
+      ];
+      const resumes = [
         client.supervisorResumeArgs("thread-1", "envelope"),
         client.workerResumeArgs("thread-2", "message"),
-      ]) {
+      ];
+      for (const args of [...starts, ...resumes]) {
+        expect(args).toContain('shell_environment_policy.exclude=["*KEY*","*TOKEN*","*SECRET*"]');
+      }
+      for (const args of resumes) {
         expect(args.slice(0, 2)).toEqual(["exec", "resume"]);
         expect(args).not.toContain("-s");
         expect(args.some((argument) => argument.startsWith("sandbox_mode="))).toBe(true);
