@@ -211,6 +211,10 @@ function identifier(value: unknown, label: string): string {
   return parsed;
 }
 
+export function parseIdentifier(value: unknown, label: string): string {
+  return identifier(value, label);
+}
+
 function number(value: unknown, label: string, minimum = 0): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < minimum) {
     throw new EventValidationError(`${label} must be a finite number >= ${minimum}`);
@@ -1401,18 +1405,19 @@ export class EventStore {
     if (options.baseSeq !== undefined && options.baseSeq !== currentSeq) {
       throw new StaleSequenceError(currentSeq);
     }
+    options.authorize?.();
+    const validatedInput = parseEventInput(input);
     const event = {
       seq: currentSeq + 1,
       project_id: projectId,
       ts: options.ts ?? new Date().toISOString(),
-      ...input,
+      ...validatedInput,
     } as Event;
-    options.authorize?.();
     reduceEvent(fold(this.listEvents(projectId)), event, {
       ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
       ...(options.trustedImport === true ? { replay: true } : {}),
     });
-    const { nodeRef, edgeRef } = refs(input);
+    const { nodeRef, edgeRef } = refs(validatedInput);
     this.database
       .prepare(
         `INSERT INTO events
@@ -1461,9 +1466,10 @@ export class EventStore {
         const timestamp = options.ts ?? new Date().toISOString();
         const batchHash = createHash("sha256").update(idemKey).digest("hex");
         options.authorize?.();
+        const validatedInputs = inputs.map((input) => parseEventInput(input));
         let state = fold(this.listEvents(projectId));
         const events: Event[] = [];
-        for (const [index, input] of inputs.entries()) {
+        for (const [index, input] of validatedInputs.entries()) {
           const event = {
             seq: currentSeq + index + 1,
             project_id: projectId,

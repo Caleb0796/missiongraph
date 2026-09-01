@@ -767,6 +767,82 @@ describe("HTTP and streaming contract", () => {
     ]);
   });
 
+  it("validates capability headers and persists only grammar-valid authorization identifiers", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    for (const nodeId of ["a", "b", "c"]) seedPendingApproval(store, "project", nodeId);
+    const { grant } = await issuePolicy(app, {
+      project: "project",
+      token: "visitor-token",
+      session: "session-a",
+      proof: "proof-a",
+      maxUses: 4,
+    });
+    const approve = (
+      nodeId: string,
+      idemKey: string,
+      headers: Record<string, string>,
+    ) => app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": grant.policy_ref,
+        "x-mg-capability": grant.capability,
+        "x-mg-nonce": "unused-valid-nonce",
+        ...headers,
+      },
+      payload: {
+        type: "APPROVED",
+        payload: {
+          approval_id: `approval-${nodeId}`,
+          node_id: nodeId,
+          policy_ref: grant.policy_ref,
+        },
+        idem_key: idemKey,
+      },
+    });
+    const invalidHeaders = [
+      { headers: { "x-mg-capability-ref": "bad/value" }, label: "x-mg-capability-ref" },
+      { headers: { "x-mg-capability-ref": "r".repeat(129) }, label: "x-mg-capability-ref" },
+      { headers: { "x-mg-capability": "bad/value" }, label: "x-mg-capability" },
+      { headers: { "x-mg-capability": "t".repeat(129) }, label: "x-mg-capability" },
+      { headers: { "x-mg-nonce": "bad/value" }, label: "x-mg-nonce" },
+      { headers: { "x-mg-nonce": "n".repeat(129) }, label: "x-mg-nonce" },
+    ];
+
+    for (const [index, invalid] of invalidHeaders.entries()) {
+      const response = await approve(index < 5 ? "a" : "b", `invalid-header-${index}`, invalid.headers);
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: { code: "invalid_event", message: expect.stringContaining(invalid.label) },
+      });
+    }
+
+    const nonce = "123e4567-e89b-42d3-a456-426614174000";
+    const accepted = await approve("c", "valid-uuid-nonce", { "x-mg-nonce": nonce });
+    const uses = store.database
+      .prepare("SELECT capability_ref, nonce FROM human_capability_uses ORDER BY capability_ref, nonce")
+      .all() as unknown as { capability_ref: string; nonce: string }[];
+    const authorizations = store.listEvents("project").flatMap((event) =>
+      "authorization" in event.payload && event.payload.authorization
+        ? [event.payload.authorization]
+        : [],
+    );
+
+    expect(accepted.statusCode).toBe(200);
+    expect(uses).toEqual([{ capability_ref: grant.policy_ref, nonce }]);
+    expect(authorizations).toEqual([
+      expect.objectContaining({ capability_ref: grant.policy_ref, use_nonce: nonce }),
+    ]);
+    for (const value of uses.flatMap((use) => [use.capability_ref, use.nonce])) {
+      expect(value).toMatch(/^[A-Za-z0-9._:-]{1,128}$/);
+    }
+  });
+
   it("rejects foreign-session and foreign-project human capabilities without writes", async () => {
     const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
     for (const { project, token } of [
