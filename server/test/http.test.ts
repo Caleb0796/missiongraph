@@ -4,6 +4,7 @@ import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createServer, type MissionGraphServer, type ServerOptions } from "../src/http.js";
+import { fold } from "../src/reducer.js";
 import { baseHandoff } from "./fixtures.js";
 
 const openServers: MissionGraphServer[] = [];
@@ -280,6 +281,30 @@ describe("HTTP and streaming contract", () => {
     expect(denied.headers["access-control-allow-origin"]).toBeUndefined();
   });
 
+  it("rate limits demo clones per forwarded client IP with token refill", async () => {
+    let clock = new Date("2026-08-30T10:00:00.000Z");
+    const { app } = server({ cloneDemoHourlyCap: 2, now: () => clock });
+    const clone = (ip: string) => app.inject({
+      method: "POST",
+      url: "/api/clone-demo",
+      headers: { "x-forwarded-for": ip },
+    });
+
+    const first = await clone("203.0.113.10");
+    const second = await clone("203.0.113.10");
+    const limited = await clone("203.0.113.10");
+    const otherIp = await clone("203.0.113.11");
+    clock = new Date("2026-08-30T10:30:00.000Z");
+    const refilled = await clone("203.0.113.10");
+    const spoofedEarlierHop = await clone("198.51.100.99, 203.0.113.10");
+
+    expect([first.statusCode, second.statusCode, otherIp.statusCode, refilled.statusCode]).toEqual([200, 200, 200, 200]);
+    expect(limited.statusCode).toBe(429);
+    expect(limited.headers["retry-after"]).toBe("1800");
+    expect(limited.json()).toMatchObject({ error: { code: "clone_demo_rate_limited" } });
+    expect(spoofedEarlierHop.statusCode).toBe(429);
+  });
+
   it("issues project-bound browser sessions without storing their raw proof", async () => {
     const issuedAt = "2026-08-30T10:05:00.000Z";
     const { app, store } = server({ now: () => new Date(issuedAt) });
@@ -305,6 +330,165 @@ describe("HTTP and streaming contract", () => {
     expect(JSON.stringify(stored)).not.toContain(session.session_proof);
     expect(store.browserSessionMatches("project", session.session_id, session.session_proof, issuedAt)).toBe(true);
     expect(store.browserSessionMatches("project", session.session_id, "wrong", issuedAt)).toBe(false);
+  });
+
+  it("rate limits browser sessions and combines action drafts with their confirmations per IP", async () => {
+    const { app, store } = server({ browserSessionHourlyCap: 1, actionDraftHourlyCap: 2 });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.append("project", {
+      actor: "human",
+      type: "TASK_ADDED",
+      payload: {
+        node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+      },
+      idem_key: "add-a",
+    });
+    const issueSession = (ip: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/browser-sessions",
+      headers: { "x-mg-token": "visitor-token", "x-forwarded-for": ip },
+    });
+    const firstSession = await issueSession("203.0.113.20");
+    const session = firstSession.json<{ session_id: string; session_proof: string }>();
+    const sessionLimited = await issueSession("203.0.113.20");
+    const otherIpSession = await issueSession("203.0.113.21");
+    const actionHeaders = {
+      "x-mg-token": "visitor-token",
+      "x-mg-session": session.session_id,
+      "x-mg-session-proof": session.session_proof,
+      "x-forwarded-for": "203.0.113.20",
+    };
+    const mutation = { type: "DISPATCHED", payload: { node_id: "a", bypass_cap: true } };
+    const draft = await app.inject({
+      method: "POST",
+      url: "/api/p/project/action-drafts",
+      headers: actionHeaders,
+      payload: { mutation, summary: "Dispatch Task A." },
+    });
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/p/project/action-drafts/${draft.json<{ draft_id: string }>().draft_id}/confirm`,
+      headers: actionHeaders,
+    });
+    const actionsLimited = await app.inject({
+      method: "POST",
+      url: "/api/p/project/action-drafts",
+      headers: actionHeaders,
+      payload: { mutation, summary: "Dispatch Task A again." },
+    });
+
+    expect([firstSession.statusCode, otherIpSession.statusCode, draft.statusCode, confirmed.statusCode]).toEqual([
+      200,
+      200,
+      200,
+      200,
+    ]);
+    expect(sessionLimited.statusCode).toBe(429);
+    expect(sessionLimited.headers["retry-after"]).toBe("3600");
+    expect(sessionLimited.json()).toMatchObject({ error: { code: "browser_session_rate_limited" } });
+    expect(actionsLimited.statusCode).toBe(429);
+    expect(actionsLimited.headers["retry-after"]).toBe("1800");
+    expect(actionsLimited.json()).toMatchObject({ error: { code: "action_draft_rate_limited" } });
+  });
+
+  it("bounds policy text by UTF-8 bytes at the draft ingress", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    const stage = (text: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/policy-drafts",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+      },
+      payload: { text },
+    });
+
+    const atLimit = await stage("é".repeat(2_048));
+    const overLimit = await stage(`${"é".repeat(2_048)}x`);
+
+    expect(atLimit.statusCode).toBe(200);
+    expect(overLimit.statusCode).toBe(413);
+    expect(overLimit.json()).toMatchObject({ error: { code: "policy_text_too_large" } });
+    expect(
+      (store.database.prepare("SELECT COUNT(*) AS count FROM human_drafts").get() as { count: number }).count,
+    ).toBe(1);
+  });
+
+  it("bounds task titles and briefs by UTF-8 bytes at mutation ingress", async () => {
+    const { app, store } = server();
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    const add = (id: string, title: string, brief: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: { "x-mg-token": "visitor-token" },
+      payload: {
+        type: "TASK_ADDED",
+        payload: { node: { id, title, brief, estimate_min: 10, tags: [], state: "queued" } },
+        idem_key: `add-${id}`,
+      },
+    });
+
+    const titleAtLimit = await add("title-limit", "é".repeat(128), "Brief.");
+    const titleOverLimit = await add("title-over", `${"é".repeat(128)}x`, "Brief.");
+    const briefAtLimit = await add("brief-limit", "Brief limit", "é".repeat(8_192));
+    const briefOverLimit = await add("brief-over", "Brief over", `${"é".repeat(8_192)}x`);
+
+    expect([titleAtLimit.statusCode, briefAtLimit.statusCode]).toEqual([200, 200]);
+    expect([titleOverLimit.statusCode, briefOverLimit.statusCode]).toEqual([413, 413]);
+    expect(titleOverLimit.json()).toMatchObject({ error: { code: "node_title_too_large" } });
+    expect(briefOverLimit.json()).toMatchObject({ error: { code: "node_brief_too_large" } });
+    expect(Object.keys(fold(store.listEvents("project")).nodes)).toEqual(["title-limit", "brief-limit"]);
+  });
+
+  it("bounds annotations and journal notes by UTF-8 bytes at mutation and report ingress", async () => {
+    const { app, store } = server();
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.append("project", {
+      actor: "human",
+      type: "TASK_ADDED",
+      payload: {
+        node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+      },
+      idem_key: "add-a",
+    });
+    const mutate = (type: "ANNOTATED" | "JOURNAL_NOTE", payload: Record<string, unknown>, idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/p/project/mutations",
+        headers: { "x-mg-token": "visitor-token" },
+        payload: { type, payload, idem_key: idemKey },
+      });
+    const journalReport = (text: string, idemKey: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: "Bearer reporter-secret" },
+      payload: { actor: "supervisor", type: "JOURNAL_NOTE", payload: { text }, idem_key: idemKey },
+    });
+
+    const annotationAtLimit = await mutate(
+      "ANNOTATED",
+      { target_id: "a", note: "é".repeat(4_096) },
+      "annotation-limit",
+    );
+    const annotationOverLimit = await mutate(
+      "ANNOTATED",
+      { target_id: "a", note: `${"é".repeat(4_096)}x` },
+      "annotation-over",
+    );
+    const journalAtLimit = await journalReport("é".repeat(4_096), "journal-limit");
+    const journalOverLimit = await mutate(
+      "JOURNAL_NOTE",
+      { text: `${"é".repeat(4_096)}x` },
+      "journal-over",
+    );
+
+    expect([annotationAtLimit.statusCode, journalAtLimit.statusCode]).toEqual([200, 200]);
+    expect([annotationOverLimit.statusCode, journalOverLimit.statusCode]).toEqual([413, 413]);
+    expect(annotationOverLimit.json()).toMatchObject({ error: { code: "annotation_too_large" } });
+    expect(journalOverLimit.json()).toMatchObject({ error: { code: "journal_note_too_large" } });
   });
 
   it("applies mutation batches atomically with server-assigned ids", async () => {
@@ -1569,6 +1753,446 @@ describe("HTTP and streaming contract", () => {
     expect(authorized.json()).toEqual({ seq: 2 });
   });
 
+  it("exempts authenticated supervisor and worker reports from public endpoint buckets", async () => {
+    const { app, store } = server({
+      cloneDemoHourlyCap: 1,
+      browserSessionHourlyCap: 1,
+      actionDraftHourlyCap: 1,
+      fleetEnqueueHourlyCap: 1,
+      fleetGlobalDailyCap: 1,
+      now: () => new Date("2026-08-30T10:05:00.000Z"),
+    });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.issueReporterCredential("project", "worker:a", "2026-08-30T10:00:00.000Z", "worker-a-token");
+    store.append("project", {
+      actor: "human",
+      type: "TASK_ADDED",
+      payload: {
+        node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+      },
+      idem_key: "add-a",
+    });
+    const report = (actor: "worker:a" | "supervisor", token: string, idemKey: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: `Bearer ${token}`, "x-forwarded-for": "203.0.113.30" },
+      payload: {
+        actor,
+        type: actor === "supervisor" ? "JOURNAL_NOTE" : "WORKER_LOG",
+        payload: actor === "supervisor"
+          ? { text: "Supervisor remains connected." }
+          : { node_id: "a", lines: ["Worker remains connected."] },
+        idem_key: idemKey,
+      },
+    });
+
+    const responses = [
+      await report("worker:a", "worker-a-token", "worker-log-1"),
+      await report("worker:a", "worker-a-token", "worker-log-2"),
+      await report("supervisor", "reporter-secret", "supervisor-note-1"),
+      await report("supervisor", "reporter-secret", "supervisor-note-2"),
+    ];
+
+    expect(responses.map((response) => response.statusCode)).toEqual([200, 200, 200, 200]);
+    expect(responses.every((response) => response.headers["retry-after"] === undefined)).toBe(true);
+  });
+
+  it("bounds worker log payloads and handoff summaries by UTF-8 bytes at report ingress", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    for (const nodeId of ["log", "handoff-limit", "handoff-over"]) {
+      store.issueReporterCredential(
+        "project",
+        `worker:${nodeId}`,
+        "2026-08-30T10:00:00.000Z",
+        `worker-${nodeId}-token`,
+      );
+      store.append("project", {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: {
+            id: nodeId,
+            title: `Task ${nodeId}`,
+            brief: `Build ${nodeId}.`,
+            estimate_min: 10,
+            tags: [],
+            state: nodeId === "log" ? "queued" : "running",
+          },
+        },
+        idem_key: `add-${nodeId}`,
+      });
+    }
+    const report = (nodeId: string, type: string, payload: Record<string, unknown>, idemKey: string) =>
+      app.inject({
+        method: "POST",
+        url: "/api/p/project/report",
+        headers: { authorization: `Bearer worker-${nodeId}-token` },
+        payload: { actor: `worker:${nodeId}`, type, payload, idem_key: idemKey },
+      });
+
+    const logAtLimit = await report(
+      "log",
+      "WORKER_LOG",
+      { node_id: "log", lines: ["é".repeat(16_384), "x".repeat(32_768)] },
+      "log-limit",
+    );
+    const logOverLimit = await report(
+      "log",
+      "WORKER_LOG",
+      { node_id: "log", lines: ["é".repeat(16_384), `${"x".repeat(32_768)}y`] },
+      "log-over",
+    );
+    const handoffAtLimit = await report(
+      "handoff-limit",
+      "HANDOFF_FILED",
+      {
+        node_id: "handoff-limit",
+        handoff: { ...baseHandoff, summary: "é".repeat(8_192) },
+      },
+      "handoff-limit",
+    );
+    const handoffOverLimit = await report(
+      "handoff-over",
+      "HANDOFF_FILED",
+      {
+        node_id: "handoff-over",
+        handoff: { ...baseHandoff, summary: `${"é".repeat(8_192)}x` },
+      },
+      "handoff-over",
+    );
+
+    expect([logAtLimit.statusCode, handoffAtLimit.statusCode]).toEqual([200, 200]);
+    expect([logOverLimit.statusCode, handoffOverLimit.statusCode]).toEqual([413, 413]);
+    expect(logOverLimit.json()).toMatchObject({ error: { code: "worker_log_too_large" } });
+    expect(handoffOverLimit.json()).toMatchObject({ error: { code: "handoff_summary_too_large" } });
+    expect(store.listEvents("project").map((event) => event.idem_key)).not.toContain("log-over");
+    expect(store.listEvents("project").map((event) => event.idem_key)).not.toContain("handoff-over");
+  });
+
+  it("prevents a worker from approving itself while preserving the approval happy path", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.issueReporterCredential("project", "worker:a", "2026-08-30T10:00:00.000Z", "worker-a-token");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    store.append("project", {
+      actor: "human",
+      type: "TASK_ADDED",
+      payload: {
+        node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+      },
+      idem_key: "add-a",
+    });
+    const report = (
+      token: string,
+      actor: "worker:a" | "supervisor",
+      type: string,
+      payload: Record<string, unknown>,
+      idemKey: string,
+    ) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { actor, type, payload, idem_key: idemKey },
+    });
+
+    const running = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "queued", to: "running" },
+      "a-running",
+    );
+    const review = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "running", to: "review" },
+      "a-review",
+    );
+    const runningRetry = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "queued", to: "running" },
+      "a-running",
+    );
+    const selfApprove = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "review", to: "done" },
+      "a-self-approved",
+    );
+    const selfRestart = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "review", to: "running" },
+      "a-self-restarted",
+    );
+    const afterReproduction = await app.inject({
+      method: "GET",
+      url: "/api/p/project/snapshot",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect([running.statusCode, review.statusCode, runningRetry.statusCode]).toEqual([200, 200, 200]);
+    expect(runningRetry.json()).toEqual(running.json());
+    expect([selfApprove.statusCode, selfRestart.statusCode]).toEqual([403, 403]);
+    expect(selfApprove.json()).toMatchObject({
+      error: { code: "transition_not_permitted_for_actor" },
+    });
+    expect(afterReproduction.json()).toMatchObject({
+      state: { nodes: { a: { state: "review" } }, approvals: {} },
+    });
+
+    const handoff = await report(
+      "worker-a-token",
+      "worker:a",
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: baseHandoff },
+      "a-handoff",
+    );
+    const approval = await report(
+      "reporter-secret",
+      "supervisor",
+      "APPROVAL_CREATED",
+      { approval_id: "approval-a", node_id: "a", summary: "Review task A." },
+      "approval-a",
+    );
+    const { grant } = await issuePolicy(app, {
+      project: "project",
+      token: "visitor-token",
+      session: "session-a",
+      proof: "proof-a",
+    });
+    const approved = await app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": grant.policy_ref,
+        "x-mg-capability": grant.capability,
+        "x-mg-nonce": "approve-a",
+      },
+      payload: {
+        type: "APPROVED",
+        payload: { approval_id: "approval-a", node_id: "a", policy_ref: grant.policy_ref },
+        idem_key: "approved-a",
+      },
+    });
+    const snapshot = await app.inject({
+      method: "GET",
+      url: "/api/p/project/snapshot",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect([handoff.statusCode, approval.statusCode, approved.statusCode]).toEqual([200, 200, 200]);
+    expect(snapshot.json()).toMatchObject({
+      state: {
+        nodes: { a: { state: "done" } },
+        approvals: { "approval-a": { status: "approved" } },
+      },
+    });
+  });
+
+  it("requires review rejection before a worker may report failure", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    for (const nodeId of ["before", "pending"]) {
+      store.issueReporterCredential(
+        "project",
+        `worker:${nodeId}`,
+        "2026-08-30T10:00:00.000Z",
+        `worker-${nodeId}-token`,
+      );
+      store.append("project", {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: {
+            id: nodeId,
+            title: `Task ${nodeId}`,
+            brief: `Build ${nodeId}.`,
+            estimate_min: 10,
+            tags: [],
+            state: "running",
+          },
+        },
+        idem_key: `add-${nodeId}`,
+      });
+      store.append("project", {
+        actor: `worker:${nodeId}`,
+        type: "HANDOFF_FILED",
+        payload: { node_id: nodeId, handoff: baseHandoff },
+        idem_key: `handoff-${nodeId}`,
+      });
+    }
+    store.append("project", {
+      actor: "supervisor",
+      type: "APPROVAL_CREATED",
+      payload: { approval_id: "approval-pending", node_id: "pending", summary: "Review pending." },
+      idem_key: "approval-pending",
+    });
+    const fail = (nodeId: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: `Bearer worker-${nodeId}-token` },
+      payload: {
+        actor: `worker:${nodeId}`,
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: nodeId, from: "review", to: "failed" },
+        idem_key: `failed-${nodeId}`,
+      },
+    });
+
+    const beforeApproval = await fail("before");
+    const pendingApproval = await fail("pending");
+
+    expect(beforeApproval.statusCode).toBe(403);
+    expect(pendingApproval.statusCode).toBe(403);
+    for (const response of [beforeApproval, pendingApproval]) {
+      expect(response.json()).toMatchObject({
+        error: { code: "transition_not_permitted_for_actor" },
+      });
+    }
+  });
+
+  it("locks a filed handoff while its approval is pending and unlocks it after rejection", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.issueReporterCredential("project", "worker:a", "2026-08-30T10:00:00.000Z", "worker-a-token");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    store.append("project", {
+      actor: "human",
+      type: "TASK_ADDED",
+      payload: {
+        node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+      },
+      idem_key: "add-a",
+    });
+    const workerReport = (type: string, payload: Record<string, unknown>, idemKey: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: "Bearer worker-a-token" },
+      payload: { actor: "worker:a", type, payload, idem_key: idemKey },
+    });
+    const supervisorReport = (type: string, payload: Record<string, unknown>, idemKey: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: "Bearer reporter-secret" },
+      payload: { actor: "supervisor", type, payload, idem_key: idemKey },
+    });
+    await workerReport(
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "queued", to: "running" },
+      "a-running",
+    );
+    const originalHandoff = { ...baseHandoff, summary: "Original evidence for approval." };
+    const replacementHandoff = { ...baseHandoff, summary: "Replacement evidence after approval creation." };
+    const filed = await workerReport(
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: originalHandoff },
+      "a-handoff",
+    );
+    const approval = await supervisorReport(
+      "APPROVAL_CREATED",
+      {
+        approval_id: "approval-a",
+        node_id: "a",
+        summary: "Approve the original evidence.",
+        diff_stats: { lines_added: 12, lines_removed: 3, files: ["src/a.ts"] },
+        tests: "green",
+      },
+      "approval-a",
+    );
+    const replacement = await workerReport(
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: replacementHandoff },
+      "a-handoff-replacement",
+    );
+    const originalRetry = await workerReport(
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: originalHandoff },
+      "a-handoff",
+    );
+    const lockedSnapshot = await app.inject({
+      method: "GET",
+      url: "/api/p/project/snapshot",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect([filed.statusCode, approval.statusCode]).toEqual([200, 200]);
+    expect(replacement.statusCode).toBe(409);
+    expect(replacement.json()).toMatchObject({
+      error: { code: "handoff_locked_by_pending_approval" },
+    });
+    expect(originalRetry.json()).toEqual(filed.json());
+    expect(lockedSnapshot.json()).toMatchObject({
+      state: {
+        handoffs: { a: { summary: "Original evidence for approval." } },
+        approvals: {
+          "approval-a": {
+            status: "pending",
+            summary: "Approve the original evidence.",
+            diff_stats: { lines_added: 12, lines_removed: 3, files: ["src/a.ts"] },
+            tests: "green",
+          },
+        },
+      },
+    });
+
+    const { grant } = await issuePolicy(app, {
+      project: "project",
+      token: "visitor-token",
+      session: "session-a",
+      proof: "proof-a",
+    });
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": grant.policy_ref,
+        "x-mg-capability": grant.capability,
+        "x-mg-nonce": "reject-a",
+      },
+      payload: {
+        type: "REJECTED",
+        payload: {
+          approval_id: "approval-a",
+          node_id: "a",
+          policy_ref: grant.policy_ref,
+          reason: "Revise the handoff.",
+        },
+        idem_key: "rejected-a",
+      },
+    });
+    const replacementAfterRejection = await workerReport(
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: replacementHandoff },
+      "a-handoff-replacement",
+    );
+    const unlockedSnapshot = await app.inject({
+      method: "GET",
+      url: "/api/p/project/snapshot",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect([rejected.statusCode, replacementAfterRejection.statusCode]).toEqual([200, 200]);
+    expect(unlockedSnapshot.json()).toMatchObject({
+      state: {
+        handoffs: { a: { summary: "Replacement evidence after approval creation." } },
+        approvals: { "approval-a": { status: "rejected", reason: "Revise the handoff." } },
+      },
+    });
+  });
+
   it("binds worker reporter events to the credential node", async () => {
     const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
     store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
@@ -2270,6 +2894,53 @@ describe("HTTP and streaming contract", () => {
     expect(response.json()).toMatchObject({ error: { code: "node_not_dispatched" } });
   });
 
+  it("layers per-IP hourly buckets and a global daily cap over fleet enqueue caps", async () => {
+    let clock = new Date("2026-08-30T10:00:00.000Z");
+    const { app, store } = server({
+      fleetMode: true,
+      seedProjectId: "seed",
+      fleetDailyCap: 10,
+      fleetPerProjectCap: 1,
+      fleetEnqueueHourlyCap: 2,
+      fleetGlobalDailyCap: 3,
+      now: () => clock,
+    });
+    const candidates = [
+      { project: "project-a", token: "visitor-a", nodeId: "a", title: "Task A", brief: "Build A." },
+      { project: "project-b", token: "visitor-b", nodeId: "b", title: "Task B", brief: "Build B." },
+      { project: "project-c", token: "visitor-c", nodeId: "c", title: "Task C", brief: "Build C." },
+      { project: "project-d", token: "visitor-d", nodeId: "d", title: "Task D", brief: "Build D." },
+    ];
+    await prepareFleet(app, store, candidates);
+    const enqueue = (project: string, token: string, nodeId: string, ip: string) => app.inject({
+      method: "POST",
+      url: `/api/p/${project}/fleet-requests`,
+      headers: { "x-mg-token": token, "x-forwarded-for": ip },
+      payload: { node_id: nodeId },
+    });
+
+    const invalid = await enqueue("project-a", "visitor-a", "missing", "203.0.113.40");
+    const first = await enqueue("project-a", "visitor-a", "a", "203.0.113.40");
+    const second = await enqueue("project-b", "visitor-b", "b", "203.0.113.40");
+    const perIpLimited = await enqueue("project-c", "visitor-c", "c", "203.0.113.40");
+    const third = await enqueue("project-c", "visitor-c", "c", "203.0.113.41");
+    const globalLimited = await enqueue("project-d", "visitor-d", "d", "203.0.113.42");
+    clock = new Date("2026-08-31T00:00:00.000Z");
+    const nextDay = await enqueue("project-d", "visitor-d", "d", "203.0.113.42");
+
+    expect(invalid.statusCode).toBe(404);
+    expect([first.statusCode, second.statusCode, third.statusCode, nextDay.statusCode]).toEqual([200, 200, 200, 200]);
+    expect(perIpLimited.statusCode).toBe(429);
+    expect(perIpLimited.headers["retry-after"]).toBe("1800");
+    expect(perIpLimited.json()).toMatchObject({ error: { code: "fleet_enqueue_rate_limited" } });
+    expect(globalLimited.statusCode).toBe(429);
+    expect(globalLimited.headers["retry-after"]).toBe("50400");
+    expect(globalLimited.json()).toMatchObject({ error: { code: "fleet_global_rate_limited" } });
+    expect(
+      (store.database.prepare("SELECT COUNT(*) AS count FROM fleet_requests").get() as { count: number }).count,
+    ).toBe(4);
+  });
+
   it("enforces the project cap and refunds it after adoption expires", async () => {
     let clock = new Date("2026-08-30T10:00:00.000Z");
     const { app, store } = server({
@@ -2668,6 +3339,30 @@ describe("HTTP and streaming contract", () => {
         delete process.env.FLEET_DAILY_CAP;
         delete process.env.FLEET_PER_PROJECT_CAP;
         delete process.env.FLEET_ADOPT_TTL_MIN;
+        process.env[name] = "0";
+        expect(() => server()).toThrow(`${name} must be a positive integer`);
+      }
+    } finally {
+      for (const name of names) {
+        const value = previous[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
+  it("validates configurable public endpoint rate-limit environment values", () => {
+    const names = [
+      "CLONE_DEMO_HOURLY_CAP",
+      "BROWSER_SESSION_HOURLY_CAP",
+      "ACTION_DRAFT_HOURLY_CAP",
+      "FLEET_ENQUEUE_HOURLY_CAP",
+      "FLEET_GLOBAL_DAILY_CAP",
+    ] as const;
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      for (const name of names) {
+        for (const candidate of names) delete process.env[candidate];
         process.env[name] = "0";
         expect(() => server()).toThrow(`${name} must be a positive integer`);
       }

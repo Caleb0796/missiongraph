@@ -10,6 +10,76 @@ const lifecycleTypes = new Set([
   "APPROVAL_CREATED",
 ]);
 
+const nodeTitleByteLimit = 256;
+const nodeBriefByteLimit = 16 * 1024;
+
+function textExceeds(value, limit) {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") > limit;
+}
+
+function tokenBucket(capacity, refillWindowMs) {
+  const buckets = new Map();
+  const state = (key, at) => {
+    const existing = buckets.get(key);
+    if (!existing) {
+      const created = { tokens: capacity, updatedAt: at };
+      buckets.set(key, created);
+      return created;
+    }
+    const elapsed = Math.max(0, at - existing.updatedAt);
+    existing.tokens = Math.min(capacity, existing.tokens + elapsed * capacity / refillWindowMs);
+    existing.updatedAt = Math.max(existing.updatedAt, at);
+    return existing;
+  };
+  return {
+    consume(key, at) {
+      const current = state(key, at);
+      if (current.tokens >= 1) {
+        current.tokens -= 1;
+        return { allowed: true };
+      }
+      const waitMs = (1 - current.tokens) * refillWindowMs / capacity;
+      return { allowed: false, retryAfter: Math.max(1, Math.ceil(waitMs / 1_000)) };
+    },
+    refund(key, at) {
+      const current = state(key, at);
+      current.tokens = Math.min(capacity, current.tokens + 1);
+    },
+  };
+}
+
+function dailyCounter(capacity) {
+  let dayStart = -1;
+  let used = 0;
+  return {
+    consume(at) {
+      const currentDay = Math.floor(at / (24 * 60 * 60_000)) * 24 * 60 * 60_000;
+      if (currentDay !== dayStart) {
+        dayStart = currentDay;
+        used = 0;
+      }
+      if (used < capacity) {
+        used += 1;
+        return { allowed: true };
+      }
+      return {
+        allowed: false,
+        retryAfter: Math.max(1, Math.ceil((currentDay + 24 * 60 * 60_000 - at) / 1_000)),
+      };
+    },
+    refund(at) {
+      const currentDay = Math.floor(at / (24 * 60 * 60_000)) * 24 * 60 * 60_000;
+      if (currentDay === dayStart && used > 0) used -= 1;
+    },
+  };
+}
+
+function clientIp(request) {
+  const forwarded = request.headers["x-forwarded-for"];
+  const value = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  return value?.split(",").at(-1)?.trim() || request.socket.remoteAddress || "unknown";
+}
+
 function templateHash(title, brief) {
   return createHash("sha256").update(`${title}\n${brief}`).digest("hex");
 }
@@ -36,6 +106,11 @@ function fleetError(response, status, code, message = code) {
   json(response, status, { error: { code, message } });
 }
 
+function rateLimitError(response, code, retryAfter) {
+  response.setHeader("retry-after", String(retryAfter));
+  fleetError(response, 429, code, "Rate limit exceeded. Retry later.");
+}
+
 async function requestBody(request) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
@@ -59,6 +134,11 @@ export async function startFleetStub({
   dailyCap = 30,
   perProjectCap = 1,
   ttlMin = 20,
+  cloneDemoHourlyCap = 30,
+  browserSessionHourlyCap = 60,
+  actionDraftHourlyCap = 120,
+  fleetEnqueueHourlyCap = 3,
+  fleetGlobalDailyCap = 20,
 } = {}) {
   const reporterToken = `stub-supervisor-${randomUUID()}`;
   const projects = new Map();
@@ -74,6 +154,11 @@ export async function startFleetStub({
   ];
   let nowMs = Date.parse("2026-08-31T12:00:00.000Z");
   let sequence = 0;
+  const cloneDemoLimiter = tokenBucket(cloneDemoHourlyCap, 60 * 60_000);
+  const browserSessionLimiter = tokenBucket(browserSessionHourlyCap, 60 * 60_000);
+  const actionDraftLimiter = tokenBucket(actionDraftHourlyCap, 60 * 60_000);
+  const fleetEnqueueLimiter = tokenBucket(fleetEnqueueHourlyCap, 60 * 60_000);
+  const fleetGlobalLimiter = dailyCounter(fleetGlobalDailyCap);
 
   function append(project, actor, type, payload, idemKey = randomUUID()) {
     const event = {
@@ -239,6 +324,8 @@ export async function startFleetStub({
       const parts = url.pathname.split("/").filter(Boolean);
 
       if (request.method === "POST" && url.pathname === "/api/clone-demo") {
+        const limit = cloneDemoLimiter.consume(clientIp(request), nowMs);
+        if (!limit.allowed) return rateLimitError(response, "clone_demo_rate_limited", limit.retryAfter);
         const project = cloneProject();
         return json(response, 200, { project: project.id, token: project.token, cursor: String(project.events.at(-1)?.seq ?? 0) });
       }
@@ -261,6 +348,8 @@ export async function startFleetStub({
           return json(response, 200, { v: 1, events: project.events });
         }
         if (request.method === "POST" && parts[3] === "browser-sessions") {
+          const limit = browserSessionLimiter.consume(clientIp(request), nowMs);
+          if (!limit.allowed) return rateLimitError(response, "browser_session_rate_limited", limit.retryAfter);
           const session = { id: randomUUID(), proof: randomUUID(), project_id: project.id };
           browserSessions.set(session.id, session);
           return json(response, 200, {
@@ -270,6 +359,8 @@ export async function startFleetStub({
           });
         }
         if (request.method === "POST" && parts[3] === "action-drafts" && parts.length === 4) {
+          const limit = actionDraftLimiter.consume(clientIp(request), nowMs);
+          if (!limit.allowed) return rateLimitError(response, "action_draft_rate_limited", limit.retryAfter);
           const session = browserSessions.get(request.headers["x-mg-session"]);
           if (!session || session.project_id !== project.id || request.headers["x-mg-session-proof"] !== session.proof) {
             return fleetError(response, 403, "session_invalid");
@@ -290,6 +381,8 @@ export async function startFleetStub({
           });
         }
         if (request.method === "POST" && parts[3] === "action-drafts" && parts[5] === "confirm") {
+          const limit = actionDraftLimiter.consume(clientIp(request), nowMs);
+          if (!limit.allowed) return rateLimitError(response, "action_draft_rate_limited", limit.retryAfter);
           const draft = drafts.get(decodeURIComponent(parts[4]));
           const session = browserSessions.get(request.headers["x-mg-session"]);
           if (!draft || !session || draft.project_id !== project.id || request.headers["x-mg-session-proof"] !== session.proof) {
@@ -309,6 +402,9 @@ export async function startFleetStub({
         if (request.method === "POST" && parts[3] === "mutations") {
           const body = await requestBody(request);
           if (body.type === "DISPATCHED") {
+            if (textExceeds(body.payload?.brief_override, nodeBriefByteLimit)) {
+              return fleetError(response, 413, "node_brief_too_large");
+            }
             const capability = capabilities.get(request.headers["x-mg-capability-ref"]);
             if (!capability || capability.used || capability.project_id !== project.id || capability.token !== request.headers["x-mg-capability"]) {
               return fleetError(response, 403, "capability_required");
@@ -322,6 +418,12 @@ export async function startFleetStub({
           }
           if (body.type === "TASK_ADDED") {
             const input = body.payload?.node;
+            if (textExceeds(input?.title, nodeTitleByteLimit)) {
+              return fleetError(response, 413, "node_title_too_large");
+            }
+            if (textExceeds(input?.brief, nodeBriefByteLimit)) {
+              return fleetError(response, 413, "node_brief_too_large");
+            }
             const node = {
               ...input,
               record_type: "task",
@@ -370,19 +472,41 @@ export async function startFleetStub({
           sweep();
           if (request.method === "POST" && parts.length === 4) {
             const body = await requestBody(request);
+            const ip = clientIp(request);
+            const perIpLimit = fleetEnqueueLimiter.consume(ip, nowMs);
+            if (!perIpLimit.allowed) {
+              return rateLimitError(response, "fleet_enqueue_rate_limited", perIpLimit.retryAfter);
+            }
+            const globalLimit = fleetGlobalLimiter.consume(nowMs);
+            if (!globalLimit.allowed) {
+              fleetEnqueueLimiter.refund(ip, nowMs);
+              return rateLimitError(response, "fleet_global_rate_limited", globalLimit.retryAfter);
+            }
+            const refundLimits = () => {
+              fleetEnqueueLimiter.refund(ip, nowMs);
+              fleetGlobalLimiter.refund(nowMs);
+            };
             const result = eligibility(project, body.node_id);
             if (!result.eligible) {
+              refundLimits();
               const status = result.code === "node_not_found" ? 404 : 400;
               return fleetError(response, status, result.code, result.message);
             }
             if ([...requests.values()].some(
               (item) => item.project_id === project.id && item.node_id === result.node.id && item.status !== "expired",
             )) {
+              refundLimits();
               return fleetError(response, 409, "fleet_request_exists");
             }
             const projectUsed = [...requests.values()].filter((item) => item.project_id === project.id && item.status !== "expired").length;
-            if (projectUsed >= perProjectCap) return fleetError(response, 429, "fleet_project_cap");
-            if (dailyUsed() >= dailyCap) return fleetError(response, 429, "fleet_daily_cap");
+            if (projectUsed >= perProjectCap) {
+              refundLimits();
+              return fleetError(response, 429, "fleet_project_cap");
+            }
+            if (dailyUsed() >= dailyCap) {
+              refundLimits();
+              return fleetError(response, 429, "fleet_daily_cap");
+            }
             const item = {
               id: `fleet-request-${randomUUID()}`,
               project_id: project.id,

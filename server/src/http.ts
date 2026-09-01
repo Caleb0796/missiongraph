@@ -36,6 +36,11 @@ export interface ServerOptions {
   fleetDailyCap?: number;
   fleetPerProjectCap?: number;
   fleetAdoptTtlMin?: number;
+  cloneDemoHourlyCap?: number;
+  browserSessionHourlyCap?: number;
+  actionDraftHourlyCap?: number;
+  fleetEnqueueHourlyCap?: number;
+  fleetGlobalDailyCap?: number;
   logger?: boolean;
 }
 
@@ -247,7 +252,132 @@ function batchInputs(
   return { idemKey: body.idem_key, inputs };
 }
 
+class IngressPolicyError extends Error {
+  constructor(
+    readonly statusCode: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "IngressPolicyError";
+  }
+}
+
+const workerStateTransitions = new Set([
+  "queued->running",
+  "running->review",
+  "running->failed",
+]);
+
+const fieldByteLimits = {
+  policyText: 4 * 1024,
+  workerLog: 64 * 1024,
+  nodeTitle: 256,
+  nodeBrief: 16 * 1024,
+  handoffSummary: 16 * 1024,
+  annotation: 8 * 1024,
+  journalNote: 8 * 1024,
+} as const;
+
+function validateTextSize(value: string, limit: number, code: string, label: string): void {
+  if (Buffer.byteLength(value, "utf8") <= limit) return;
+  throw new IngressPolicyError(
+    413,
+    code,
+    `${label} must be at most ${limit} UTF-8 bytes.`,
+  );
+}
+
+function validateNodeSize(node: { title: string; brief: string }): void {
+  validateTextSize(node.title, fieldByteLimits.nodeTitle, "node_title_too_large", "Node title");
+  validateTextSize(node.brief, fieldByteLimits.nodeBrief, "node_brief_too_large", "Node brief");
+}
+
+function validateEventSizes(input: EventInput): void {
+  switch (input.type) {
+    case "TASK_ADDED":
+      validateNodeSize(input.payload.node);
+      break;
+    case "TASK_SPLIT":
+      for (const child of input.payload.children) validateNodeSize(child);
+      break;
+    case "DISPATCHED":
+      if (input.payload.brief_override !== undefined) {
+        validateTextSize(
+          input.payload.brief_override,
+          fieldByteLimits.nodeBrief,
+          "node_brief_too_large",
+          "Node brief override",
+        );
+      }
+      break;
+    case "ANNOTATED":
+      validateTextSize(input.payload.note, fieldByteLimits.annotation, "annotation_too_large", "Annotation");
+      break;
+    case "JOURNAL_NOTE":
+      validateTextSize(input.payload.text, fieldByteLimits.journalNote, "journal_note_too_large", "Journal note");
+      break;
+    case "WORKER_LOG": {
+      const size = input.payload.lines.reduce((total, line) => total + Buffer.byteLength(line, "utf8"), 0);
+      if (size > fieldByteLimits.workerLog) {
+        throw new IngressPolicyError(
+          413,
+          "worker_log_too_large",
+          `Worker log lines must total at most ${fieldByteLimits.workerLog} UTF-8 bytes.`,
+        );
+      }
+      break;
+    }
+    case "HANDOFF_FILED":
+      validateTextSize(
+        input.payload.handoff.summary,
+        fieldByteLimits.handoffSummary,
+        "handoff_summary_too_large",
+        "Handoff summary",
+      );
+      break;
+  }
+}
+
+function validateReporterIngress(events: readonly Event[], input: EventInput): void {
+  validateEventSizes(input);
+  if (input.type === "NODE_STATE_CHANGED") {
+    if (input.payload.to === "done") {
+      throw new IngressPolicyError(
+        403,
+        "transition_not_permitted_for_actor",
+        "Nodes may reach done only through an APPROVED event.",
+      );
+    }
+    if (input.actor.startsWith("worker:")) {
+      const transition = `${input.payload.from}->${input.payload.to}`;
+      if (!workerStateTransitions.has(transition)) {
+        throw new IngressPolicyError(
+          403,
+          "transition_not_permitted_for_actor",
+          `Worker actors may not report ${transition} transitions.`,
+        );
+      }
+    }
+  }
+  if (input.type === "HANDOFF_FILED") {
+    const hasPendingApproval = Object.values(fold(events).approvals).some(
+      (approval) => approval.node_id === input.payload.node_id && approval.status === "pending",
+    );
+    if (hasPendingApproval) {
+      throw new IngressPolicyError(
+        409,
+        "handoff_locked_by_pending_approval",
+        "The handoff cannot change while an approval is pending; reject the approval first.",
+      );
+    }
+  }
+}
+
 function errorReply(error: unknown, reply: FastifyReply): FastifyReply {
+  if (error instanceof IngressPolicyError) {
+    return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+  }
   if (error instanceof FleetQueueError) {
     return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
   }
@@ -272,6 +402,90 @@ function positiveInteger(value: number | string | undefined, fallback: number, n
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer`);
   return parsed;
+}
+
+interface TokenBucketState {
+  tokens: number;
+  updatedAt: number;
+}
+
+class TokenBucket {
+  private readonly buckets = new Map<string, TokenBucketState>();
+
+  constructor(
+    private readonly capacity: number,
+    private readonly refillWindowMs: number,
+  ) {}
+
+  private state(key: string, at: number): TokenBucketState {
+    const existing = this.buckets.get(key);
+    if (!existing) {
+      const created = { tokens: this.capacity, updatedAt: at };
+      this.buckets.set(key, created);
+      return created;
+    }
+    const elapsed = Math.max(0, at - existing.updatedAt);
+    existing.tokens = Math.min(
+      this.capacity,
+      existing.tokens + elapsed * this.capacity / this.refillWindowMs,
+    );
+    existing.updatedAt = Math.max(existing.updatedAt, at);
+    return existing;
+  }
+
+  consume(key: string, at: number): { allowed: true } | { allowed: false; retryAfter: number } {
+    const state = this.state(key, at);
+    if (state.tokens >= 1) {
+      state.tokens -= 1;
+      return { allowed: true };
+    }
+    const waitMs = (1 - state.tokens) * this.refillWindowMs / this.capacity;
+    return { allowed: false, retryAfter: Math.max(1, Math.ceil(waitMs / 1_000)) };
+  }
+
+  refund(key: string, at: number): void {
+    const state = this.state(key, at);
+    state.tokens = Math.min(this.capacity, state.tokens + 1);
+  }
+}
+
+class DailyCounter {
+  private dayStart = -1;
+  private used = 0;
+
+  constructor(private readonly capacity: number) {}
+
+  consume(at: number): { allowed: true } | { allowed: false; retryAfter: number } {
+    const dayStart = Math.floor(at / (24 * 60 * 60_000)) * 24 * 60 * 60_000;
+    if (dayStart !== this.dayStart) {
+      this.dayStart = dayStart;
+      this.used = 0;
+    }
+    if (this.used < this.capacity) {
+      this.used += 1;
+      return { allowed: true };
+    }
+    return {
+      allowed: false,
+      retryAfter: Math.max(1, Math.ceil((dayStart + 24 * 60 * 60_000 - at) / 1_000)),
+    };
+  }
+
+  refund(at: number): void {
+    const dayStart = Math.floor(at / (24 * 60 * 60_000)) * 24 * 60 * 60_000;
+    if (dayStart === this.dayStart && this.used > 0) this.used -= 1;
+  }
+}
+
+function rateLimitReply(
+  reply: FastifyReply,
+  code: string,
+  retryAfter: number,
+): FastifyReply {
+  return reply
+    .header("retry-after", String(retryAfter))
+    .code(429)
+    .send({ error: { code, message: "Rate limit exceeded. Retry later." } });
 }
 
 function fleetRequestResponse(request: FleetRequest, position?: number): Record<string, unknown> {
@@ -413,6 +627,31 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
   const fleetAdoptTtlMin = fleetMode
     ? positiveInteger(options.fleetAdoptTtlMin ?? process.env.FLEET_ADOPT_TTL_MIN, 20, "FLEET_ADOPT_TTL_MIN")
     : 20;
+  const cloneDemoHourlyCap = positiveInteger(
+    options.cloneDemoHourlyCap ?? process.env.CLONE_DEMO_HOURLY_CAP,
+    30,
+    "CLONE_DEMO_HOURLY_CAP",
+  );
+  const browserSessionHourlyCap = positiveInteger(
+    options.browserSessionHourlyCap ?? process.env.BROWSER_SESSION_HOURLY_CAP,
+    60,
+    "BROWSER_SESSION_HOURLY_CAP",
+  );
+  const actionDraftHourlyCap = positiveInteger(
+    options.actionDraftHourlyCap ?? process.env.ACTION_DRAFT_HOURLY_CAP,
+    120,
+    "ACTION_DRAFT_HOURLY_CAP",
+  );
+  const fleetEnqueueHourlyCap = positiveInteger(
+    options.fleetEnqueueHourlyCap ?? process.env.FLEET_ENQUEUE_HOURLY_CAP,
+    3,
+    "FLEET_ENQUEUE_HOURLY_CAP",
+  );
+  const fleetGlobalDailyCap = positiveInteger(
+    options.fleetGlobalDailyCap ?? process.env.FLEET_GLOBAL_DAILY_CAP,
+    20,
+    "FLEET_GLOBAL_DAILY_CAP",
+  );
   const fixtureSeedProjectId = "demo-seed";
   const allowedOrigins = new Set(
     options.allowedOrigins ??
@@ -429,7 +668,12 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     adoptTtlMin: fleetAdoptTtlMin,
     id,
   });
-  const app = Fastify({ logger: options.logger ?? false });
+  const cloneDemoLimiter = new TokenBucket(cloneDemoHourlyCap, 60 * 60_000);
+  const browserSessionLimiter = new TokenBucket(browserSessionHourlyCap, 60 * 60_000);
+  const actionDraftLimiter = new TokenBucket(actionDraftHourlyCap, 60 * 60_000);
+  const fleetEnqueueLimiter = new TokenBucket(fleetEnqueueHourlyCap, 60 * 60_000);
+  const fleetGlobalLimiter = new DailyCounter(fleetGlobalDailyCap);
+  const app = Fastify({ logger: options.logger ?? false, trustProxy: 1 });
 
   app.addHook("onRequest", async (request, reply) => {
     const origin = textHeader(request.headers.origin);
@@ -472,7 +716,24 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       if (typeof body.node_id !== "string" || body.node_id.length === 0) {
         throw new EventValidationError("node_id must not be empty");
       }
-      const result = fleet.enqueue(project, body.node_id, now());
+      const requestTime = now();
+      const perIpLimit = fleetEnqueueLimiter.consume(request.ip, requestTime.getTime());
+      if (!perIpLimit.allowed) {
+        return rateLimitReply(reply, "fleet_enqueue_rate_limited", perIpLimit.retryAfter);
+      }
+      const globalLimit = fleetGlobalLimiter.consume(requestTime.getTime());
+      if (!globalLimit.allowed) {
+        fleetEnqueueLimiter.refund(request.ip, requestTime.getTime());
+        return rateLimitReply(reply, "fleet_global_rate_limited", globalLimit.retryAfter);
+      }
+      let result: ReturnType<FleetQueue["enqueue"]>;
+      try {
+        result = fleet.enqueue(project, body.node_id, requestTime);
+      } catch (error) {
+        fleetEnqueueLimiter.refund(request.ip, requestTime.getTime());
+        fleetGlobalLimiter.refund(requestTime.getTime());
+        throw error;
+      }
       return reply.send({ id: result.request.id, status: "queued", position: result.position });
     } catch (error) {
       return errorReply(error, reply);
@@ -546,6 +807,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
     try {
       const createdAt = now();
+      const limit = browserSessionLimiter.consume(request.ip, createdAt.getTime());
+      if (!limit.allowed) {
+        return rateLimitReply(reply, "browser_session_rate_limited", limit.retryAfter);
+      }
       const session = store.issueBrowserSession({
         id: id(),
         token: id(),
@@ -573,6 +838,12 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       if (typeof body.text !== "string" || body.text.trim() === "") {
         throw new EventValidationError("text must not be empty");
       }
+      validateTextSize(
+        body.text,
+        fieldByteLimits.policyText,
+        "policy_text_too_large",
+        "Policy text",
+      );
       const maxUses = body.max_uses === undefined ? 4 : body.max_uses;
       if (!Number.isSafeInteger(maxUses) || (maxUses as number) < 1 || (maxUses as number) > 20) {
         throw new EventValidationError("max_uses must be an integer between 1 and 20");
@@ -642,6 +913,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       const body = record(request.body, "body");
       const mutation = record(body.mutation, "mutation");
       const createdAt = now();
+      const limit = actionDraftLimiter.consume(request.ip, createdAt.getTime());
+      if (!limit.allowed) {
+        return rateLimitReply(reply, "action_draft_rate_limited", limit.retryAfter);
+      }
       const sessionId = requiredBrowserSession(store, request, project, createdAt.toISOString());
       let inputs: EventInput[];
       if (mutation.batch !== undefined) {
@@ -652,6 +927,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       } else {
         inputs = [parseEventInput({ ...mutation, actor: "human", idem_key: id() })];
       }
+      for (const input of inputs) validateEventSizes(input);
       const action = actionForMutation(inputs, store.listEvents(project));
       if (!action) throw new EventValidationError("mutation does not require human-presence confirmation");
       const displayText = typeof body.summary === "string" && body.summary.trim() !== ""
@@ -690,6 +966,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     if (!visitorAuthorized(store, request, project)) return reply.code(401).send({ error: "unauthorized" });
     try {
       const confirmedAt = now().toISOString();
+      const limit = actionDraftLimiter.consume(request.ip, Date.parse(confirmedAt));
+      if (!limit.allowed) {
+        return rateLimitReply(reply, "action_draft_rate_limited", limit.retryAfter);
+      }
       const sessionId = requiredBrowserSession(store, request, project, confirmedAt);
       const capability = store.confirmHumanDraft({
         projectId: project,
@@ -822,11 +1102,15 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
               }
             }
           : undefined;
+        const beforeAppend = () => {
+          for (const input of inputs) validateEventSizes(input);
+          authorize?.();
+        };
         if (batchIdemKey) {
           const result = store.appendBatch(project, inputs, batchIdemKey, {
             ...(baseSeq === undefined ? {} : { baseSeq }),
             ...(sessionId === undefined ? {} : { sessionId }),
-            ...(authorize ? { authorize } : {}),
+            authorize: beforeAppend,
             ts: now().toISOString(),
           });
           return reply.send({ seqs: result.events.map((event) => event.seq) });
@@ -834,7 +1118,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
         const result = store.append(project, inputs[0]!, {
           ...(baseSeq === undefined ? {} : { baseSeq }),
           ...(sessionId === undefined ? {} : { sessionId }),
-          ...(authorize ? { authorize } : {}),
+          authorize: beforeAppend,
           ts: now().toISOString(),
         });
         return reply.send({ seq: result.event.seq });
@@ -878,6 +1162,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       }
       if (!reporterEventTypes.has(input.type) && !(input.actor === "supervisor" && input.type === "JOURNAL_NOTE")) {
         throw new EventValidationError(`${input.type} is not a fleet reporter event`);
+      }
+      const events = store.listEvents(project);
+      if (!events.some((event) => event.idem_key === input.idem_key)) {
+        validateReporterIngress(events, input);
       }
       const result = store.append(project, input, { ts: reportTime.toISOString() });
       return reply.send({ seq: result.event.seq });
@@ -964,11 +1252,15 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
     }
   });
 
-  app.post("/api/clone-demo", async (_request, reply) => {
-    const project = id();
-    const token = id();
+  app.post("/api/clone-demo", async (request, reply) => {
     const created = now();
     try {
+      const limit = cloneDemoLimiter.consume(request.ip, created.getTime());
+      if (!limit.allowed) {
+        return rateLimitReply(reply, "clone_demo_rate_limited", limit.retryAfter);
+      }
+      const project = id();
+      const token = id();
       let sourceProjectId = fixtureSeedProjectId;
       if (configuredSeedProjectId) {
         if (store.hasProject(configuredSeedProjectId)) {
