@@ -181,15 +181,50 @@ test('consequential actions use a visible project-bound human confirmation', asy
   assert.doesNotMatch(client, /sessionStorage/)
   assert.match(client, /Bound request SHA-256:/)
   assert.match(store, /humanConfirmation: HumanConfirmation \| null/)
+  assert.equal((store.match(/binding: string\[\]/g) ?? []).length, 2)
   assert.match(store, /pending\.deny\?\.\(\)/)
   assert.match(canvas, /Human policy confirmation/)
   assert.match(canvas, /humanConfirmation\.text/)
   assert.match(canvas, /humanConfirmation\.details\.map/)
+  assert.match(canvas, /humanConfirmation\.binding\.map/)
+  assert.match(canvas, /structuralPreview\.binding\.map/)
   assert.match(canvas, /humanConfirmation\.expiresAt/)
   assert.match(canvas, /denyHumanConfirmation\(\s*humanConfirmation\.id,\s*humanConfirmation\.textHash/)
   assert.match(canvas, /confirmHumanConfirmation\(\s*humanConfirmation\.id,\s*humanConfirmation\.textHash/)
   assert.match(store, /requireConfirmationSlot\(get\(\)\.humanConfirmation\)/)
   assert.match(store, /Confirmation changed; review the visible draft/)
+})
+
+test('confirmation decisions lead while binding metadata stays collapsed', async () => {
+  const client = await source('../src/transport/client.ts')
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  const styles = await source('../src/index.css')
+  const humanDialog = canvas.slice(
+    canvas.indexOf('{humanConfirmation && ('),
+    canvas.indexOf('{!humanConfirmation && structuralPreview && ('),
+  )
+  const bindingDetails = humanDialog.indexOf(
+    '<details className="structural-confirm-binding">',
+  )
+
+  assert.ok(bindingDetails > humanDialog.indexOf('humanConfirmation.text'))
+  assert.ok(bindingDetails > humanDialog.indexOf('humanConfirmation.details.map'))
+  assert.ok(bindingDetails > humanDialog.indexOf('humanConfirmation.expiresAt'))
+  assert.match(humanDialog, /<summary>Binding details<\/summary>/)
+  assert.match(humanDialog, /humanConfirmation\.binding\.map/)
+  assert.match(client, /details: \[\s*`Requested by \$\{actor/)
+  assert.match(client, /details: \[\s*'Requested by browser agent',\s*'One use only'/)
+  assert.match(client, /binding: \[\s*`Project:/)
+  assert.match(client, /Action: state policy/)
+  assert.match(client, /Bound request SHA-256:/)
+  assert.match(
+    styles,
+    /\.structural-confirm-binding summary \{[^}]*color: #d2a666;[^}]*font-size: 10\.5px;/,
+  )
+  assert.equal(
+    canvas.match(/<details className="structural-confirm-binding">/g)?.length,
+    2,
+  )
 })
 
 test('confirmation metadata wraps without sharing the action row layout', async () => {
