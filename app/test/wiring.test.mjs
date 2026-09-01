@@ -458,6 +458,29 @@ test('selection settling, project clearing, and cosmetic 409 handling preserve l
   assert.match(client, /await refreshSnapshot\(candidate\)/)
 })
 
+test('live fleet dispatch metadata, polling cleanup, and honest copy are wired', async () => {
+  const client = await source('../src/transport/client.ts')
+  const fleet = await source('../src/transport/fleet.ts')
+  const tools = await source('../src/webmcp/tools.ts')
+  const panel = await source('../src/components/FlightPanel.tsx')
+  const app = await source('../src/App.tsx')
+  assert.match(client, /fleet-status/)
+  assert.match(client, /fleet-requests/)
+  assert.match(client, /void liveFleet\.dispatch\(dispatched\.node_id\)/)
+  assert.match(client, /liveFleet\.noteLedgerEvent\(data\.event\)/)
+  assert.match(tools, /fleetResultForDispatch\(id\)/)
+  assert.match(tools, /withFleetMetadata/)
+  assert.match(panel, /liveFleetDisplayText\(liveFleet\)/)
+  assert.match(fleet, /10_000/)
+  assert.match(fleet, /Live fleet: queued/)
+  assert.match(fleet, /Live fleet: worker starting/)
+  assert.match(
+    fleet,
+    /The shared live fleet is busy right now — live execution is demonstrated in the video\./,
+  )
+  assert.match(app, /return unmountLiveFleet/)
+})
+
 test('lineage folds and remap dossiers do not depend on bounded event history', async () => {
   const store = await source('../src/store/mission-store.ts')
   const tools = await source('../src/webmcp/tools.ts')
