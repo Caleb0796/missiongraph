@@ -71,6 +71,32 @@ describe("event contract", () => {
     store.close();
   });
 
+  it("re-validates authorization attached after parsing before any append", () => {
+    for (const mode of ["single", "batch"] as const) {
+      const store = new EventStore(":memory:");
+      store.createProject("project", "token", "2026-08-30T10:00:00.000Z");
+      store.append("project", eventFixtures.TASK_ADDED);
+      const input = parseEventInput(eventFixtures.DISPATCHED);
+      if (input.type !== "DISPATCHED") throw new Error("expected dispatch fixture");
+      const authorize = () => {
+        input.payload.authorization = {
+          capability_ref: "capability-a",
+          confirmed_at: "2026-08-30T10:00:01.000Z",
+          request_origin: "same-origin",
+          use_nonce: "bad/value",
+        };
+      };
+
+      expect(() =>
+        mode === "single"
+          ? store.append("project", input, { authorize })
+          : store.appendBatch("project", [input], "dispatch-batch", { authorize }),
+      ).toThrow(/payload\.authorization\.use_nonce/);
+      expect(store.listEvents("project")).toHaveLength(1);
+      store.close();
+    }
+  });
+
   it("returns the original sequence for an idempotent duplicate", () => {
     const store = new EventStore(":memory:");
     store.createProject("project", "token", "2026-08-30T10:00:00.000Z");

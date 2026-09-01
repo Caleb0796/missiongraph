@@ -12,6 +12,7 @@ import {
   UnknownProjectError,
   parseActor,
   parseEventInput,
+  parseIdentifier,
   reporterEventTypes,
   type Actor,
   type Event,
@@ -163,7 +164,11 @@ function capabilityHeaders(request: FastifyRequest): {
   if (!ref || !token || !nonce) {
     throw new CapabilityError("capability_required", "Visible human confirmation is required for this action.");
   }
-  return { ref, token, nonce };
+  return {
+    ref: parseIdentifier(ref, "x-mg-capability-ref"),
+    token: parseIdentifier(token, "x-mg-capability"),
+    nonce: parseIdentifier(nonce, "x-mg-nonce"),
+  };
 }
 
 const nodeScopedReporterEventTypes = new Set([
