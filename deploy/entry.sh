@@ -97,12 +97,13 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ] && [ "${codex_ready:-0}" = "1" ]; then
     # cloned repository, and log the tail. On a container where the Linux sandbox or
     # its network gate does not work, this line is the fastest explanation of why
     # workers exit without ever reporting.
-    worker_probe=$(codex exec -C /data/target-repo -s workspace-write \
+    worker_sandbox="${MG_CODEX_SANDBOX:-workspace-write}"
+    worker_probe=$(codex exec -C /data/target-repo -s "$worker_sandbox" \
       -c 'sandbox_workspace_write.network_access=true' -c 'mcp_servers={}' --skip-git-repo-check \
       ${MG_CODEX_MODEL:+-m "$MG_CODEX_MODEL"} \
       "Run exactly this shell command and reply with only its raw output: curl -s -m 5 http://127.0.0.1:${PORT}/api/health; printf ' exit=%s' \$?" \
       </dev/null 2>&1 | tail -c 300 | tr '\n' ' ') || true
-    echo "[entry] worker-mode probe: ${worker_probe:-<no output>}" >&2
+    echo "[entry] worker-mode probe (sandbox=$worker_sandbox): ${worker_probe:-<no output>}" >&2
   fi
 
   if [ "$bridge_project_ready" = "1" ]; then
