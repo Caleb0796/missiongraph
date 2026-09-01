@@ -82,9 +82,10 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ] && [ "${codex_ready:-0}" = "1" ]; then
       if ! git clone "${MG_TARGET_REPO_URL}" /data/target-repo 2>&1; then
         echo "BRIDGE DISABLED: could not clone MG_TARGET_REPO_URL" >&2
         bridge_project_ready=0
-      else
-        git -C /data/target-repo config user.email "fleet@missiongraph.local"
-        git -C /data/target-repo config user.name "MissionGraph Fleet"
+      elif ! git -C /data/target-repo config user.email "fleet@missiongraph.local" ||
+          ! git -C /data/target-repo config user.name "MissionGraph Fleet"; then
+        echo "BRIDGE DISABLED: could not configure the cloned target repository" >&2
+        bridge_project_ready=0
       fi
     fi
   fi
