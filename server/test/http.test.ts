@@ -1840,6 +1840,155 @@ describe("HTTP and streaming contract", () => {
     expect(enqueued.json()).toMatchObject({ error: { code: "node_not_dispatched" } });
   });
 
+  it("rejects an exact-copy task authored after the clone baseline at enqueue", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+    addFleetNode(store, "seed", "template", "Build API", "Implement it.", false);
+    const clone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const body = clone.json<{ project: string; token: string }>();
+    addFleetNode(store, body.project, "authored-copy", "Build API", "Implement it.", false);
+    registerBrowserSession(store, body.project, "clone-session", "clone-proof");
+    const dispatch = await dispatchFleetNode(app, {
+      project: body.project,
+      token: body.token,
+      nodeId: "authored-copy",
+      session: "clone-session",
+      proof: "clone-proof",
+      nonce: "authored-copy-dispatch",
+    });
+
+    const enqueued = await app.inject({
+      method: "POST",
+      url: `/api/p/${body.project}/fleet-requests`,
+      headers: { "x-mg-token": body.token },
+      payload: { node_id: "authored-copy" },
+    });
+
+    expect(dispatch.dispatched.statusCode).toBe(200);
+    expect(enqueued.statusCode).toBe(400);
+    expect(enqueued.json()).toMatchObject({ error: { code: "template_mismatch" } });
+  });
+
+  it("rejects an exact-copy task authored after the clone baseline at claim", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+    addFleetNode(store, "seed", "template", "Build API", "Implement it.", false);
+    const clone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const body = clone.json<{ project: string; token: string }>();
+    addFleetNode(store, body.project, "authored-copy", "Build API", "Implement it.", false);
+    registerBrowserSession(store, body.project, "clone-session", "clone-proof");
+    const dispatch = await dispatchFleetNode(app, {
+      project: body.project,
+      token: body.token,
+      nodeId: "authored-copy",
+      session: "clone-session",
+      proof: "clone-proof",
+      nonce: "authored-copy-dispatch",
+    });
+    store.database.prepare(
+      `INSERT INTO fleet_requests
+        (id, project_id, node_id, status, outcome, note, created_at, adopted_at, finished_at)
+       VALUES (?, ?, ?, 'queued', NULL, NULL, ?, NULL, NULL)`,
+    ).run("authored-copy-request", body.project, "authored-copy", "2026-08-30T10:00:00.000Z");
+
+    const claimed = await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    const stored = store.database
+      .prepare("SELECT status, outcome FROM fleet_requests WHERE id = ?")
+      .get("authored-copy-request");
+
+    expect(dispatch.dispatched.statusCode).toBe(200);
+    expect(claimed.statusCode).toBe(204);
+    expect(stored).toEqual({ status: "failed", outcome: "template_mismatch" });
+  });
+
+  it("rejects a split child created after the clone baseline", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+    addFleetNode(store, "seed", "template", "Build API", "Implement it.", false);
+    const clone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const body = clone.json<{ project: string; token: string }>();
+    const parent = store.listEvents(body.project).find((event) => event.type === "TASK_ADDED");
+    if (!parent || parent.type !== "TASK_ADDED") throw new Error("cloned task missing");
+    store.append(body.project, {
+      actor: "human",
+      type: "TASK_SPLIT",
+      payload: {
+        parent_id: parent.payload.node.id,
+        children: [
+          {
+            id: "split-child",
+            title: "Build API",
+            brief: "Implement it.",
+            estimate_min: 12,
+            tags: ["fleet"],
+            state: "queued",
+          },
+        ],
+        edge_remap: [],
+      },
+      idem_key: "split-template",
+    });
+    registerBrowserSession(store, body.project, "clone-session", "clone-proof");
+    const dispatch = await dispatchFleetNode(app, {
+      project: body.project,
+      token: body.token,
+      nodeId: "split-child",
+      session: "clone-session",
+      proof: "clone-proof",
+      nonce: "split-child-dispatch",
+    });
+
+    const enqueued = await app.inject({
+      method: "POST",
+      url: `/api/p/${body.project}/fleet-requests`,
+      headers: { "x-mg-token": body.token },
+      payload: { node_id: "split-child" },
+    });
+
+    expect(dispatch.dispatched.statusCode).toBe(200);
+    expect(enqueued.statusCode).toBe(400);
+    expect(enqueued.json()).toMatchObject({ error: { code: "template_mismatch" } });
+  });
+
+  it("accepts an inherited template task with a fresh confirmed dispatch", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+    addFleetNode(store, "seed", "template", "Build API", "Implement it.", false);
+    const clone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const body = clone.json<{ project: string; token: string }>();
+    const inherited = store.listEvents(body.project).find((event) => event.type === "TASK_ADDED");
+    if (!inherited || inherited.type !== "TASK_ADDED") throw new Error("cloned task missing");
+    registerBrowserSession(store, body.project, "clone-session", "clone-proof");
+    const dispatch = await dispatchFleetNode(app, {
+      project: body.project,
+      token: body.token,
+      nodeId: inherited.payload.node.id,
+      session: "clone-session",
+      proof: "clone-proof",
+      nonce: "inherited-task-dispatch",
+    });
+
+    const enqueued = await app.inject({
+      method: "POST",
+      url: `/api/p/${body.project}/fleet-requests`,
+      headers: { "x-mg-token": body.token },
+      payload: { node_id: inherited.payload.node.id },
+    });
+    const claimed = await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+
+    expect(dispatch.dispatched.statusCode).toBe(200);
+    expect(enqueued.statusCode).toBe(200);
+    expect(claimed.json()).toMatchObject({ project_id: body.project, node_id: inherited.payload.node.id });
+  });
+
   it("rejects a post-clone dispatch authorized by a capability consumed in another clone", async () => {
     const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
     store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
