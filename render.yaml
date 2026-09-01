@@ -23,9 +23,12 @@ services:
       # Set after importing the real-run seed (see deploy/DEPLOY.md step 4):
       - key: SEED_PROJECT_ID
         sync: false
-      # Flagship fleet (step 5) — leave BRIDGE_ENABLED=0 until the seed is in place:
+      # Flagship fleet (step 5). Dashboard-owned (sync: false): a literal value here is
+      # re-applied on every Blueprint sync and silently flipped the live switch back to 0
+      # when an unrelated render.yaml change was pushed. Set it to 1 in the dashboard,
+      # last, after every other variable is in place.
       - key: BRIDGE_ENABLED
-        value: "0"
+        sync: false
       - key: MG_PROJECT_ID
         sync: false
       - key: MG_VISITOR_TOKEN
@@ -61,8 +64,9 @@ services:
         value: danger-full-access
       # Judge fleet (a clone may borrow the bridge for ONE human-confirmed, template-bound task).
       # Everything below is inert while FLEET_MODE is 0 — the merged code changes nothing here.
+      # Dashboard-owned for the same reason as BRIDGE_ENABLED (set to 1 for judging).
       - key: FLEET_MODE
-        value: "0"
+        sync: false
       # Worst-case spend is bounded by daily cap x judging days, so keep the cap low and ALSO set
       # a hard spend limit on the API key itself — that limit is the backstop that does not
       # depend on this code being correct.
