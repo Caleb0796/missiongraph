@@ -100,7 +100,14 @@ class FleetClient {
       {
         method: "POST",
         headers: { "x-mg-reporter": this.config.reporterCredential },
-        signal: requestSignal(signal, Math.min(this.config.fleetHeartbeatMs, fleetRequestTimeoutMs)),
+        // Cap the network timeout at the heartbeat cadence so requests never pile up past
+        // one interval (heartbeatInFlight already drops overlapping ticks), but keep a real
+        // floor: a test-speed cadence of a few ms must not shrink an HTTP timeout below
+        // what a healthy localhost round-trip needs on a slow CI runner.
+        signal: requestSignal(
+          signal,
+          Math.max(1_000, Math.min(this.config.fleetHeartbeatMs, fleetRequestTimeoutMs)),
+        ),
       },
     );
     if (await staleFleetResponse(response)) return false;
