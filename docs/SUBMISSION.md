@@ -15,7 +15,7 @@ MissionGraph is a live task-DAG canvas shared by three kinds of minds:
 - **Your browser agent** (ChatGPT via WebMCP) plans missions onto the graph, narrates everything you missed, clears approval queues under policies you state in one sentence and visibly confirm (the agent cannot self-authorize — one confirmation mints a nonce-bound, multi-use grant, and every approval records the policy it cited), finds idle work, and re-engineers the graph mid-flight — through 26 WebMCP tools.
 - **A real Codex worker fleet** executes tasks in isolated git worktrees, reporting lifecycle, logs, and structured handoffs through node-bound short-lived credentials, coordinated by a Codex supervisor whose every scheduling decision is a recorded, auditable turn.
 
-Three scenarios: S1 Genesis (co-planning a paragraph into a DAG), S2 Flight (co-supervision of live workers), S3 Rewire (mid-flight re-engineering with blast-radius previews).
+Three scenarios: S1 Genesis (co-planning a paragraph into a DAG), S2 Flight (co-supervision of live workers), S3 Rewire (recording a mid-flight split after previewing its stale/pausing-work blast radius, re-routing edges, and recomputing the critical path). A running worker keeps its original brief until it exits; the supervisor can then re-brief the idle thread.
 
 ## Why WebMCP (the challenge question)
 

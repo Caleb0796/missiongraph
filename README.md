@@ -12,7 +12,7 @@ Parallel agent fleets are fast — and illegible. A linear chat loop is legible 
 
 - **S1 · Genesis** — describe the mission in a paragraph; your browser agent plans it as a dependency DAG on the canvas (`plan_seed`), you drag, it splits oversized nodes; the critical path ignites.
 - **S2 · Flight** — real Codex workers execute in parallel. Ask your agent to *catch you up* (`graph_digest` narrates everything you missed), state a one-sentence approval policy and let the agent clear the review queue under it (`policy_ref` on every agent approval — auditable), staff the idle branch the radar found.
-- **S3 · Rewire** — mid-flight you split a running task: the blast radius (stale/pausing work) is previewed before anything applies, workers get re-briefed, the critical path re-routes live.
+- **S3 · Rewire** — mid-flight you split a running task: the split is recorded after the blast radius (stale/pausing work) is previewed, edges re-route, and the critical path recomputes. A running worker keeps its original brief until it exits; the supervisor can then re-brief the idle thread.
 
 ## Architecture
 
