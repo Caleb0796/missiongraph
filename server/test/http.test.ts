@@ -1569,6 +1569,197 @@ describe("HTTP and streaming contract", () => {
     expect(authorized.json()).toEqual({ seq: 2 });
   });
 
+  it("prevents a worker from approving itself while preserving the approval happy path", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    store.issueReporterCredential("project", "worker:a", "2026-08-30T10:00:00.000Z", "worker-a-token");
+    registerBrowserSession(store, "project", "session-a", "proof-a");
+    store.append("project", {
+      actor: "human",
+      type: "TASK_ADDED",
+      payload: {
+        node: { id: "a", title: "Task A", brief: "Build A.", estimate_min: 10, tags: [], state: "queued" },
+      },
+      idem_key: "add-a",
+    });
+    const report = (
+      token: string,
+      actor: "worker:a" | "supervisor",
+      type: string,
+      payload: Record<string, unknown>,
+      idemKey: string,
+    ) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { actor, type, payload, idem_key: idemKey },
+    });
+
+    const running = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "queued", to: "running" },
+      "a-running",
+    );
+    const review = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "running", to: "review" },
+      "a-review",
+    );
+    const runningRetry = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "queued", to: "running" },
+      "a-running",
+    );
+    const selfApprove = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "review", to: "done" },
+      "a-self-approved",
+    );
+    const selfRestart = await report(
+      "worker-a-token",
+      "worker:a",
+      "NODE_STATE_CHANGED",
+      { node_id: "a", from: "review", to: "running" },
+      "a-self-restarted",
+    );
+    const afterReproduction = await app.inject({
+      method: "GET",
+      url: "/api/p/project/snapshot",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect([running.statusCode, review.statusCode, runningRetry.statusCode]).toEqual([200, 200, 200]);
+    expect(runningRetry.json()).toEqual(running.json());
+    expect([selfApprove.statusCode, selfRestart.statusCode]).toEqual([403, 403]);
+    expect(selfApprove.json()).toMatchObject({
+      error: { code: "transition_not_permitted_for_actor" },
+    });
+    expect(afterReproduction.json()).toMatchObject({
+      state: { nodes: { a: { state: "review" } }, approvals: {} },
+    });
+
+    const handoff = await report(
+      "worker-a-token",
+      "worker:a",
+      "HANDOFF_FILED",
+      { node_id: "a", handoff: baseHandoff },
+      "a-handoff",
+    );
+    const approval = await report(
+      "reporter-secret",
+      "supervisor",
+      "APPROVAL_CREATED",
+      { approval_id: "approval-a", node_id: "a", summary: "Review task A." },
+      "approval-a",
+    );
+    const { grant } = await issuePolicy(app, {
+      project: "project",
+      token: "visitor-token",
+      session: "session-a",
+      proof: "proof-a",
+    });
+    const approved = await app.inject({
+      method: "POST",
+      url: "/api/p/project/agent-mutations",
+      headers: {
+        "x-mg-token": "visitor-token",
+        "x-mg-session": "session-a",
+        "x-mg-session-proof": "proof-a",
+        "x-mg-capability-ref": grant.policy_ref,
+        "x-mg-capability": grant.capability,
+        "x-mg-nonce": "approve-a",
+      },
+      payload: {
+        type: "APPROVED",
+        payload: { approval_id: "approval-a", node_id: "a", policy_ref: grant.policy_ref },
+        idem_key: "approved-a",
+      },
+    });
+    const snapshot = await app.inject({
+      method: "GET",
+      url: "/api/p/project/snapshot",
+      headers: { "x-mg-token": "visitor-token" },
+    });
+
+    expect([handoff.statusCode, approval.statusCode, approved.statusCode]).toEqual([200, 200, 200]);
+    expect(snapshot.json()).toMatchObject({
+      state: {
+        nodes: { a: { state: "done" } },
+        approvals: { "approval-a": { status: "approved" } },
+      },
+    });
+  });
+
+  it("requires review rejection before a worker may report failure", async () => {
+    const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
+    store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");
+    for (const nodeId of ["before", "pending"]) {
+      store.issueReporterCredential(
+        "project",
+        `worker:${nodeId}`,
+        "2026-08-30T10:00:00.000Z",
+        `worker-${nodeId}-token`,
+      );
+      store.append("project", {
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: {
+          node: {
+            id: nodeId,
+            title: `Task ${nodeId}`,
+            brief: `Build ${nodeId}.`,
+            estimate_min: 10,
+            tags: [],
+            state: "running",
+          },
+        },
+        idem_key: `add-${nodeId}`,
+      });
+      store.append("project", {
+        actor: `worker:${nodeId}`,
+        type: "HANDOFF_FILED",
+        payload: { node_id: nodeId, handoff: baseHandoff },
+        idem_key: `handoff-${nodeId}`,
+      });
+    }
+    store.append("project", {
+      actor: "supervisor",
+      type: "APPROVAL_CREATED",
+      payload: { approval_id: "approval-pending", node_id: "pending", summary: "Review pending." },
+      idem_key: "approval-pending",
+    });
+    const fail = (nodeId: string) => app.inject({
+      method: "POST",
+      url: "/api/p/project/report",
+      headers: { authorization: `Bearer worker-${nodeId}-token` },
+      payload: {
+        actor: `worker:${nodeId}`,
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: nodeId, from: "review", to: "failed" },
+        idem_key: `failed-${nodeId}`,
+      },
+    });
+
+    const beforeApproval = await fail("before");
+    const pendingApproval = await fail("pending");
+
+    expect(beforeApproval.statusCode).toBe(403);
+    expect(pendingApproval.statusCode).toBe(403);
+    for (const response of [beforeApproval, pendingApproval]) {
+      expect(response.json()).toMatchObject({
+        error: { code: "transition_not_permitted_for_actor" },
+      });
+    }
+  });
+
   it("binds worker reporter events to the credential node", async () => {
     const { app, store } = server({ now: () => new Date("2026-08-30T10:05:00.000Z") });
     store.createProject("project", "visitor-token", "2026-08-30T10:00:00.000Z");

@@ -247,7 +247,47 @@ function batchInputs(
   return { idemKey: body.idem_key, inputs };
 }
 
+class IngressPolicyError extends Error {
+  constructor(
+    readonly statusCode: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "IngressPolicyError";
+  }
+}
+
+const workerStateTransitions = new Set([
+  "queued->running",
+  "running->review",
+  "running->failed",
+]);
+
+function validateReporterTransition(input: EventInput): void {
+  if (input.type !== "NODE_STATE_CHANGED") return;
+  if (input.payload.to === "done") {
+    throw new IngressPolicyError(
+      403,
+      "transition_not_permitted_for_actor",
+      "Nodes may reach done only through an APPROVED event.",
+    );
+  }
+  if (!input.actor.startsWith("worker:")) return;
+  const transition = `${input.payload.from}->${input.payload.to}`;
+  if (!workerStateTransitions.has(transition)) {
+    throw new IngressPolicyError(
+      403,
+      "transition_not_permitted_for_actor",
+      `Worker actors may not report ${transition} transitions.`,
+    );
+  }
+}
+
 function errorReply(error: unknown, reply: FastifyReply): FastifyReply {
+  if (error instanceof IngressPolicyError) {
+    return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+  }
   if (error instanceof FleetQueueError) {
     return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
   }
@@ -878,6 +918,10 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       }
       if (!reporterEventTypes.has(input.type) && !(input.actor === "supervisor" && input.type === "JOURNAL_NOTE")) {
         throw new EventValidationError(`${input.type} is not a fleet reporter event`);
+      }
+      const events = store.listEvents(project);
+      if (!events.some((event) => event.idem_key === input.idem_key)) {
+        validateReporterTransition(input);
       }
       const result = store.append(project, input, { ts: reportTime.toISOString() });
       return reply.send({ seq: result.event.seq });

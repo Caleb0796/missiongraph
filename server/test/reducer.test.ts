@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Event, EventInput, TaskNode } from "../src/events.js";
-import { GraphValidationError, initialState, reduceEvent, type GraphState } from "../src/reducer.js";
+import { fold, GraphValidationError, initialState, reduceEvent, type GraphState } from "../src/reducer.js";
 import { baseHandoff } from "./fixtures.js";
 
 const task = (id: string, estimate_min: number): TaskNode => ({
@@ -41,6 +41,49 @@ function link(state: GraphState, upstream: string, downstream: string, kind: "de
 }
 
 describe("deterministic reducer", () => {
+  it("folds historical worker review-to-done events without applying ingress policy", () => {
+    const events: Event[] = [
+      {
+        seq: 1,
+        project_id: "project",
+        ts: "2026-08-30T10:00:00.000Z",
+        actor: "human",
+        type: "TASK_ADDED",
+        payload: { node: task("a", 5) },
+        idem_key: "add-a",
+      },
+      {
+        seq: 2,
+        project_id: "project",
+        ts: "2026-08-30T10:01:00.000Z",
+        actor: "worker:a",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "a", from: "queued", to: "running" },
+        idem_key: "a-running",
+      },
+      {
+        seq: 3,
+        project_id: "project",
+        ts: "2026-08-30T10:02:00.000Z",
+        actor: "worker:a",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "a", from: "running", to: "review" },
+        idem_key: "a-review",
+      },
+      {
+        seq: 4,
+        project_id: "project",
+        ts: "2026-08-30T10:03:00.000Z",
+        actor: "worker:a",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "a", from: "review", to: "done" },
+        idem_key: "a-done",
+      },
+    ];
+
+    expect(fold(events).nodes.a?.state).toBe("done");
+  });
+
   it("rejects dependency cycles but excludes conflict edges from cycle checks", () => {
     let state = add(initialState(), "a", 5);
     state = add(state, "b", 10);
