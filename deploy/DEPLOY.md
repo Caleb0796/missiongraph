@@ -48,7 +48,17 @@ Response gives `project_id`. Set `SEED_PROJECT_ID=<project_id>` in Render env �
 
 ## 5. Enable the flagship fleet (optional until demo week)
 
-Clone one flagship mission (POST `/api/clone-demo`), keep its `project`/`token`. In Render env set: `BRIDGE_ENABLED=1`, `MG_PROJECT_ID`, `MG_VISITOR_TOKEN`, `MG_TARGET_REPO_URL` (a public demo repo the workers may modify — use a throwaway fork), `OPENAI_API_KEY` (project-scoped key with a **hard spend cap**; NEVER a ChatGPT login on the VM), `MG_CODEX_MODEL` (verify availability first: shell into the instance and run `codex -m <model> exec 'say ok'`). Redeploy.
+Clone one flagship mission (POST `/api/clone-demo`), keep its `project`/`token`. In Render env set: `BRIDGE_ENABLED=1`, `MG_PROJECT_ID`, `MG_VISITOR_TOKEN`, `MG_TARGET_REPO_URL` (a public demo repo the workers may modify — use a throwaway fork), `OPENAI_API_KEY` (project-scoped key with a **hard spend cap**; NEVER a ChatGPT login on the VM), `MG_CODEX_MODEL`. Redeploy.
+
+**Codex ignores `OPENAI_API_KEY` in the environment.** Given only the variable it sends no credential at all and every worker dies on `Missing bearer or basic authentication in header`. `entry.sh` therefore pipes the key into `codex login --with-api-key` on boot, writing the credential to `CODEX_HOME=/data/codex` (700, on the persistent disk, inherited by worker children through the existing `CODEX_`/`OPENAI_` allowlist). It then runs one throwaway `codex exec` to prove the key can actually reach `MG_CODEX_MODEL`, and refuses to start the bridge if it cannot — better one clear boot failure than a stream of adopted tasks dying after the judge already confirmed them. Both steps read the key from stdin, never from argv.
+
+Flip `BRIDGE_ENABLED=1` **last**, after every other variable is in place: while it is `0` there is no worker process on the VM, so nothing can be spent and nothing can execute.
+
+### Judge fleet (a clone may borrow the bridge for ONE human-confirmed, template-bound task)
+
+Set `FLEET_MODE=1` on the same service to open the fleet routes and the bridge's adoption loop; `FLEET_DAILY_CAP`, `FLEET_PER_PROJECT_CAP`, `FLEET_ADOPT_TTL_MIN` and `FLEET_RUN_TTL_MIN` carry the defaults declared in `render.yaml`. With `FLEET_MODE` unset or `0` every fleet route returns `fleet_disabled` and the bridge never polls, so the merged code is inert.
+
+Worst-case spend is bounded by `FLEET_DAILY_CAP` × judging days. Set a hard spend limit on the API key itself as well — that limit is the only backstop that does not depend on this code being correct.
 
 Supervisor policy stays at two automatic critical-path workers + one explicit-dispatch slot (GOAL_PLAN §13); do not raise it for the public demo.
 

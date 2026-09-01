@@ -16,6 +16,26 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ]; then
   : "${MG_TARGET_REPO_URL:?BRIDGE_ENABLED=1 requires MG_TARGET_REPO_URL}"
   : "${OPENAI_API_KEY:?BRIDGE_ENABLED=1 requires OPENAI_API_KEY (never a ChatGPT login on the VM)}"
 
+  # Codex does NOT read OPENAI_API_KEY from the environment: without this login it sends no
+  # credential at all and every worker dies on "Missing bearer or basic authentication in header".
+  # Piping from stdin keeps the key out of the process list. CODEX_HOME lives on the persistent
+  # disk so the credential is written once per boot to a path the bridge's workers inherit.
+  export CODEX_HOME="${CODEX_HOME:-/data/codex}"
+  mkdir -p "$CODEX_HOME"
+  chmod 700 "$CODEX_HOME"
+  printf '%s' "${OPENAI_API_KEY}" | codex login --with-api-key >/dev/null 2>&1 || {
+    echo "codex login with the provided OPENAI_API_KEY failed" >&2
+    exit 1
+  }
+
+  # Fail fast on a key that cannot reach the configured model, rather than letting every judge's
+  # task die one at a time after adoption.
+  if ! codex exec -s read-only -c 'mcp_servers={}' \
+      ${MG_CODEX_MODEL:+-m "$MG_CODEX_MODEL"} "reply with ok" </dev/null >/dev/null 2>&1; then
+    echo "codex cannot run ${MG_CODEX_MODEL:-the default model} with this API key" >&2
+    exit 1
+  fi
+
   tries=0
   until curl -fsS -H "x-mg-token: ${MG_VISITOR_TOKEN}" \
     "http://127.0.0.1:${PORT}/api/p/${MG_PROJECT_ID}/snapshot" >/dev/null 2>&1; do
