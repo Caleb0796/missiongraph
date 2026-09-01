@@ -87,9 +87,9 @@ function summary(event: MissionEvent): string {
 export function workerBrief(nodeId: string, brief: string, repoPath: string): string {
   return `MISSIONGRAPH WORKER
 
-Node ID: ${nodeId}
-Task brief: ${brief}
-Target repository: ${repoPath}
+Node ID: ${JSON.stringify(nodeId)}
+Task brief: ${JSON.stringify(brief)}
+Target repository: ${JSON.stringify(repoPath)}
 
 Work only on this task in the provided isolated git worktree. Commit your completed changes. Never merge branches. Follow the repository's own instructions.
 

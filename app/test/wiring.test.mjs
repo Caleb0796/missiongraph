@@ -97,6 +97,28 @@ test('plan_seed uses one batch and native edits stage a visible confirmation', a
   assert.match(inspector, /annotations\[node\.id\]/)
 })
 
+test('live plan_seed keeps temp_id local while wiring persistent task ids', async () => {
+  const tools = await source('../src/webmcp/tools.ts')
+  const planSeed = tools.slice(
+    tools.indexOf("name: 'plan_seed'"),
+    tools.indexOf('const addTask'),
+  )
+  const batchIdMap = planSeed.slice(
+    planSeed.indexOf('const batchIds'),
+    planSeed.indexOf('const candidateEdges'),
+  )
+
+  assert.match(
+    batchIdMap,
+    /const batchIds = new Map\(\s*tasks\.map\(\(task\) => \[task\.temp_id, crypto\.randomUUID\(\)\]\),\s*\)/,
+  )
+  assert.doesNotMatch(batchIdMap, /connectionMode/)
+  assert.match(planSeed, /const upstream = batchIds\.get\(dep\) \?\? dep/)
+  assert.match(planSeed, /const downstream = batchIds\.get\(task\.temp_id\)!/)
+  assert.match(planSeed, /id: batchIds\.get\(task\.temp_id\)!/)
+  assert.match(planSeed, /node_id: batchIds\.get\(task\.temp_id\)!/)
+})
+
 test('all M4 tools stage policy confirmation and require policy attribution', async () => {
   const tools = await source('../src/webmcp/tools.ts')
   const client = await source('../src/transport/client.ts')

@@ -195,9 +195,19 @@ function string(value: unknown, label: string): string {
   return value;
 }
 
-function identifier(value: unknown, label: string): string {
+function nonEmptyString(value: unknown, label: string): string {
   const parsed = string(value, label);
   if (parsed.length === 0) throw new EventValidationError(`${label} must not be empty`);
+  return parsed;
+}
+
+function identifier(value: unknown, label: string): string {
+  const parsed = nonEmptyString(value, label);
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(parsed)) {
+    throw new EventValidationError(
+      `${label} must be 1-128 characters using only letters, numbers, dot, underscore, colon, or hyphen`,
+    );
+  }
   return parsed;
 }
 
@@ -282,8 +292,8 @@ function authorizationAudit(value: unknown): AuthorizationAudit {
     ...(item.policy_text === undefined
       ? {}
       : { policy_text: string(item.policy_text, "payload.authorization.policy_text") }),
-    confirmed_at: identifier(item.confirmed_at, "payload.authorization.confirmed_at"),
-    request_origin: identifier(item.request_origin, "payload.authorization.request_origin"),
+    confirmed_at: nonEmptyString(item.confirmed_at, "payload.authorization.confirmed_at"),
+    request_origin: nonEmptyString(item.request_origin, "payload.authorization.request_origin"),
     use_nonce: identifier(item.use_nonce, "payload.authorization.use_nonce"),
   };
 }
@@ -302,7 +312,8 @@ export function parseActor(value: unknown): Actor {
   if (value === "human" || value === "browser_agent" || value === "supervisor") {
     return value;
   }
-  if (typeof value === "string" && value.startsWith("worker:") && value.length > 7) {
+  if (typeof value === "string" && value.startsWith("worker:")) {
+    identifier(value.slice("worker:".length), "actor worker id");
     return value as `worker:${string}`;
   }
   throw new EventValidationError("actor is invalid");
@@ -429,13 +440,13 @@ export function parsePayload<T extends EvType>(type: T, value: unknown): EventPa
           : { max_uses: number(payload.max_uses, "payload.max_uses", 1) }),
         ...(payload.expires_at === undefined
           ? {}
-          : { expires_at: identifier(payload.expires_at, "payload.expires_at") }),
+          : { expires_at: nonEmptyString(payload.expires_at, "payload.expires_at") }),
         ...(payload.confirmed_at === undefined
           ? {}
-          : { confirmed_at: identifier(payload.confirmed_at, "payload.confirmed_at") }),
+          : { confirmed_at: nonEmptyString(payload.confirmed_at, "payload.confirmed_at") }),
         ...(payload.request_origin === undefined
           ? {}
-          : { request_origin: identifier(payload.request_origin, "payload.request_origin") }),
+          : { request_origin: nonEmptyString(payload.request_origin, "payload.request_origin") }),
       };
       break;
     case "ANNOTATED":
@@ -1046,6 +1057,7 @@ export class EventStore {
 
   stageHumanDraft(input: HumanDraft): HumanDraft {
     if (!this.hasProject(input.project_id)) throw new UnknownProjectError(input.project_id);
+    const draft = { ...input, id: identifier(input.id, "draft.id") };
     this.database
       .prepare(
         `INSERT INTO human_drafts
@@ -1054,19 +1066,19 @@ export class EventStore {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        input.id,
-        input.project_id,
-        input.session_id,
-        input.kind,
-        JSON.stringify(input.actions),
-        input.subject_hash,
-        input.display_text,
-        input.policy_text ?? null,
-        input.max_uses,
-        input.created_at,
-        input.expires_at,
+        draft.id,
+        draft.project_id,
+        draft.session_id,
+        draft.kind,
+        JSON.stringify(draft.actions),
+        draft.subject_hash,
+        draft.display_text,
+        draft.policy_text ?? null,
+        draft.max_uses,
+        draft.created_at,
+        draft.expires_at,
       );
-    return input;
+    return draft;
   }
 
   confirmHumanDraft(input: {
