@@ -89,6 +89,7 @@ export function PulseBar({
         </div>
         <Stat label="Ready" value={counts.ready} tone="bg-blue-400" />
         <Stat label="Running" value={counts.running} tone="bg-cyan-400" />
+        <Stat label="Paused" value={counts.paused} tone="bg-sky-300" />
         <Stat label="Review" value={counts.review} tone="bg-amber-300" />
         <Stat label="Done" value={counts.done} tone="bg-emerald-400" />
         <Stat label="Blocked" value={counts.blocked} tone="bg-slate-500" />

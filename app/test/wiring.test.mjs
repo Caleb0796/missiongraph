@@ -344,6 +344,12 @@ test('capability links and fixture labeling stay explicit', async () => {
   assert.doesNotMatch(pulse, /connectionMessage\.includes\('fixture projection'\)/)
 })
 
+test('pulse reports paused workers from visitor clones', async () => {
+  const pulse = await source('../src/components/PulseBar.tsx')
+  assert.match(pulse, /<Stat label="Running" value=\{counts\.running\}/)
+  assert.match(pulse, /<Stat label="Paused" value=\{counts\.paused\}/)
+})
+
 test('judge first-run prompts and WebMCP guidance are wired into the canvas', async () => {
   const canvas = await source('../src/components/GraphCanvas.tsx')
   const pulse = await source('../src/components/PulseBar.tsx')
