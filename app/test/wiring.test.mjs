@@ -393,11 +393,15 @@ test('judge first-run prompts and WebMCP guidance are wired into the canvas', as
   assert.match(canvas, /claimFirstRunPrompts\(projectId\)/)
   assert.match(canvas, /dismissFirstRunPrompts\(projectId\)/)
   assert.match(canvas, /copyText\(prompt\)/)
+  assert.match(canvas, /className="agent-prompt-copy">Copy</)
+  assert.match(canvas, /Copied — paste it to your agent/)
+  assert.match(canvas, /}, 2_000\)/)
   assert.match(pulse, /aria-label="Show agent prompt suggestions"/)
-  assert.match(
+  assert.doesNotMatch(
     styles,
     /first-run-prompts:not\(\.first-run-prompts--menu-open\) \{ display: none; \}/,
   )
+  assert.match(styles, /\.first-run-prompts > div \{ display: grid; \}/)
   assert.match(canvas, /ChatGPT&apos;s built-in browser works natively/)
   assert.match(canvas, /Enable site tools/)
   assert.match(canvas, /chrome:\/\/flags\/#enable-webmcp-testing/)

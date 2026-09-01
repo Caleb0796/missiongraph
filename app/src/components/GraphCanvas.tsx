@@ -154,6 +154,7 @@ function MissionBoard() {
   const [now, setNow] = useState(() => Date.now())
   const [firstRunOpen, setFirstRunOpen] = useState(false)
   const [firstRunMenuOpen, setFirstRunMenuOpen] = useState(false)
+  const [copiedPrompt, setCopiedPrompt] = useState<string | null>(null)
   const initializedFirstRunProject = useRef<string | null>(null)
   const hasLaidOut = useRef(false)
   const layoutRequest = useRef<{
@@ -167,6 +168,7 @@ function MissionBoard() {
   const replayActive = useRef(false)
   const replayWaitCancel = useRef<(() => void) | null>(null)
   const confirmationCancelRef = useRef<HTMLButtonElement>(null)
+  const promptCopyTimer = useRef<number | null>(null)
   const { fitView, getViewport, setCenter, setViewport } =
     useReactFlow<TaskFlowNode, Edge>()
   const criticalPath = useMemo(
@@ -456,6 +458,7 @@ function MissionBoard() {
     () => () => {
       if (relayoutTimer.current !== null) window.clearTimeout(relayoutTimer.current)
       if (layoutDebounce.current !== null) window.clearTimeout(layoutDebounce.current)
+      if (promptCopyTimer.current !== null) window.clearTimeout(promptCopyTimer.current)
       replayActive.current = false
       replayGeneration.current += 1
       replayWaitCancel.current?.()
@@ -634,17 +637,29 @@ function MissionBoard() {
 
   async function copyAgentPrompt(prompt: string) {
     const copied = await copyText(prompt)
-    useMissionStore
-      .getState()
-      .showToast(
-        copied ? 'Agent prompt copied' : 'Copy this agent prompt manually',
-        'info',
-        copied ? 'Paste it into your browser agent' : prompt,
-      )
+    if (!copied) {
+      useMissionStore
+        .getState()
+        .showToast('Copy this agent prompt manually', 'info', prompt)
+      return
+    }
+    if (promptCopyTimer.current !== null) {
+      window.clearTimeout(promptCopyTimer.current)
+    }
+    setCopiedPrompt(prompt)
+    promptCopyTimer.current = window.setTimeout(() => {
+      setCopiedPrompt((current) => (current === prompt ? null : current))
+      promptCopyTimer.current = null
+    }, 2_000)
   }
 
   function dismissAgentPrompts() {
     if (projectId) dismissFirstRunPrompts(projectId)
+    if (promptCopyTimer.current !== null) {
+      window.clearTimeout(promptCopyTimer.current)
+      promptCopyTimer.current = null
+    }
+    setCopiedPrompt(null)
     setFirstRunOpen(false)
     setFirstRunMenuOpen(false)
   }
@@ -718,9 +733,15 @@ function MissionBoard() {
                   className="agent-prompt-chip"
                   onClick={() => void copyAgentPrompt(prompt)}
                 >
-                  {prompt}
+                  <span className="agent-prompt-copy">Copy</span>
+                  <span>{prompt}</span>
                 </button>
               ))}
+              {copiedPrompt && (
+                <span className="agent-prompt-confirmation" role="status">
+                  Copied — paste it to your agent
+                </span>
+              )}
             </div>
             <button
               type="button"

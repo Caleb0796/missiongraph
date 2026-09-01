@@ -288,7 +288,10 @@ a:focus-visible {
 .first-run-prompts > div { display: flex; min-width: 0; flex: 1; gap: 7px; }
 
 .agent-prompt-chip {
+  display: inline-flex;
+  align-items: center;
   min-width: 0;
+  gap: 6px;
   border: 1px solid #315064;
   border-radius: 999px;
   background: #122430;
@@ -300,6 +303,8 @@ a:focus-visible {
 }
 
 .agent-prompt-chip:hover { border-color: #4f8290; background: #17303b; color: #d4eff1; }
+.agent-prompt-copy { border: 1px solid #416879; border-radius: 999px; padding: 1px 4px; color: #7fcbd3; font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+.agent-prompt-confirmation { align-self: center; color: #74cfa4; font-size: 10.5px; }
 
 .first-run-dismiss {
   flex: 0 0 auto;
@@ -912,7 +917,6 @@ a:focus-visible {
   .live-indicator, .compat-link { display: none; }
   .webmcp-banner { align-items: flex-start; flex-wrap: wrap; justify-content: flex-start; padding: 7px 10px; }
   .webmcp-banner strong { width: 100%; }
-  .first-run-prompts:not(.first-run-prompts--menu-open) { display: none; }
   .first-run-prompts { align-items: stretch; flex-direction: column; padding: 9px 10px; }
   .first-run-prompts > div { display: grid; }
   .agent-prompt-chip { width: 100%; border-radius: 7px; }
