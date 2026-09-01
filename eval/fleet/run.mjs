@@ -67,6 +67,7 @@ async function main() {
 
   const startedAt = new Date().toISOString();
   const results = [];
+  let acceptedRequests = 0;
   const executionScenarios = selected.mode === "real"
     ? [...scenarios.filter((scenario) => scenario.name !== "daily-cap" && !scenario.disabled),
       scenarios.find((scenario) => scenario.name === "daily-cap"),
@@ -77,6 +78,10 @@ async function main() {
     let controls;
     let client;
     let failure;
+    if (selected.mode === "real" && scenario.stubOnly) {
+      results.push({ name: scenario.name, status: "SKIP", duration_ms: 0, error: "stub mirror consistency scenario" });
+      continue;
+    }
     try {
       if (selected.mode === "stub") {
         controls = await startFleetStub(scenario.stubOptions);
@@ -96,7 +101,7 @@ async function main() {
           timeoutMs: Number(process.env.FLEET_EVAL_TIMEOUT_MS ?? 120_000),
         });
       }
-      await scenario.run({ client, controls, mode: selected.mode });
+      await scenario.run({ client, controls, mode: selected.mode, acceptedBefore: acceptedRequests });
     } catch (error) {
       failure = error;
     } finally {
@@ -122,9 +127,16 @@ async function main() {
       duration_ms: Date.now() - started,
       ...(failure ? { error: printableError(failure) } : {}),
     });
+    if (selected.mode === "real" && client) {
+      acceptedRequests += client.fleetResponses.filter(
+        (response) => response.path.endsWith("/fleet-requests") && response.status === 200,
+      ).length;
+    }
   }
 
   const passed = results.filter((result) => result.status === "PASS").length;
+  const failed = results.filter((result) => result.status === "FAIL").length;
+  const skipped = results.filter((result) => result.status === "SKIP").length;
   const summary = {
     version: 1,
     mode: selected.mode,
@@ -132,16 +144,17 @@ async function main() {
     started_at: startedAt,
     finished_at: new Date().toISOString(),
     passed,
-    failed: results.length - passed,
+    failed,
+    skipped,
     total: results.length,
     scenarios: results,
   };
   await writeFile(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
 
   printTable(results);
-  console.log(`\n${passed}/${results.length} passed`);
+  console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped`);
   console.log(`JSON summary: ${summaryPath}`);
-  if (passed !== results.length) process.exitCode = 1;
+  if (failed > 0) process.exitCode = 1;
 }
 
 await main();
