@@ -65,12 +65,12 @@ pnpm dev
 
 ## Testing
 
-251 tests across the three packages (CI runs them on pushes to `main`/`track/**` and on pull requests):
+294 tests across the three packages (CI runs them on pushes to `main`/`track/**` and on pull requests):
 
 ```sh
-cd server && pnpm test   # 69 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, and the fleet queue
-cd bridge && pnpm test   # 77 — decision validation, crash replay, PID/lock safety, credential renewal, lease and watchdog behaviour, the worker-launch handshake, and human-confirmed dispatch integrations against the real server
-cd app    && pnpm test   # 105 — tool envelopes, identity fencing/recovery, split confirmation, S2 policy/action dialogs, late WebMCP injection, tier detection, fleet-off dispatch invariants, and real-server HTTP paths
+cd server && pnpm test   # 82 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, actor-aware ingress rules, field limits and per-IP rate limits, and the fleet queue
+cd bridge && pnpm test   # 88 — decision validation, crash replay, PID/lock safety and lock leases, credential renewal, secret-free worker environments, SSE reconnection, worktree cleanup, adoption-scoped completion evidence, SIGTERM reconciliation, and human-confirmed dispatch integrations against the real server
+cd app    && pnpm test   # 124 — tool envelopes and untrusted-content labels, atomic add_task, full split rewiring, self-describing policy handshake, identity fencing/recovery, confirmation dialogs (folded binding details, keyboard access), first-run and replay UX, late WebMCP injection, tier detection, fleet-off dispatch invariants, and real-server HTTP paths
 ```
 
 The fleet contract has its own scenario harness on top of those: `node eval/fleet/run.mjs --stub` runs 19
