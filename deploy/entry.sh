@@ -82,9 +82,10 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ] && [ "${codex_ready:-0}" = "1" ]; then
       if ! git clone "${MG_TARGET_REPO_URL}" /data/target-repo 2>&1; then
         echo "BRIDGE DISABLED: could not clone MG_TARGET_REPO_URL" >&2
         bridge_project_ready=0
-      else
-        git -C /data/target-repo config user.email "fleet@missiongraph.local"
-        git -C /data/target-repo config user.name "MissionGraph Fleet"
+      elif ! git -C /data/target-repo config user.email "fleet@missiongraph.local" ||
+          ! git -C /data/target-repo config user.name "MissionGraph Fleet"; then
+        echo "BRIDGE DISABLED: could not configure the cloned target repository" >&2
+        bridge_project_ready=0
       fi
     fi
   fi
@@ -93,10 +94,10 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ] && [ "${codex_ready:-0}" = "1" ]; then
     # Zero-downtime deploys overlap the old and new instances on the same /data disk,
     # so the first bridge start typically loses the state lock to the outgoing
     # instance and exits. Retry on a bounded loop: the old bridge releases the lock
-    # when its instance shuts down. After ten minutes the overlap is long over, so a
-    # lock still naming another host is a leftover from a killed instance — move it
-    # aside (keeping the evidence) and let the next attempt take over. The server is
-    # never affected by anything in this loop.
+    # when its instance shuts down. After ten minutes, inspect the lock's heartbeat
+    # lease on every remaining attempt. Only a lock untouched for more than five
+    # minutes is moved aside (keeping the evidence). The server is never affected by
+    # anything in this loop.
     (
       BRIDGE_PID=""
       # On shutdown, forward TERM to the bridge and wait for it: its graceful stop is
@@ -120,10 +121,20 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ] && [ "${codex_ready:-0}" = "1" ]; then
           break
         fi
         echo "[entry] bridge exited with status $bridge_status (attempt $attempt/30); retrying in 30s" >&2
-        if [ "$attempt" -eq 20 ] && [ -f /data/bridge-state.json.lock ]; then
-          echo "[entry] clearing a presumed-stale cross-host bridge lock (evidence kept)" >&2
-          mv /data/bridge-state.json.lock "/data/bridge-state.json.lock.cleared-$(date +%s)" 2>/dev/null || true
-          rm -f /data/bridge-state.json.lock.takeover 2>/dev/null || true
+        if [ "$attempt" -ge 20 ] && [ -f /data/bridge-state.json.lock ]; then
+          if lock_mtime=$(stat -c %Y /data/bridge-state.json.lock 2>/dev/null) && lock_now=$(date +%s); then
+            lock_cutoff=$((lock_now - 300))
+            if [ "$lock_mtime" -lt "$lock_cutoff" ]; then
+              echo "[entry] clearing an expired cross-host bridge lock lease (evidence kept)" >&2
+              if mv /data/bridge-state.json.lock "/data/bridge-state.json.lock.cleared-${lock_now}" 2>/dev/null; then
+                rm -f /data/bridge-state.json.lock.takeover 2>/dev/null || true
+              fi
+            elif [ "$attempt" -eq 20 ]; then
+              echo "[entry] cross-host bridge lock lease is active; continuing retries" >&2
+            fi
+          elif [ "$attempt" -eq 20 ]; then
+            echo "[entry] could not inspect the cross-host bridge lock lease; continuing retries" >&2
+          fi
         fi
         sleep 30 &
         wait $! 2>/dev/null || true

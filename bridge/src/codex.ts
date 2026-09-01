@@ -33,6 +33,7 @@ interface Command {
 
 const outputRetentionBytes = 2 * 1024 * 1024;
 const lineBufferRetentionBytes = 64 * 1024;
+const shellEnvironmentPolicy = 'shell_environment_policy.exclude=["*KEY*","*TOKEN*","*SECRET*"]';
 const childSourceVariables = new Set([
   "PATH",
   "HOME",
@@ -66,6 +67,7 @@ export function codexChildEnvironment(
       value !== undefined &&
       name !== "REPORTER_TOKEN" &&
       !name.startsWith("MG_") &&
+      !/(KEY|TOKEN|SECRET)/i.test(name) &&
       (childSourceVariables.has(name) || name.startsWith("CODEX_") || name.startsWith("OPENAI_")),
     ),
   );
@@ -95,22 +97,7 @@ export class CodexClient {
   }
 
   startSupervisor(brief: string): RunningCodex {
-    return this.start(
-      [
-        "exec",
-        brief,
-        "-s",
-        "read-only",
-        "-c",
-        "mcp_servers={}",
-        "-c",
-        `model_reasoning_effort=${JSON.stringify(this.config.effort)}`,
-        "-m",
-        this.config.model,
-        "--json",
-      ],
-      this.config.targetRepoPath,
-    );
+    return this.start(this.supervisorStartArgs(brief), this.config.targetRepoPath);
   }
 
   resumeSupervisor(threadId: string, envelope: string): RunningCodex {
@@ -125,23 +112,7 @@ export class CodexClient {
     workerConfig: BridgeConfig = this.config,
   ): RunningCodex {
     const running = this.start(
-      [
-        "exec",
-        brief,
-        "-C",
-        worktree,
-        "-s",
-        "workspace-write",
-        "-c",
-        "sandbox_workspace_write.network_access=true",
-        "-c",
-        "mcp_servers={}",
-        "-c",
-        `model_reasoning_effort=${JSON.stringify(this.config.effort)}`,
-        "-m",
-        this.config.model,
-        "--json",
-      ],
+      this.workerStartArgs(brief, worktree),
       this.config.targetRepoPath,
       workerChildEnvironment(workerConfig, nodeId, reporterConfigPath),
       true,
@@ -165,6 +136,46 @@ export class CodexClient {
     );
   }
 
+  private supervisorStartArgs(brief: string): string[] {
+    return [
+      "exec",
+      brief,
+      "-s",
+      "read-only",
+      "-c",
+      shellEnvironmentPolicy,
+      "-c",
+      "mcp_servers={}",
+      "-c",
+      `model_reasoning_effort=${JSON.stringify(this.config.effort)}`,
+      "-m",
+      this.config.model,
+      "--json",
+    ];
+  }
+
+  private workerStartArgs(brief: string, worktree: string): string[] {
+    return [
+      "exec",
+      brief,
+      "-C",
+      worktree,
+      "-s",
+      "workspace-write",
+      "-c",
+      shellEnvironmentPolicy,
+      "-c",
+      "sandbox_workspace_write.network_access=true",
+      "-c",
+      "mcp_servers={}",
+      "-c",
+      `model_reasoning_effort=${JSON.stringify(this.config.effort)}`,
+      "-m",
+      this.config.model,
+      "--json",
+    ];
+  }
+
   private supervisorResumeArgs(threadId: string, message: string): string[] {
     return [
       "exec",
@@ -173,6 +184,8 @@ export class CodexClient {
       message,
       "-c",
       'sandbox_mode="read-only"',
+      "-c",
+      shellEnvironmentPolicy,
       "-c",
       "mcp_servers={}",
       "-c",
@@ -191,6 +204,8 @@ export class CodexClient {
       message,
       "-c",
       'sandbox_mode="workspace-write"',
+      "-c",
+      shellEnvironmentPolicy,
       "-c",
       "sandbox_workspace_write.network_access=true",
       "-c",
