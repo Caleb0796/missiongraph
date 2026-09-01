@@ -12,7 +12,7 @@ Recording frame: the whole ChatGPT desktop window — agent conversation (left p
 
 ### 1. Agent catch-up — 0:20–1:00 (WebMCP Leverage)
 - **Action**: click a first-run chip to copy the prompt; tell the agent **"Catch me up on this mission."** Agent calls `graph_digest`; the camera lens follows its narration.
-- **VO**: "Watch this — I just ask my agent to catch me up. The page has already handed it twenty-five core tools through WebMCP and exposes five contextual tools keyed to selection or failure state — no extension, no copy-paste. And every answer comes with whatever changed while it was away, so it's never working from a stale picture."
+- **VO**: "Watch this — I just ask my agent to catch me up. The page has already handed it twenty-five tools through WebMCP — no extension, no copy-paste. And every answer comes with whatever changed while it was away, so it's never working from a stale picture."
 - **Must be in frame**: the agent's tool-call entries in the conversation pane.
 
 ### 2. Policy grant + live fleet — 1:00–1:55 (Execution + security)
