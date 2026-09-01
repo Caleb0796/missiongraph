@@ -495,6 +495,109 @@ describe("ActionExecutor", () => {
     }
   });
 
+  it("releases the global lease when a recovered live worker process exits", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-recovered-worker-"));
+    const child = (await import("node:child_process")).spawn(
+      process.execPath,
+      ["-e", "setInterval(() => undefined, 1000)"],
+      { stdio: "ignore" },
+    );
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      child.once("spawn", resolvePromise);
+      child.once("error", rejectPromise);
+    });
+    const processStartTime = async (pid: number): Promise<string | undefined> => {
+      if (pid === process.pid) return "test-bridge-start";
+      if (pid !== child.pid) return undefined;
+      try {
+        process.kill(pid, 0);
+        return "recovered-child-start";
+      } catch {
+        return undefined;
+      }
+    };
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    try {
+      const bridgeConfig = { ...config(root), fleetMode: true };
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, processStartTime);
+      state.state.workers.live = {
+        status: "live",
+        thread_id: "live-thread",
+        worktree: join(root, "live"),
+        branch: "work/live",
+        reporter_credential: "token",
+        reporter_expires: "2099-08-30T10:15:00.000Z",
+        pid: child.pid!,
+        process_start_time: "recovered-child-start",
+      };
+      await state.save();
+      const slot = new (await import("../src/slot.js")).ExecutionSlot();
+      executor = new ActionExecutor(bridgeConfig, state, {
+        startWorker: () => { throw new Error("not used"); },
+        resumeWorker: () => { throw new Error("not used"); },
+      }, new TestLogger(), false, processStartTime, slot);
+      await executor.initialize();
+      expect(slot.owner).toBe("recovered worker live");
+
+      child.kill("SIGTERM");
+      await new Promise<void>((resolvePromise) => child.once("exit", () => resolvePromise()));
+      for (let attempt = 0; attempt < 100 && slot.owner !== undefined; attempt += 1) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+      }
+
+      expect(slot.owner).toBeUndefined();
+      expect(state.state.workers.live?.status).toBe("idle");
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      await executor?.terminateAll();
+      await executor?.stop();
+      await state?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes a worker reporter configuration when the worker reaches a terminal process state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "missiongraph-reporter-cleanup-"));
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).endsWith("/reporter-credentials")) return Response.json({ seq: 1 });
+      const body = JSON.parse(String(init?.body)) as { actor: string };
+      return Response.json({ token: "worker-token", actor: body.actor, expires: "2099-08-30T10:15:00.000Z" });
+    }));
+    let finish!: () => void;
+    const completed = new Promise<{ stdout: string; stderr: string }>((resolvePromise) => {
+      finish = () => resolvePromise({ stdout: "", stderr: "" });
+    });
+    let state: StateStore | undefined;
+    let executor: ActionExecutor | undefined;
+    try {
+      const bridgeConfig = config(root);
+      await initializeRepo(bridgeConfig.targetRepoPath);
+      state = await StateStore.open(bridgeConfig.statePath, bridgeConfig.projectId, lockProcessStartTime);
+      executor = new ActionExecutor(bridgeConfig, state, {
+        startWorker: () => running("worker-a", completed),
+        resumeWorker: () => { throw new Error("not used"); },
+      }, new TestLogger());
+      await executor.execute({ actions: [{ act: "spawn_worker", node_id: "a", brief: "Build A." }] });
+      const reporterConfigPath = state.state.workers.a!.reporter_config_path!;
+      expect(await readFile(reporterConfigPath, "utf8")).toContain("worker-token");
+
+      finish();
+      for (let attempt = 0; attempt < 100 && state.state.workers.a?.status !== "idle"; attempt += 1) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+      }
+
+      await expect(readFile(reporterConfigPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      finish();
+      await executor?.terminateAll();
+      await executor?.stop();
+      await state?.close();
+      vi.unstubAllGlobals();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not schedule or persist renewal work that completes during shutdown", async () => {
     const root = await mkdtemp(join(tmpdir(), "missiongraph-renewal-stop-"));
     let resolveCredential!: (response: Response) => void;

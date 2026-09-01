@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -28,7 +28,15 @@ class FleetStub {
   readonly claims: (FleetClaim | undefined)[] = [];
   readonly missingProjects = new Set<string>();
   heartbeatMissingAfter: number | undefined;
+  heartbeatConflictAfter: number | undefined;
   completeMissing = false;
+  completeConflict = false;
+  stallNext = false;
+  stallComplete = false;
+  stallCredential = false;
+  private releaseNextResponse: (() => void) | undefined;
+  private releaseCompleteResponse: (() => void) | undefined;
+  private releaseCredentialResponse: (() => void) | undefined;
   private server: Server | undefined;
   url = "";
 
@@ -42,7 +50,14 @@ class FleetStub {
 
   async stop(): Promise<void> {
     if (!this.server) return;
+    this.releaseStalls();
     await new Promise<void>((resolve, reject) => this.server!.close((error) => error ? reject(error) : resolve()));
+  }
+
+  releaseStalls(): void {
+    this.releaseNextResponse?.();
+    this.releaseCompleteResponse?.();
+    this.releaseCredentialResponse?.();
   }
 
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -50,6 +65,10 @@ class FleetStub {
     if (request.method === "POST" && url.pathname === "/api/fleet/next") {
       this.requireReporter(request);
       this.nextTimes.push(Date.now());
+      if (this.stallNext) {
+        await new Promise<void>((resolvePromise) => { this.releaseNextResponse = resolvePromise; });
+        this.releaseNextResponse = undefined;
+      }
       const claim = this.claims.shift();
       if (!claim) return this.send(response, 204);
       return this.json(response, 200, claim);
@@ -62,6 +81,9 @@ class FleetStub {
       if (this.heartbeatMissingAfter !== undefined && index >= this.heartbeatMissingAfter) {
         return this.json(response, 404, { error: { code: "unknown_fleet_request", message: "missing" } });
       }
+      if (this.heartbeatConflictAfter !== undefined && index >= this.heartbeatConflictAfter) {
+        return this.json(response, 409, { error: { code: "fleet_request_state", message: "expired" } });
+      }
       return this.json(response, 200, { ok: true });
     }
     const complete = url.pathname.match(/^\/api\/fleet\/([^/]+)\/complete$/);
@@ -69,8 +91,15 @@ class FleetStub {
       this.requireReporter(request);
       const body = await this.body(request) as CompletionCall["body"];
       this.completionCalls.push({ requestId: decodeURIComponent(complete[1]!), body });
+      if (this.stallComplete) {
+        await new Promise<void>((resolvePromise) => { this.releaseCompleteResponse = resolvePromise; });
+        this.releaseCompleteResponse = undefined;
+      }
       if (this.completeMissing) {
         return this.json(response, 404, { error: { code: "unknown_fleet_request", message: "missing" } });
+      }
+      if (this.completeConflict) {
+        return this.json(response, 409, { error: { code: "fleet_request_state", message: "expired" } });
       }
       return this.json(response, 200, { ok: true });
     }
@@ -80,6 +109,10 @@ class FleetStub {
       this.credentialProjects.push(project);
       const body = await this.body(request) as { actor: string };
       this.credentialActors.push(body.actor);
+      if (this.stallCredential) {
+        await new Promise<void>((resolvePromise) => { this.releaseCredentialResponse = resolvePromise; });
+        this.releaseCredentialResponse = undefined;
+      }
       if (this.missingProjects.has(project)) {
         return this.json(response, 404, { error: { code: "unknown_project", message: "missing" } });
       }
@@ -197,8 +230,11 @@ async function createHarness(
       loop.start();
     },
     stop: async () => {
-      if (started) await loop.stop();
       await codex.stop();
+      if (started) {
+        started = false;
+        await loop.stop();
+      }
       await actions.terminateAll();
       await actions.stop();
       await state.close();
@@ -289,6 +325,20 @@ describe("FleetAdoptionLoop", () => {
       note: expect.stringContaining("FLEET_RUN_TTL_MIN"),
     });
     expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
+  });
+
+  it("starts heartbeat and the run watchdog before a real worker can emit thread.started", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim("MOCK_NO_THREAD"));
+    const harness = await createHarness(stub, { fleetRunTtlMs: 90, fleetHeartbeatMs: 25 });
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+    expect(stub.heartbeatTimes.length).toBeGreaterThanOrEqual(2);
+    expect(stub.completionCalls[0]?.body).toMatchObject({
+      outcome: "failed",
+      note: expect.stringContaining("FLEET_RUN_TTL_MIN"),
+    });
   });
 
   it("heartbeats repeatedly within the configured cadence while a worker runs", async () => {
@@ -474,6 +524,99 @@ describe("FleetAdoptionLoop", () => {
       note: expect.stringContaining("became stale"),
     });
     expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
+  });
+
+  it("terminates and detaches when heartbeat returns terminal fleet_request_state", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim("MOCK_HANG"));
+    stub.heartbeatConflictAfter = 0;
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.heartbeatTimes.length >= 1 && harness.state.state.fleet_adoption === undefined);
+    expect(stub.heartbeatTimes.length).toBeGreaterThanOrEqual(1);
+    expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
+    expect(stub.credentialProjects).toEqual([]);
+  });
+
+  it("detaches idempotently when completion returns terminal fleet_request_state", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.completeConflict = true;
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+    expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
+  });
+
+  it("aborts a stalled next response during shutdown and releases the global slot", async () => {
+    const stub = await startedStub();
+    stub.stallNext = true;
+    const harness = await createHarness(stub, { fleetPollMs: 500 });
+    harness.start();
+    await waitFor(() => stub.nextTimes.length === 1);
+
+    const stopping = harness.loop.stop();
+    const stoppedPromptly = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 150)),
+    ]);
+    stub.releaseStalls();
+    await stopping;
+
+    expect(stoppedPromptly).toBe(true);
+    expect(harness.slot.owner).toBeUndefined();
+  });
+
+  it("aborts a stalled completion response during shutdown", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.stallComplete = true;
+    const harness = await createHarness(stub, { fleetPollMs: 500 });
+    harness.start();
+    await waitFor(() => stub.completionCalls.length === 1);
+
+    const stopping = harness.loop.stop();
+    const stoppedPromptly = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 150)),
+    ]);
+    stub.releaseStalls();
+    await stopping;
+
+    expect(stoppedPromptly).toBe(true);
+  });
+
+  it("aborts a stalled reporter credential request during shutdown", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.stallCredential = true;
+    const harness = await createHarness(stub, { fleetPollMs: 500 });
+    harness.start();
+    await waitFor(() => stub.credentialProjects.length === 1);
+
+    const stopping = harness.loop.stop();
+    const stoppedPromptly = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 150)),
+    ]);
+    stub.releaseStalls();
+    await stopping;
+
+    expect(stoppedPromptly).toBe(true);
+  });
+
+  it("removes the adopted worker reporter file when terminal detach clears state", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+    const worktreeRoot = join(harness.root, ".missiongraph-worktrees");
+    const reporterFiles = (await readdir(worktreeRoot)).filter((name) => name.endsWith(".reporter.conf"));
+    expect(reporterFiles).toEqual([]);
   });
 
   it("uses exactly the flagship OPENAI/CODEX environment allowlist for adopted workers", () => {
