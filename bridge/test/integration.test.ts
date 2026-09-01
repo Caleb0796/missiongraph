@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -10,6 +10,23 @@ import { MissionGraphBridge } from "../src/bridge.js";
 import { config, initializeRepo, TestLogger } from "./helpers.js";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+
+async function committingMockCodex(root: string): Promise<string> {
+  const source = await readFile(join(repositoryRoot, "bridge/mock-codex.mjs"), "utf8");
+  const withImports = source
+    .replace('import { spawn } from "node:child_process";', 'import { execFileSync, spawn } from "node:child_process";')
+    .replace('import { createHash, randomUUID } from "node:crypto";', 'import { createHash, randomUUID } from "node:crypto";\nimport { writeFileSync } from "node:fs";\nimport { join } from "node:path";');
+  const withCommit = withImports.replace(
+    '  if (reportLifecycle) {\n    await report("WORKER_LOG", { node_id: nodeId, lines: ["Mock fleet worker finished."] });',
+    '  if (reportLifecycle) {\n    const workerDirectory = args[args.indexOf("-C") + 1];\n    if (!workerDirectory) throw new Error("mock worker checkout is missing");\n    const artifact = `.missiongraph-mock-${createHash("sha1").update(nodeId).digest("hex").slice(0, 8)}.txt`;\n    writeFileSync(join(workerDirectory, artifact), `Mock completion for ${nodeId}.\\n`);\n    execFileSync("git", ["-C", workerDirectory, "add", artifact]);\n    execFileSync("git", ["-C", workerDirectory, "commit", "-m", `test: complete ${nodeId}`]);\n    const mockCommit = execFileSync("git", ["-C", workerDirectory, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();\n    await report("WORKER_LOG", { node_id: nodeId, lines: ["Mock fleet worker finished."] });',
+  ).replace("        commits: [],", "        commits: [mockCommit],");
+  if (withCommit === source || !withCommit.includes("commits: [mockCommit]")) {
+    throw new Error("test mock patch did not match bridge/mock-codex.mjs");
+  }
+  const path = join(root, "committing-mock-codex.mjs");
+  await writeFile(path, withCommit, { mode: 0o700 });
+  return path;
+}
 
 async function freePort(): Promise<number> {
   const server = createServer();
@@ -261,6 +278,163 @@ describe("bridge dry-run integration", () => {
   );
 
   it(
+    "pauses a running mock worker when SIGTERM shuts down the bridge",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "missiongraph-sigterm-integration-"));
+      const port = await freePort();
+      const reporterToken = "sigterm-integration-reporter-token";
+      const serverUrl = `http://127.0.0.1:${port}`;
+      const server = spawn("pnpm", ["--dir", join(repositoryRoot, "server"), "exec", "tsx", "src/http.ts"], {
+        cwd: repositoryRoot,
+        env: {
+          ...process.env,
+          REPORTER_TOKEN: reporterToken,
+          DB_PATH: join(root, "sigterm.sqlite"),
+          PORT: String(port),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let serverStderr = "";
+      server.stderr?.on("data", (chunk: Buffer) => {
+        serverStderr += chunk.toString();
+      });
+      let bridgeProcess: ChildProcess | undefined;
+      let bridgeStderr = "";
+      try {
+        const clone = await cloneWhenReady(serverUrl);
+        const repoPath = join(root, "target-repo");
+        const statePath = join(root, "bridge-state.json");
+        await initializeRepo(repoPath);
+        await mutation(
+          serverUrl,
+          clone.project,
+          clone.token,
+          "TASK_ADDED",
+          {
+            node: {
+              id: "sigterm-node",
+              title: "SIGTERM node",
+              brief: "Exercise graceful worker detachment.",
+              estimate_min: 1,
+              tags: ["sigterm"],
+              state: "queued",
+            },
+          },
+          "sigterm-add",
+        );
+        await confirmedMutation(
+          serverUrl,
+          clone.project,
+          clone.token,
+          "DISPATCHED",
+          {
+            node_id: "sigterm-node",
+            brief_override: "MOCK_REPORT_LIFECYCLE MOCK_HANG",
+            bypass_cap: true,
+          },
+          "sigterm-dispatch",
+        );
+
+        bridgeProcess = spawn(
+          process.execPath,
+          [join(repositoryRoot, "server/node_modules/tsx/dist/cli.mjs"), "test/sigterm-bridge.ts"],
+          {
+            cwd: join(repositoryRoot, "bridge"),
+            env: {
+              ...process.env,
+              MG_SERVER_URL: serverUrl,
+              MG_PROJECT_ID: clone.project,
+              MG_VISITOR_TOKEN: clone.token,
+              MG_REPORTER_CREDENTIAL: reporterToken,
+              MG_TARGET_REPO: repoPath,
+              MG_BRIDGE_STATE: statePath,
+              FLEET_MODE: "0",
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        bridgeProcess.stderr?.on("data", (chunk: Buffer) => {
+          bridgeStderr += chunk.toString();
+        });
+
+        let workerPid: number | undefined;
+        let nodeState: string | undefined;
+        for (let attempt = 0; attempt < 200 && (!workerPid || nodeState !== "running"); attempt += 1) {
+          const snapshotResponse = await fetch(
+            `${serverUrl}/api/p/${encodeURIComponent(clone.project)}/snapshot`,
+            { headers: { "x-mg-token": clone.token } },
+          );
+          if (snapshotResponse.ok) {
+            const snapshot = await snapshotResponse.json() as {
+              state: { nodes: Record<string, { state: string }> };
+            };
+            nodeState = snapshot.state.nodes["sigterm-node"]?.state;
+          }
+          try {
+            const persisted = JSON.parse(await readFile(statePath, "utf8")) as {
+              workers: Record<string, { pid?: number }>;
+            };
+            workerPid = persisted.workers["sigterm-node"]?.pid;
+          } catch {
+            workerPid = undefined;
+          }
+          if (!workerPid || nodeState !== "running") {
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+          }
+        }
+        expect(nodeState, bridgeStderr).toBe("running");
+        expect(workerPid, bridgeStderr).toEqual(expect.any(Number));
+        expect(() => process.kill(workerPid!, 0)).not.toThrow();
+
+        await stopProcess(bridgeProcess);
+        bridgeProcess = undefined;
+
+        const persisted = JSON.parse(await readFile(statePath, "utf8")) as {
+          workers: Record<string, { status: string; pid?: number }>;
+        };
+        expect(persisted.workers["sigterm-node"]).toMatchObject({ status: "idle" });
+        expect(persisted.workers["sigterm-node"]).not.toHaveProperty("pid");
+        expect(() => process.kill(workerPid!, 0)).toThrow();
+
+        const snapshotResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(clone.project)}/snapshot`, {
+          headers: { "x-mg-token": clone.token },
+        });
+        const snapshot = await snapshotResponse.json() as {
+          state: { nodes: Record<string, { state: string }> };
+        };
+        expect(snapshot.state.nodes["sigterm-node"]?.state).toBe("paused");
+        const ledgerResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(clone.project)}/export`, {
+          headers: { "x-mg-token": clone.token },
+        });
+        const ledger = await ledgerResponse.json() as {
+          events: { actor: string; type: string; payload: Record<string, unknown> }[];
+        };
+        expect(ledger.events.filter((event) =>
+          event.actor === "worker:sigterm-node" &&
+          event.type === "NODE_STATE_CHANGED" &&
+          event.payload.to === "paused"
+        )).toEqual([
+          expect.objectContaining({
+            payload: {
+              node_id: "sigterm-node",
+              from: "running",
+              to: "paused",
+              detail: "worker detached during bridge shutdown",
+            },
+          }),
+        ]);
+        expect(bridgeStderr).not.toContain("Error:");
+      } finally {
+        if (bridgeProcess) await stopProcess(bridgeProcess);
+        await stopProcess(server);
+        await rm(root, { recursive: true, force: true });
+      }
+      expect(serverStderr).not.toContain("Error:");
+    },
+    20_000,
+  );
+
+  it(
     "adopts a seeded clone through the real fleet server and detaches after reported worker lifecycle",
     async () => {
       const root = await mkdtemp(join(tmpdir(), "missiongraph-fleet-integration-"));
@@ -428,6 +602,7 @@ describe("bridge dry-run integration", () => {
 
         const repoPath = join(root, "target-repo");
         await initializeRepo(repoPath);
+        const mockCodexPath = await committingMockCodex(root);
         const statePath = join(root, "fleet-state.json");
         const logger = new TestLogger();
         bridge = new MissionGraphBridge({
@@ -436,28 +611,37 @@ describe("bridge dry-run integration", () => {
           projectId: seed.project_id,
           visitorToken: seed.token,
           reporterCredential: reporterToken,
+          codexBinaryPath: mockCodexPath,
           statePath,
           fleetMode: true,
           fleetPollMs: 20,
           fleetHeartbeatMs: 30,
           fleetRunTtlMs: 5_000,
-        }, logger, true, async (pid) => `fleet-integration-${pid}`);
+        }, logger, false, async (pid) => `fleet-integration-${pid}`);
         await bridge.start();
 
         const adoptedAt = new Set<string>();
         let requestStatus = "queued";
-        for (let attempt = 0; attempt < 500 && requestStatus !== "done"; attempt += 1) {
+        let requestNote: string | null = null;
+        for (
+          let attempt = 0;
+          attempt < 500 && !["done", "failed"].includes(requestStatus);
+          attempt += 1
+        ) {
           const response = await fetch(
             `${serverUrl}/api/p/${encodeURIComponent(clone.project)}/fleet-requests/${encodeURIComponent(request.id)}`,
             { headers: { "x-mg-token": clone.token } },
           );
           if (!response.ok) throw new Error(`fleet request poll failed (${response.status}): ${await response.text()}`);
-          const body = await response.json() as { status: string; adopted_at?: string };
+          const body = await response.json() as { status: string; adopted_at?: string; note: string | null };
           requestStatus = body.status;
+          requestNote = body.note;
           if (body.adopted_at) adoptedAt.add(body.adopted_at);
-          if (requestStatus !== "done") await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+          if (!["done", "failed"].includes(requestStatus)) {
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+          }
         }
-        expect(requestStatus).toBe("done");
+        expect(requestStatus, requestNote ?? undefined).toBe("done");
         expect(adoptedAt.size).toBeGreaterThanOrEqual(2);
 
         let partialRequestStatus = "queued";

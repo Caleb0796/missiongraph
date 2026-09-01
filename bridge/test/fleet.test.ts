@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { spawn } from "node:child_process";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -19,6 +19,13 @@ interface CompletionCall {
   body: { outcome: "done" | "failed"; note?: string };
 }
 
+interface LedgerEvent {
+  seq: number;
+  actor: string;
+  type: string;
+  payload: Record<string, unknown>;
+}
+
 class FleetStub {
   readonly nextTimes: number[] = [];
   readonly heartbeatTimes: number[] = [];
@@ -27,15 +34,29 @@ class FleetStub {
   readonly credentialActors: string[] = [];
   readonly claims: (FleetClaim | undefined)[] = [];
   readonly missingProjects = new Set<string>();
-  readonly ledgerEvents: { actor: string; type: string; payload: Record<string, unknown> }[] = [
+  readonly historicalLedgerEvents: LedgerEvent[] = [];
+  readonly ledgerEvents: LedgerEvent[] = [
     {
+      seq: 1,
+      actor: "worker:adopted-node",
+      type: "NODE_STATE_CHANGED",
+      payload: { node_id: "adopted-node", from: "queued", to: "running" },
+    },
+    {
+      seq: 2,
       actor: "worker:adopted-node",
       type: "NODE_STATE_CHANGED",
       payload: { node_id: "adopted-node", from: "running", to: "review" },
     },
-    { actor: "worker:adopted-node", type: "HANDOFF_FILED", payload: { node_id: "adopted-node" } },
-    { actor: "worker:adopted-node", type: "APPROVAL_CREATED", payload: { node_id: "adopted-node" } },
+    {
+      seq: 3,
+      actor: "worker:adopted-node",
+      type: "HANDOFF_FILED",
+      payload: { node_id: "adopted-node", handoff: { v: 1, commits: ["TEST_REPO_HEAD"] } },
+    },
+    { seq: 4, actor: "worker:adopted-node", type: "APPROVAL_CREATED", payload: { node_id: "adopted-node" } },
   ];
+  ledgerReads = 0;
   heartbeatMissingAfter: number | undefined;
   heartbeatConflictAfter: number | undefined;
   completeMissing = false;
@@ -138,7 +159,11 @@ class FleetStub {
       if (request.headers["x-mg-token"] !== "adopted-visitor-token") {
         return this.json(response, 401, { error: "unauthorized" });
       }
-      return this.json(response, 200, { v: 1, events: this.ledgerEvents });
+      const events = this.ledgerReads === 0
+        ? this.historicalLedgerEvents
+        : [...this.historicalLedgerEvents, ...this.ledgerEvents];
+      this.ledgerReads += 1;
+      return this.json(response, 200, { v: 1, events });
     }
     this.json(response, 404, { error: { code: "not_found", message: "missing" } });
   }
@@ -209,6 +234,12 @@ async function createHarness(
     ...overrides,
   };
   await initializeRepo(bridgeConfig.targetRepoPath);
+  const head = spawnSync("git", ["-C", bridgeConfig.targetRepoPath, "rev-parse", "HEAD"], { encoding: "utf8" });
+  if (head.status !== 0) throw new Error(head.stderr);
+  for (const event of stub.ledgerEvents) {
+    const handoff = event.payload.handoff as { commits?: unknown[] } | undefined;
+    if (handoff?.commits?.[0] === "TEST_REPO_HEAD") handoff.commits = [head.stdout.trim()];
+  }
   const processStartTime = async (pid: number): Promise<string | undefined> => {
     if (pid === process.pid) return "fleet-test-bridge";
     try {
@@ -314,6 +345,13 @@ describe("FleetAdoptionLoop", () => {
     stub.claims.push(claim());
     stub.ledgerEvents.splice(0, stub.ledgerEvents.length,
       {
+        seq: 1,
+        actor: "worker:adopted-node",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "adopted-node", from: "queued", to: "running" },
+      },
+      {
+        seq: 2,
         actor: "worker:adopted-node",
         type: "NODE_STATE_CHANGED",
         payload: { node_id: "adopted-node", from: "running", to: "failed", detail: "Authoritative tests failed." },
@@ -328,6 +366,49 @@ describe("FleetAdoptionLoop", () => {
       outcome: "failed",
       note: "Fleet worker reported terminal NODE_STATE_CHANGED to failed: Authoritative tests failed.",
     });
+  });
+
+  it("ignores a complete same-node lifecycle that predates this adoption", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.historicalLedgerEvents.push(...stub.ledgerEvents.map((event) => structuredClone(event)));
+    stub.ledgerEvents.splice(0);
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toMatchObject({
+      outcome: "failed",
+      note: expect.stringContaining("ordered NODE_STATE_CHANGED running→review|failed"),
+    });
+  });
+
+  it("rejects empty or unverifiable handoff commits and duplicate approvals", async () => {
+    const emptyStub = await startedStub();
+    emptyStub.claims.push(claim());
+    const emptyHandoff = emptyStub.ledgerEvents.find((event) => event.type === "HANDOFF_FILED")!;
+    (emptyHandoff.payload.handoff as { commits: string[] }).commits = [];
+    const emptyHarness = await createHarness(emptyStub);
+    emptyHarness.start();
+    await waitFor(() => emptyStub.completionCalls.length === 1);
+    expect(emptyStub.completionCalls[0]?.body.note).toContain("non-empty HANDOFF_FILED commits");
+
+    const invalidStub = await startedStub();
+    invalidStub.claims.push(claim());
+    const invalidHandoff = invalidStub.ledgerEvents.find((event) => event.type === "HANDOFF_FILED")!;
+    (invalidHandoff.payload.handoff as { commits: string[] }).commits = ["a".repeat(40)];
+    invalidStub.ledgerEvents.push({
+      seq: 5,
+      actor: "worker:adopted-node",
+      type: "APPROVAL_CREATED",
+      payload: { node_id: "adopted-node" },
+    });
+    const invalidHarness = await createHarness(invalidStub);
+    invalidHarness.start();
+    await waitFor(() => invalidStub.completionCalls.length === 1);
+    expect(invalidStub.completionCalls[0]?.body.note).toContain("valid HANDOFF_FILED commits");
+    expect(invalidStub.completionCalls[0]?.body.note).toContain("exactly one ordered APPROVAL_CREATED");
   });
 
   it("places the server title and brief verbatim into the existing worker brief", () => {
@@ -420,8 +501,10 @@ describe("FleetAdoptionLoop", () => {
     });
   });
 
-  it("resumes heartbeats for a persisted live adoption and fails honestly when its process disappears", async () => {
+  it("evaluates protocol evidence before failing a recovered worker whose process disappears", async () => {
     const stub = await startedStub();
+    stub.ledgerEvents.splice(0);
+    stub.ledgerReads = 1;
     const child = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], {
       stdio: "ignore",
     });
@@ -444,6 +527,7 @@ describe("FleetAdoptionLoop", () => {
         adopted_at: new Date(Date.now() - 100).toISOString(),
         started_at: new Date(Date.now() - 100).toISOString(),
       };
+      Object.assign(state.state.fleet_adoption, { ledger_seq_at_adoption: 0 });
       state.state.workers["fleet:request-1"] = {
         status: "live",
         thread_id: "recovered-thread",
@@ -469,8 +553,69 @@ describe("FleetAdoptionLoop", () => {
     await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
-      note: expect.stringContaining("no longer running"),
+      note: expect.stringContaining("ordered NODE_STATE_CHANGED running→review|failed"),
     });
+  });
+
+  it("completes done after restart when the recovered worker exits with valid protocol evidence", async () => {
+    const stub = await startedStub();
+    stub.ledgerReads = 1;
+    const child = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], {
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    cleanups.push(async () => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      }
+    });
+    const harness = await createHarness(stub, {}, async (state) => {
+      const adopted = claim();
+      const repoPath = join(dirname(state.path), "repo");
+      const worktree = join(dirname(state.path), "recovered-success-worktree");
+      const add = spawnSync(
+        "git",
+        ["-C", repoPath, "worktree", "add", "-b", "work/recovered-success", worktree],
+        { encoding: "utf8" },
+      );
+      if (add.status !== 0) throw new Error(add.stderr);
+      state.state.fleet_adoption = {
+        ...adopted,
+        worker_key: "fleet:request-1",
+        status: "running",
+        adopted_at: new Date(Date.now() - 100).toISOString(),
+        started_at: new Date(Date.now() - 100).toISOString(),
+      };
+      Object.assign(state.state.fleet_adoption, { ledger_seq_at_adoption: 0 });
+      state.state.workers["fleet:request-1"] = {
+        status: "live",
+        thread_id: "recovered-thread",
+        worktree,
+        branch: "work/recovered-success",
+        reporter_credential: "credential-adopted-project",
+        reporter_expires: "2099-08-30T10:15:00.000Z",
+        node_id: adopted.node_id,
+        project_id: adopted.project_id,
+        fleet_request_id: adopted.request_id,
+        pid: child.pid!,
+        process_start_time: `fleet-test-child-${child.pid}`,
+      };
+      await state.save();
+    });
+    harness.start();
+
+    await waitFor(() => stub.heartbeatTimes.length >= 1);
+    child.kill("SIGTERM");
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    }
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toEqual({ outcome: "done" });
   });
 
   it("does not rerun a completed persisted request if the server returns it again", async () => {
@@ -668,6 +813,33 @@ describe("FleetAdoptionLoop", () => {
     const worktreeRoot = join(harness.root, ".missiongraph-worktrees");
     const reporterFiles = (await readdir(worktreeRoot)).filter((name) => name.endsWith(".reporter.conf"));
     expect(reporterFiles).toEqual([]);
+  });
+
+  it("removes only a terminal adopted worker worktree while retaining its audit branch", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim("MOCK_DELAY_180"));
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => harness.state.state.workers["fleet:request-1"]?.status === "live");
+    const worker = harness.state.state.workers["fleet:request-1"]!;
+    const worktree = worker.worktree;
+    const branch = worker.branch;
+    expect((await stat(worktree)).isDirectory()).toBe(true);
+    const persisted = JSON.parse(await readFile(harness.config.statePath, "utf8")) as {
+      fleet_adoption?: { ledger_seq_at_adoption?: number };
+    };
+    expect(persisted.fleet_adoption?.ledger_seq_at_adoption).toBe(0);
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    await expect(stat(worktree)).rejects.toMatchObject({ code: "ENOENT" });
+    const branchCheck = spawnSync(
+      "git",
+      ["-C", harness.config.targetRepoPath, "show-ref", "--verify", `refs/heads/${branch}`],
+      { encoding: "utf8" },
+    );
+    expect(branchCheck.status, branchCheck.stderr).toBe(0);
   });
 
   it("uses exactly the flagship OPENAI/CODEX environment allowlist for adopted workers", () => {
