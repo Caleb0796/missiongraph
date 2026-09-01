@@ -53,6 +53,27 @@ function templateHash(node: Pick<GraphNode, "title" | "brief">): string {
   return createHash("sha256").update(`${node.title}\n${node.brief}`).digest("hex");
 }
 
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (typeof value !== "object" || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, stableValue(child)]),
+  );
+}
+
+function dispatchSubjectHash(event: Extract<Event, { type: "DISPATCHED" }>): string {
+  const payload = {
+    node_id: event.payload.node_id,
+    ...(event.payload.brief_override === undefined ? {} : { brief_override: event.payload.brief_override }),
+    bypass_cap: event.payload.bypass_cap,
+  };
+  return createHash("sha256")
+    .update(JSON.stringify(stableValue({ type: event.type, payload })))
+    .digest("hex");
+}
+
 function row(value: unknown): FleetRequest {
   return value as FleetRequest;
 }
@@ -339,6 +360,32 @@ export class FleetQueue {
         eligible: false,
         code: "template_mismatch",
         message: "The node does not match the seed template registry.",
+      };
+    }
+    const baseline = this.store.cloneBaseline(projectId);
+    const authorizedDispatch = events.find((event) => {
+      if (
+        event.type !== "DISPATCHED" ||
+        event.payload.node_id !== requestedNodeId ||
+        baseline === undefined ||
+        event.seq <= baseline ||
+        !event.payload.authorization
+      ) {
+        return false;
+      }
+      return this.store.humanCapabilityUseMatches({
+        projectId,
+        ref: event.payload.authorization.capability_ref,
+        nonce: event.payload.authorization.use_nonce,
+        action: "dispatch",
+        subjectHash: dispatchSubjectHash(event),
+      });
+    });
+    if (!authorizedDispatch) {
+      return {
+        eligible: false,
+        code: "node_not_dispatched",
+        message: "The node lacks a clone-local, human-confirmed dispatch.",
       };
     }
     return { eligible: true, node: requested };

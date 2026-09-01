@@ -1004,6 +1004,7 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
           { ts: now().toISOString() },
         );
       }
+      store.recordCloneBaseline(project);
       return reply.send({ project, token, cursor: String(store.latestSeq(project)) });
     } catch (error) {
       return errorReply(error, reply);

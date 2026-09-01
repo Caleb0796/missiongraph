@@ -818,6 +818,10 @@ export class EventStore {
         used_at TEXT NOT NULL,
         PRIMARY KEY (capability_ref, nonce)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS clone_baselines (
+        project_id TEXT PRIMARY KEY REFERENCES projects(id),
+        baseline_seq INTEGER NOT NULL CHECK(baseline_seq >= 0)
+      ) STRICT;
       CREATE TABLE IF NOT EXISTS fleet_requests (
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
@@ -1333,6 +1337,45 @@ export class EventStore {
       request_origin: row.request_origin,
       use_nonce: input.nonce,
     };
+  }
+
+  recordCloneBaseline(projectId: string): number {
+    const baseline = this.latestSeq(projectId);
+    this.database
+      .prepare("INSERT INTO clone_baselines (project_id, baseline_seq) VALUES (?, ?)")
+      .run(projectId, baseline);
+    return baseline;
+  }
+
+  cloneBaseline(projectId: string): number | undefined {
+    const row = this.database
+      .prepare("SELECT baseline_seq FROM clone_baselines WHERE project_id = ?")
+      .get(projectId) as { baseline_seq: number } | undefined;
+    return row?.baseline_seq;
+  }
+
+  humanCapabilityUseMatches(input: {
+    projectId: string;
+    ref: string;
+    nonce: string;
+    action: HumanAction;
+    subjectHash: string;
+  }): boolean {
+    const row = this.database
+      .prepare(
+        `SELECT capability.actions_json, capability.subject_hash
+         FROM human_capabilities AS capability
+         JOIN human_capability_uses AS use ON use.capability_ref = capability.ref
+         WHERE capability.ref = ? AND capability.project_id = ? AND use.nonce = ?`,
+      )
+      .get(input.ref, input.projectId, input.nonce) as
+      | { actions_json: string; subject_hash: string }
+      | undefined;
+    return Boolean(
+      row &&
+      row.subject_hash === input.subjectHash &&
+      (JSON.parse(row.actions_json) as HumanAction[]).includes(input.action),
+    );
   }
 
   latestSeq(projectId: string): number {

@@ -74,6 +74,58 @@ function registerBrowserSession(
   });
 }
 
+async function dispatchFleetNode(
+  app: MissionGraphServer["app"],
+  input: {
+    project: string;
+    token: string;
+    nodeId: string;
+    session: string;
+    proof: string;
+    nonce: string;
+  },
+) {
+  const mutation = {
+    type: "DISPATCHED",
+    payload: { node_id: input.nodeId, bypass_cap: true },
+  };
+  const staged = await app.inject({
+    method: "POST",
+    url: `/api/p/${input.project}/action-drafts`,
+    headers: {
+      "x-mg-token": input.token,
+      "x-mg-session": input.session,
+      "x-mg-session-proof": input.proof,
+    },
+    payload: { mutation, summary: `Dispatch ${input.nodeId} to a real worker.` },
+  });
+  const draft = staged.json<{ draft_id: string }>();
+  const confirmed = await app.inject({
+    method: "POST",
+    url: `/api/p/${input.project}/action-drafts/${draft.draft_id}/confirm`,
+    headers: {
+      "x-mg-token": input.token,
+      "x-mg-session": input.session,
+      "x-mg-session-proof": input.proof,
+    },
+  });
+  const capability = confirmed.json<{ capability_ref: string; capability: string }>();
+  const dispatched = await app.inject({
+    method: "POST",
+    url: `/api/p/${input.project}/mutations`,
+    headers: {
+      "x-mg-token": input.token,
+      "x-mg-session": input.session,
+      "x-mg-session-proof": input.proof,
+      "x-mg-capability-ref": capability.capability_ref,
+      "x-mg-capability": capability.capability,
+      "x-mg-nonce": input.nonce,
+    },
+    payload: { ...mutation, idem_key: `dispatch-${input.project}-${input.nodeId}` },
+  });
+  return { staged, confirmed, capability, dispatched };
+}
+
 async function issuePolicy(
   app: MissionGraphServer["app"],
   input: {
@@ -157,7 +209,8 @@ function addFleetNode(
   }
 }
 
-function prepareFleet(
+async function prepareFleet(
+  app: MissionGraphServer["app"],
   store: MissionGraphServer["store"],
   candidates: { project: string; token: string; nodeId: string; title: string; brief: string; dispatched?: boolean }[],
 ) {
@@ -174,14 +227,25 @@ function prepareFleet(
       templates.add(templateKey);
       addFleetNode(store, "seed", `template-${templates.size}`, candidate.title, candidate.brief, false);
     }
-    addFleetNode(
-      store,
-      candidate.project,
-      candidate.nodeId,
-      candidate.title,
-      candidate.brief,
-      candidate.dispatched ?? true,
-    );
+    addFleetNode(store, candidate.project, candidate.nodeId, candidate.title, candidate.brief, false);
+  }
+  for (const project of new Set(candidates.map((candidate) => candidate.project))) {
+    store.recordCloneBaseline(project);
+    registerBrowserSession(store, project, `fleet-session-${project}`, `fleet-proof-${project}`);
+  }
+  for (const candidate of candidates) {
+    if (candidate.dispatched === false) continue;
+    const result = await dispatchFleetNode(app, {
+      project: candidate.project,
+      token: candidate.token,
+      nodeId: candidate.nodeId,
+      session: `fleet-session-${candidate.project}`,
+      proof: `fleet-proof-${candidate.project}`,
+      nonce: `fleet-dispatch-${candidate.project}-${candidate.nodeId}`,
+    });
+    if (result.dispatched.statusCode !== 200) {
+      throw new Error(`failed to dispatch fleet fixture ${candidate.project}/${candidate.nodeId}`);
+    }
   }
 }
 
@@ -1697,7 +1761,7 @@ describe("HTTP and streaming contract", () => {
   it("runs a fleet request through enqueue, claim, heartbeat, and completion", async () => {
     let clock = new Date("2026-08-30T10:00:00.000Z");
     const { app, store } = server({ fleetMode: true, seedProjectId: "seed", now: () => clock });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
     ]);
 
@@ -1756,6 +1820,118 @@ describe("HTTP and streaming contract", () => {
     ).toEqual({ note: "Worker finished cleanly." });
   });
 
+  it("rejects a fleet dispatch inherited from the seed before the clone baseline", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+    addFleetNode(store, "seed", "template", "Build API", "Implement it.", true);
+    const clone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const body = clone.json<{ project: string; token: string }>();
+    const clonedNode = store.listEvents(body.project).find((event) => event.type === "TASK_ADDED");
+    if (!clonedNode || clonedNode.type !== "TASK_ADDED") throw new Error("cloned task missing");
+
+    const enqueued = await app.inject({
+      method: "POST",
+      url: `/api/p/${body.project}/fleet-requests`,
+      headers: { "x-mg-token": body.token },
+      payload: { node_id: clonedNode.payload.node.id },
+    });
+
+    expect(enqueued.statusCode).toBe(400);
+    expect(enqueued.json()).toMatchObject({ error: { code: "node_not_dispatched" } });
+  });
+
+  it("rejects a post-clone dispatch authorized by a capability consumed in another clone", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+    addFleetNode(store, "seed", "template", "Build API", "Implement it.", false);
+    const sourceClone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const source = sourceClone.json<{ project: string; token: string }>();
+    const sourceTask = store.listEvents(source.project).find((event) => event.type === "TASK_ADDED");
+    if (!sourceTask || sourceTask.type !== "TASK_ADDED") throw new Error("source cloned task missing");
+    registerBrowserSession(store, source.project, "source-session", "source-proof");
+    const sourceDispatch = await dispatchFleetNode(app, {
+      project: source.project,
+      token: source.token,
+      nodeId: sourceTask.payload.node.id,
+      session: "source-session",
+      proof: "source-proof",
+      nonce: "source-dispatch-use",
+    });
+    expect(sourceDispatch.dispatched.statusCode).toBe(200);
+    const sourceAuthorization = store.listEvents(source.project).at(-1);
+    if (!sourceAuthorization || sourceAuthorization.type !== "DISPATCHED" || !sourceAuthorization.payload.authorization) {
+      throw new Error("source dispatch authorization missing");
+    }
+
+    const targetClone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const target = targetClone.json<{ project: string; token: string }>();
+    const targetTask = store.listEvents(target.project).find((event) => event.type === "TASK_ADDED");
+    if (!targetTask || targetTask.type !== "TASK_ADDED") throw new Error("target cloned task missing");
+    store.append(target.project, {
+      actor: "human",
+      type: "DISPATCHED",
+      payload: {
+        node_id: targetTask.payload.node.id,
+        bypass_cap: true,
+        authorization: sourceAuthorization.payload.authorization,
+      },
+      idem_key: "foreign-authorized-dispatch",
+    });
+
+    const enqueued = await app.inject({
+      method: "POST",
+      url: `/api/p/${target.project}/fleet-requests`,
+      headers: { "x-mg-token": target.token },
+      payload: { node_id: targetTask.payload.node.id },
+    });
+
+    expect(enqueued.statusCode).toBe(400);
+    expect(enqueued.json()).toMatchObject({ error: { code: "node_not_dispatched" } });
+  });
+
+  it("revalidates clone-local capability consumption when claiming a fleet request", async () => {
+    const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
+    store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
+    addFleetNode(store, "seed", "template", "Build API", "Implement it.", false);
+    const clone = await app.inject({ method: "POST", url: "/api/clone-demo" });
+    const body = clone.json<{ project: string; token: string }>();
+    const clonedTask = store.listEvents(body.project).find((event) => event.type === "TASK_ADDED");
+    if (!clonedTask || clonedTask.type !== "TASK_ADDED") throw new Error("cloned task missing");
+    registerBrowserSession(store, body.project, "clone-session", "clone-proof");
+    const dispatch = await dispatchFleetNode(app, {
+      project: body.project,
+      token: body.token,
+      nodeId: clonedTask.payload.node.id,
+      session: "clone-session",
+      proof: "clone-proof",
+      nonce: "clone-dispatch-use",
+    });
+    expect(dispatch.dispatched.statusCode).toBe(200);
+    const enqueued = await app.inject({
+      method: "POST",
+      url: `/api/p/${body.project}/fleet-requests`,
+      headers: { "x-mg-token": body.token },
+      payload: { node_id: clonedTask.payload.node.id },
+    });
+    const request = enqueued.json<{ id: string }>();
+    expect(enqueued.statusCode).toBe(200);
+    store.database
+      .prepare("DELETE FROM human_capability_uses WHERE capability_ref = ? AND nonce = ?")
+      .run(dispatch.capability.capability_ref, "clone-dispatch-use");
+
+    const claimed = await app.inject({
+      method: "POST",
+      url: "/api/fleet/next",
+      headers: { "x-mg-reporter": "reporter-secret" },
+    });
+    const stored = store.database
+      .prepare("SELECT status, outcome FROM fleet_requests WHERE id = ?")
+      .get(request.id);
+
+    expect(claimed.statusCode).toBe(204);
+    expect(stored).toEqual({ status: "failed", outcome: "stale" });
+  });
+
   it("rejects an edited brief that no longer matches the seed template", async () => {
     const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
     store.createProject("seed", "seed-token", "2026-08-30T09:00:00.000Z");
@@ -1805,7 +1981,7 @@ describe("HTTP and streaming contract", () => {
       fleetPerProjectCap: 2,
       now: () => clock,
     });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project", token: "visitor-token", nodeId: "eligible", title: "Build API", brief: "Canonical brief." },
     ]);
     addFleetNode(store, "project", "overridden", "Build API", "Canonical brief.", true, "Canonical brief.");
@@ -1841,7 +2017,7 @@ describe("HTTP and streaming contract", () => {
 
   it("rejects a template node that has not been dispatched", async () => {
     const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       {
         project: "project",
         token: "visitor-token",
@@ -1872,7 +2048,7 @@ describe("HTTP and streaming contract", () => {
       fleetAdoptTtlMin: 1,
       now: () => clock,
     });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project", token: "visitor-token", nodeId: "a", title: "Task A", brief: "Build A." },
       { project: "project", token: "visitor-token", nodeId: "b", title: "Task B", brief: "Build B." },
     ]);
@@ -1913,7 +2089,7 @@ describe("HTTP and streaming contract", () => {
       fleetPerProjectCap: 2,
       now: () => new Date("2026-08-30T23:59:00.000Z"),
     });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project-a", token: "visitor-a", nodeId: "a", title: "Task A", brief: "Build A." },
       { project: "project-b", token: "visitor-b", nodeId: "b", title: "Task B", brief: "Build B." },
     ]);
@@ -1937,7 +2113,7 @@ describe("HTTP and streaming contract", () => {
 
   it("returns a conflict for a duplicate active fleet request", async () => {
     const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
     ]);
     const enqueue = () => app.inject({
@@ -1956,7 +2132,7 @@ describe("HTTP and streaming contract", () => {
 
   it("marks a stale queued item failed and claims the next eligible item atomically", async () => {
     const { app, store } = server({ fleetMode: true, seedProjectId: "seed", fleetPerProjectCap: 2 });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project", token: "visitor-token", nodeId: "a", title: "Task A", brief: "Build A." },
       { project: "project", token: "visitor-token", nodeId: "b", title: "Task B", brief: "Build B." },
     ]);
@@ -2001,7 +2177,7 @@ describe("HTTP and streaming contract", () => {
       fleetAdoptTtlMin: 1,
       now: () => clock,
     });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
     ]);
     const enqueued = await app.inject({
@@ -2052,7 +2228,7 @@ describe("HTTP and streaming contract", () => {
       fleetAdoptTtlMin: 1,
       now: () => clock,
     });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
     ]);
     const enqueued = await app.inject({
@@ -2085,7 +2261,7 @@ describe("HTTP and streaming contract", () => {
 
   it("rejects visitor credentials on supervisor fleet routes", async () => {
     const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
     ]);
 
@@ -2101,7 +2277,7 @@ describe("HTTP and streaming contract", () => {
 
   it("rejects supervisor credentials on visitor fleet routes", async () => {
     const { app, store } = server({ fleetMode: true, seedProjectId: "seed" });
-    prepareFleet(store, [
+    await prepareFleet(app, store, [
       { project: "project", token: "visitor-token", nodeId: "task", title: "Build API", brief: "Implement it." },
     ]);
 
