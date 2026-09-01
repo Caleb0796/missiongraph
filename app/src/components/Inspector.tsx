@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   describeEvent,
   eventTargetsNode,
@@ -50,6 +50,11 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
   const activeSplitDraft = splitDraft?.nodeId === node?.id ? splitDraft : null
   const firstChildTitle = activeSplitDraft?.first ?? ''
   const secondChildTitle = activeSplitDraft?.second ?? ''
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setActiveTab('Brief'), 0)
+    return () => window.clearTimeout(timer)
+  }, [selectedId])
 
   const relevantEvents = useMemo(
     () =>
@@ -116,6 +121,7 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
     | (TaskNode & {
         record_type?: 'task' | 'group'
         child_ids?: string[]
+        assigned?: boolean
         pause_requested?: boolean
       })
     | undefined
@@ -352,10 +358,14 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
           <button
             type="button"
             className="action-secondary"
-            disabled={displayState !== 'ready' || runtimeNode?.record_type === 'group'}
+            disabled={
+              displayState !== 'ready' ||
+              runtimeNode?.assigned ||
+              runtimeNode?.record_type === 'group'
+            }
             onClick={() => dispatch(node.id)}
           >
-            Dispatch
+            {runtimeNode?.assigned ? 'Queued for worker' : 'Dispatch'}
           </button>
           {node.state === 'running' && runtimeNode?.record_type !== 'group' && (
             <button

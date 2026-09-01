@@ -1,5 +1,7 @@
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react'
 import type { DisplayState } from '../model/graph'
+import type { TaskNode } from '../model/types'
+import { useMissionStore } from '../store/mission-store'
 
 export interface TaskNodeData extends Record<string, unknown> {
   title: string
@@ -31,7 +33,15 @@ const stateLabels: Record<DisplayState, string> = {
   blocked: 'Blocked',
 }
 
-export function TaskNodeCard({ data, selected }: NodeProps<TaskFlowNode>) {
+export function TaskNodeCard({ id, data, selected }: NodeProps<TaskFlowNode>) {
+  const assigned = useMissionStore((state) =>
+    Boolean(
+      (state.nodes.find((node) => node.id === id) as
+        | (TaskNode & { assigned?: boolean })
+        | undefined)?.assigned,
+    ),
+  )
+
   return (
     <div
       className={`mission-node mission-node--${data.displayState} ${
@@ -80,6 +90,9 @@ export function TaskNodeCard({ data, selected }: NodeProps<TaskFlowNode>) {
           </span>
         ))}
         {data.approval && <span className="mission-approval">Approval</span>}
+        {data.displayState === 'ready' && assigned && (
+          <span className="mission-tag">queued</span>
+        )}
         {data.idleFor && <span className="mission-idle">{data.idleFor}</span>}
       </div>
       <Handle

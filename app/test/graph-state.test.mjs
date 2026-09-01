@@ -7,6 +7,7 @@ import {
   approvalsForNode,
   boundedHistory,
   contextualToolNamesForState,
+  describeEvent,
   eventTargetsNode,
   fixtureRankedPendingApprovals,
   foldEdgeLineage,
@@ -15,6 +16,7 @@ import {
   humanizeIdleAge,
   idleRadar,
   isPreviewStale,
+  isReadyUnassigned,
   pruneEdgeLineage,
   refreshReadySince,
 } from '../src/model/graph.ts'
@@ -51,6 +53,47 @@ test('readiness timestamps follow every derived readiness transition', () => {
     '10:02',
   )
   assert.deepEqual(ready, { b: '10:02' })
+})
+
+test('ready counts exclude tasks already queued for a worker', () => {
+  assert.equal(isReadyUnassigned(task('ready'), [], []), true)
+  assert.equal(
+    isReadyUnassigned(task('assigned', 'queued', { assigned: true }), [], []),
+    false,
+  )
+})
+
+test('visitor clone detach events explain why recorded workers are paused', () => {
+  const nodes = [task('a', 'paused')]
+  const detached = {
+    seq: 1,
+    project_id: 'project',
+    ts: '2026-09-01T10:00:00.000Z',
+    actor: 'supervisor',
+    type: 'NODE_STATE_CHANGED',
+    payload: {
+      node_id: 'a',
+      from: 'running',
+      to: 'paused',
+      detail: 'worker detached during visitor clone',
+    },
+    idem_key: 'detached',
+  }
+  assert.equal(
+    describeEvent(detached, nodes, []),
+    'Recorded worker detached when your private mission copy was created',
+  )
+  assert.equal(
+    describeEvent(
+      {
+        ...detached,
+        payload: { node_id: 'a', from: 'running', to: 'paused' },
+      },
+      nodes,
+      [],
+    ),
+    'Task a moved from running to paused.',
+  )
 })
 
 test('blast radius includes downstream running work', () => {

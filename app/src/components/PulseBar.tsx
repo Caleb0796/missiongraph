@@ -1,5 +1,9 @@
-import type { DisplayState } from '../model/graph'
-import type { ConnectionMode } from '../store/mission-store'
+import { isReadyUnassigned, type DisplayState } from '../model/graph'
+import {
+  selectReplaySequenceLength,
+  useMissionStore,
+  type ConnectionMode,
+} from '../store/mission-store'
 
 interface PulseBarProps {
   eta: number
@@ -46,6 +50,14 @@ export function PulseBar({
   linkErrorHasStoredIdentity,
   contextualToolsDegraded,
 }: PulseBarProps) {
+  const nodes = useMissionStore((state) => state.nodes)
+  const edges = useMissionStore((state) => state.edges)
+  const replaySequenceLength = useMissionStore(selectReplaySequenceLength)
+  const replayTotal = replayProgress?.total ?? replaySequenceLength
+  const readyCount = nodes.filter((node) =>
+    isReadyUnassigned(node, nodes, edges),
+  ).length
+
   return (
     <header className="pulse-bar">
       <div className="flex min-w-0 items-center gap-3">
@@ -80,8 +92,9 @@ export function PulseBar({
             {eta} min
           </strong>
         </div>
-        <Stat label="Ready" value={counts.ready} tone="bg-blue-400" />
+        <Stat label="Ready" value={readyCount} tone="bg-blue-400" />
         <Stat label="Running" value={counts.running} tone="bg-cyan-400" />
+        <Stat label="Paused" value={counts.paused} tone="bg-sky-300" />
         <Stat label="Review" value={counts.review} tone="bg-amber-300" />
         <Stat label="Done" value={counts.done} tone="bg-emerald-400" />
         <Stat label="Blocked" value={counts.blocked} tone="bg-slate-500" />
@@ -99,7 +112,7 @@ export function PulseBar({
         )}
         {connectionMode === 'fixture' && (
           <span className="offline-badge" title={connectionMessage}>
-            Dev fixture projection
+            {import.meta.env.PROD ? 'Offline demo data' : 'Dev fixture projection'}
           </span>
         )}
         <button
@@ -107,10 +120,12 @@ export function PulseBar({
           className="catch-up-chip"
           onClick={onCatchUp}
         >
-          <span className="catch-up-count">{replayProgress?.total ?? 6}</span>
+          {replayTotal !== null && (
+            <span className="catch-up-count">{replayTotal}</span>
+          )}
           {replaying && replayProgress
             ? `Replaying changes · ${replayProgress.step}/${replayProgress.total}`
-            : 'Since you left'}
+            : 'Recent changes'}
         </button>
         <div className={`live-indicator live-indicator--${connectionMode}`}>
           <span className="live-dot" />

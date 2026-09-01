@@ -98,10 +98,10 @@ export function CompatPage() {
           ← Return to MissionGraph
         </a>
         <p className="mb-3 font-mono text-sm tracking-[0.22em] text-cyan-300 uppercase">
-          MissionGraph M0
+          MissionGraph
         </p>
         <h1 className="text-4xl font-semibold tracking-tight sm:text-5xl">
-          WebMCP compatibility spike
+          WebMCP compatibility check
         </h1>
         <p className="mt-5 max-w-2xl text-lg leading-8 text-slate-300">
           This page registers one read-only tool and exposes direct discovery and

@@ -311,6 +311,9 @@ test('late WebMCP activation updates the canvas and compatibility page reactivel
   assert.match(compat, /useSyncExternalStore\(/)
   assert.match(compat, /await recheckWebMcp\(\)/)
   assert.match(compat, /status\.state === 'active' \? status\.namespace/)
+  assert.match(compat, />\s*MissionGraph\s*</)
+  assert.match(compat, /WebMCP compatibility check/)
+  assert.doesNotMatch(compat, /MissionGraph M0|WebMCP compatibility spike/)
 })
 
 test('tool console keeps unknown tools and malformed JSON as inline errors', async () => {
@@ -337,8 +340,41 @@ test('capability links and fixture labeling stay explicit', async () => {
   assert.match(pulse, /Start a fresh mission copy/)
   assert.match(pulse, /Open my stored mission/)
   assert.match(pulse, /connectionMode === 'fixture'/)
+  assert.match(pulse, /import\.meta\.env\.PROD/)
+  assert.match(pulse, /Offline demo data/)
   assert.match(pulse, /Dev fixture projection/)
   assert.doesNotMatch(pulse, /connectionMessage\.includes\('fixture projection'\)/)
+})
+
+test('pulse reports paused workers from visitor clones', async () => {
+  const pulse = await source('../src/components/PulseBar.tsx')
+  assert.match(pulse, /<Stat label="Running" value=\{counts\.running\}/)
+  assert.match(pulse, /<Stat label="Paused" value=\{counts\.paused\}/)
+})
+
+test('assigned ready tasks cannot be dispatched twice', async () => {
+  const inspector = await source('../src/components/Inspector.tsx')
+  const card = await source('../src/components/TaskNodeCard.tsx')
+  const pulse = await source('../src/components/PulseBar.tsx')
+  const graph = await source('../src/model/graph.ts')
+  const dispatchButton = inspector.slice(
+    inspector.indexOf('onClick={() => dispatch(node.id)}') - 260,
+    inspector.indexOf('onClick={() => dispatch(node.id)}') + 180,
+  )
+  assert.match(dispatchButton, /runtimeNode\?\.assigned/)
+  assert.match(dispatchButton, /Queued for worker/)
+  assert.match(card, /data\.displayState === 'ready' && assigned/)
+  assert.match(card, />queued</)
+  assert.match(pulse, /value=\{readyCount\}/)
+  assert.match(graph, /export function isReadyUnassigned/)
+})
+
+test('each dossier selection opens on its Brief tab', async () => {
+  const inspector = await source('../src/components/Inspector.tsx')
+  assert.match(
+    inspector,
+    /useEffect\(\(\) => \{\s*const timer = window\.setTimeout\(\(\) => setActiveTab\('Brief'\), 0\)[\s\S]*?\}, \[selectedId\]\)/,
+  )
 })
 
 test('judge first-run prompts and WebMCP guidance are wired into the canvas', async () => {
@@ -450,6 +486,7 @@ test('M5 visual wiring exposes blast radius, relayout, split ancestry, and pause
 test('canvas gates first paint and replays changes with visible cancellable pacing', async () => {
   const canvas = await source('../src/components/GraphCanvas.tsx')
   const pulse = await source('../src/components/PulseBar.tsx')
+  const store = await source('../src/store/mission-store.ts')
   const styles = await source('../src/index.css')
   assert.match(canvas, /const prelayout = layoutReadyFor\?\.projectId !== projectId/)
   assert.match(canvas, /setLayoutReadyFor\(\{ projectId: scheduledProjectId \}\)/)
@@ -471,6 +508,11 @@ test('canvas gates first paint and replays changes with visible cancellable paci
   assert.match(styles, /canvas--replaying \.react-flow__node,/)
   assert.match(styles, /mission-flow-node--replay-focus/)
   assert.match(pulse, /Replaying changes · \$\{replayProgress\.step\}\/\$\{replayProgress\.total\}/)
+  assert.match(pulse, /Recent changes/)
+  assert.match(pulse, /useMissionStore\(selectReplaySequenceLength\)/)
+  assert.doesNotMatch(pulse, /replayProgress\?\.total \?\? 6/)
+  assert.match(store, /export function selectReplaySequenceLength/)
+  assert.match(store, /\.slice\(-6\)\.length/)
   assert.match(canvas, /onPointerDownCapture=\{cancelReplay\}/)
   assert.match(canvas, /replayWaitCancel\.current\?\.\(\)/)
   assert.match(canvas, /setViewport\(getViewport\(\), \{ duration: 0 \}\)/)

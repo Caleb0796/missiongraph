@@ -385,7 +385,7 @@ export function getBlastRadius(
   }
 }
 
-function isReadyUnassigned(
+export function isReadyUnassigned(
   node: TaskNode,
   nodes: TaskNode[],
   edges: GraphEdge[],
@@ -651,6 +651,9 @@ export function describeEvent(
     case 'JOURNAL_NOTE':
       return event.payload.text
     case 'NODE_STATE_CHANGED':
+      if (event.payload.detail === 'worker detached during visitor clone') {
+        return 'Recorded worker detached when your private mission copy was created'
+      }
       return `${title(event.payload.node_id)} moved from ${event.payload.from} to ${event.payload.to}.`
     case 'PAUSE_ACKED':
       return `${title(event.payload.node_id)} reached a safe pause point.`
