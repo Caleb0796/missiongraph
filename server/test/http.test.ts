@@ -70,7 +70,12 @@ function registerBrowserSession(
     token: proof,
     project_id: project,
     created_at: "2026-08-30T10:00:00.000Z",
-    expires_at: "2026-09-01T10:00:00.000Z",
+    // Session validity is checked against the REAL clock (no injected clock on this
+    // path), so this must stay far in the future: a near-term date here is a time
+    // bomb — the fixture expired on 2026-09-01T10:00Z and turned CI red with
+    // "invalid value \"undefined\" for header x-mg-capability-ref" while the same
+    // tree had been green that morning.
+    expires_at: "2035-01-01T00:00:00.000Z",
   });
 }
 
