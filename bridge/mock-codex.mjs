@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 
 const args = process.argv.slice(2);
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -9,6 +10,44 @@ const includesPair = (flag, value) => args.some((argument, index) => argument ==
 const finish = async () => {
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
 };
+
+async function report(type, payload) {
+  const url = process.env.MG_REPORT_URL;
+  const config = process.env.MG_REPORTER_CONFIG;
+  const actor = process.env.MG_WORKER_ACTOR;
+  if (!url || !config || !actor) throw new Error("mock lifecycle reporting environment is incomplete");
+  const body = JSON.stringify({ actor, type, payload, idem_key: randomUUID() });
+  await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(
+      "curl",
+      [
+        "--config",
+        config,
+        "--fail",
+        "--silent",
+        "--show-error",
+        "-X",
+        "POST",
+        url,
+        "-H",
+        "content-type: application/json",
+        "--data-binary",
+        "@-",
+      ],
+      { stdio: ["pipe", "ignore", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", rejectPromise);
+    child.once("close", (code) => {
+      if (code === 0) resolvePromise();
+      else rejectPromise(new Error(`mock lifecycle report ${type} failed (${code}): ${stderr.trim()}`));
+    });
+    child.stdin.end(body);
+  });
+}
 
 for (const name of ["REPORTER_TOKEN", "MG_REPORTER_CREDENTIAL", "MG_VISITOR_TOKEN"]) {
   if (process.env[name] !== undefined) {
@@ -76,11 +115,39 @@ if (brief.startsWith("MISSIONGRAPH SUPERVISOR")) {
 } else {
   if (!includesPair("-s", "workspace-write") || !args.includes("sandbox_workspace_write.network_access=true")) process.exit(8);
   const nodeId = brief.match(/Node ID: ([^\n]+)/)?.[1] ?? createHash("sha1").update(brief).digest("hex").slice(0, 8);
+  const reportLifecycle = brief.includes("MOCK_REPORT_LIFECYCLE");
   emit({ type: "thread.started", thread_id: `mock-worker-${nodeId}` });
+  if (reportLifecycle) {
+    await report("NODE_STATE_CHANGED", { node_id: nodeId, from: "queued", to: "running", detail: "Mock fleet worker started." });
+    await report("WORKER_LOG", { node_id: nodeId, lines: ["Mock fleet worker is running."] });
+  }
   agent({ worker_complete: true });
   const delay = Number(brief.match(/MOCK_DELAY_(\d+)/)?.[1] ?? "0");
   if (brief.includes("MOCK_HANG")) await new Promise(() => setInterval(() => undefined, 1_000));
   if (delay > 0) await new Promise((resolvePromise) => setTimeout(resolvePromise, delay));
   if (brief.includes("MOCK_FAIL")) process.exit(12);
+  if (reportLifecycle) {
+    await report("WORKER_LOG", { node_id: nodeId, lines: ["Mock fleet worker finished."] });
+    await report("NODE_STATE_CHANGED", { node_id: nodeId, from: "running", to: "review", detail: "Mock fleet worker finished." });
+    await report("HANDOFF_FILED", {
+      node_id: nodeId,
+      handoff: {
+        v: 1,
+        summary: "Mock fleet worker completed the seeded integration task.",
+        files: [],
+        commits: [],
+        tests: "green",
+        downstream_notes: "No downstream action required.",
+        deviations: [],
+        artifacts: [],
+      },
+    });
+    await report("APPROVAL_CREATED", {
+      approval_id: `mock-fleet-approval-${randomUUID()}`,
+      node_id: nodeId,
+      summary: "Review the mock fleet worker handoff.",
+      tests: "green",
+    });
+  }
 }
 await finish();

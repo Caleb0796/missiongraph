@@ -248,25 +248,14 @@ describe("FleetAdoptionLoop", () => {
     const harness = await createHarness(stub);
     harness.start();
 
-    await waitFor(() => harness.state.state.fleet_adoption?.status === "completed");
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
 
-    expect(harness.state.state.fleet_adoption).toMatchObject({
-      request_id: "request-1",
-      project_id: "adopted-project",
-      node_id: "adopted-node",
-      outcome: "done",
-    });
+    expect(harness.state.state.fleet_adoption).toBeUndefined();
     expect(stub.credentialProjects).toEqual(["adopted-project"]);
     expect(stub.credentialActors).toEqual(["worker:adopted-node"]);
     expect(stub.heartbeatTimes.length).toBeGreaterThanOrEqual(1);
     expect(stub.completionCalls).toEqual([{ requestId: "request-1", body: { outcome: "done" } }]);
-    expect(harness.state.state.workers["fleet:request-1"]).toMatchObject({
-      status: "idle",
-      node_id: "adopted-node",
-      project_id: "adopted-project",
-      fleet_request_id: "request-1",
-      thread_id: "mock-worker-adopted-node",
-    });
+    expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
   });
 
   it("places the server title and brief verbatim into the existing worker brief", () => {
@@ -294,12 +283,12 @@ describe("FleetAdoptionLoop", () => {
     const harness = await createHarness(stub, { fleetRunTtlMs: 90 });
     harness.start();
 
-    await waitFor(() => harness.state.state.fleet_adoption?.status === "completed");
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
       note: expect.stringContaining("FLEET_RUN_TTL_MIN"),
     });
-    expect(harness.state.state.workers["fleet:request-1"]?.status).toBe("idle");
+    expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
   });
 
   it("heartbeats repeatedly within the configured cadence while a worker runs", async () => {
@@ -308,7 +297,7 @@ describe("FleetAdoptionLoop", () => {
     const harness = await createHarness(stub, { fleetHeartbeatMs: 35 });
     harness.start();
 
-    await waitFor(() => harness.state.state.fleet_adoption?.status === "completed");
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
     expect(stub.heartbeatTimes.length).toBeGreaterThanOrEqual(4);
     for (let index = 1; index < stub.heartbeatTimes.length; index += 1) {
       expect(stub.heartbeatTimes[index]! - stub.heartbeatTimes[index - 1]!).toBeLessThan(100);
@@ -328,7 +317,7 @@ describe("FleetAdoptionLoop", () => {
     });
     harness.start();
 
-    await waitFor(() => harness.state.state.fleet_adoption?.status === "completed");
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
     expect(stub.nextTimes).toEqual([]);
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
@@ -382,7 +371,7 @@ describe("FleetAdoptionLoop", () => {
     if (child.exitCode === null && child.signalCode === null) {
       await new Promise<void>((resolve) => child.once("exit", () => resolve()));
     }
-    await waitFor(() => harness.state.state.fleet_adoption?.status === "completed");
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
       note: expect.stringContaining("no longer running"),
@@ -408,7 +397,28 @@ describe("FleetAdoptionLoop", () => {
     await waitFor(() => stub.completionCalls.length === 1);
     expect(stub.credentialProjects).toEqual([]);
     expect(harness.state.state.workers).toEqual({});
+    expect(harness.state.state.fleet_adoption).toBeUndefined();
     expect(stub.completionCalls[0]?.body.outcome).toBe("done");
+  });
+
+  it("clears a completed persisted adoption when the server queue is empty", async () => {
+    const stub = await startedStub();
+    const harness = await createHarness(stub, {}, async (state) => {
+      state.state.fleet_adoption = {
+        ...claim(),
+        worker_key: "fleet:request-1",
+        status: "completed",
+        adopted_at: new Date(Date.now() - 1_000).toISOString(),
+        outcome: "done",
+        finished_at: new Date().toISOString(),
+      };
+      await state.save();
+    });
+    harness.start();
+
+    await waitFor(() => stub.nextTimes.length === 1 && harness.state.state.fleet_adoption === undefined);
+    expect(stub.completionCalls).toEqual([]);
+    expect(harness.state.state.workers).toEqual({});
   });
 
   it("backs off after 204 empty responses instead of busy-polling", async () => {
@@ -430,7 +440,7 @@ describe("FleetAdoptionLoop", () => {
     const harness = await createHarness(stub);
     harness.start();
 
-    await waitFor(() => harness.state.state.fleet_adoption?.status === "completed");
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
     expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
@@ -444,7 +454,7 @@ describe("FleetAdoptionLoop", () => {
     const harness = await createHarness(stub);
     harness.start();
 
-    await waitFor(() => harness.state.state.fleet_adoption?.status === "completed");
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
       note: expect.stringContaining("exited unsuccessfully"),
@@ -458,12 +468,12 @@ describe("FleetAdoptionLoop", () => {
     const harness = await createHarness(stub);
     harness.start();
 
-    await waitFor(() => harness.state.state.fleet_adoption?.status === "completed");
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
       note: expect.stringContaining("became stale"),
     });
-    expect(harness.state.state.workers["fleet:request-1"]?.status).toBe("idle");
+    expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
   });
 
   it("uses exactly the flagship OPENAI/CODEX environment allowlist for adopted workers", () => {

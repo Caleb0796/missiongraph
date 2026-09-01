@@ -154,13 +154,16 @@ export class FleetAdoptionLoop {
     let transferred = false;
     let claim: FleetClaim | undefined;
     try {
-      claim = await this.client.next();
-      if (!claim) return;
       const previous = this.stateStore.state.fleet_adoption;
-      if (previous?.request_id === claim.request_id && terminalStatuses.has(previous.status)) {
-        await this.client.complete(claim.request_id, previous.outcome ?? "failed", previous.note);
-        return;
+      claim = await this.client.next();
+      if (previous && terminalStatuses.has(previous.status)) {
+        if (claim?.request_id === previous.request_id) {
+          await this.client.complete(claim.request_id, previous.outcome ?? "failed", previous.note);
+        }
+        await this.detach(previous);
+        if (!claim || claim.request_id === previous.request_id) return;
       }
+      if (!claim) return;
       const adoption: FleetAdoptionState = {
         request_id: claim.request_id,
         project_id: claim.project_id,
@@ -338,16 +341,19 @@ export class FleetAdoptionLoop {
       await this.abandon(adoption, adoption.note ?? "Fleet claim disappeared before completion.");
       return;
     }
-    adoption.status = "completed";
-    adoption.finished_at = new Date().toISOString();
-    await this.stateStore.save();
+    await this.detach(adoption);
   }
 
   private async abandon(adoption: FleetAdoptionState, note: string): Promise<void> {
-    adoption.status = "abandoned";
-    adoption.outcome = "failed";
-    adoption.note = note;
-    adoption.finished_at = new Date().toISOString();
+    this.logger.warn(`fleet adoption ${adoption.request_id} detached without completion: ${note}`);
+    await this.detach(adoption);
+  }
+
+  private async detach(adoption: FleetAdoptionState): Promise<void> {
+    delete this.stateStore.state.workers[adoption.worker_key];
+    if (this.stateStore.state.fleet_adoption?.request_id === adoption.request_id) {
+      delete this.stateStore.state.fleet_adoption;
+    }
     await this.stateStore.save();
   }
 
