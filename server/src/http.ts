@@ -20,6 +20,7 @@ import {
   type ImportedEvent,
   type ReporterActor,
 } from "./events.js";
+import { FleetQueue, FleetQueueError, type FleetRequest } from "./fleet.js";
 import { fold, GraphValidationError } from "./reducer.js";
 import { installRealtime } from "./ws.js";
 
@@ -30,6 +31,10 @@ export interface ServerOptions {
   now?: () => Date;
   id?: () => string;
   allowedOrigins?: string[];
+  fleetMode?: boolean;
+  fleetDailyCap?: number;
+  fleetPerProjectCap?: number;
+  fleetAdoptTtlMin?: number;
   logger?: boolean;
 }
 
@@ -238,6 +243,9 @@ function batchInputs(
 }
 
 function errorReply(error: unknown, reply: FastifyReply): FastifyReply {
+  if (error instanceof FleetQueueError) {
+    return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message } });
+  }
   if (error instanceof CapabilityError) {
     return reply.code(403).send({ error: { code: error.code, message: error.message } });
   }
@@ -248,6 +256,28 @@ function errorReply(error: unknown, reply: FastifyReply): FastifyReply {
     return reply.code(404).send({ error: { code: "project_not_found", message: error.message } });
   }
   throw error;
+}
+
+function fleetError(reply: FastifyReply, statusCode: number, code: string, message: string): FastifyReply {
+  return reply.code(statusCode).send({ error: { code, message } });
+}
+
+function positiveInteger(value: number | string | undefined, fallback: number, name: string): number {
+  if (value === undefined || value === "") return fallback;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer`);
+  return parsed;
+}
+
+function fleetRequestResponse(request: FleetRequest, position?: number): Record<string, unknown> {
+  return {
+    id: request.id,
+    status: request.status,
+    ...(position === undefined ? {} : { position }),
+    ...(request.adopted_at === null ? {} : { adopted_at: request.adopted_at }),
+    ...(request.finished_at === null ? {} : { finished_at: request.finished_at }),
+    ...(request.outcome === null ? {} : { outcome: request.outcome }),
+  };
 }
 
 function collectIds(events: readonly Event[]): Map<string, string> {
@@ -367,6 +397,18 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
   const now = options.now ?? (() => new Date());
   const id = options.id ?? randomUUID;
   const configuredSeedProjectId = options.seedProjectId ?? process.env.SEED_PROJECT_ID;
+  const fleetMode = options.fleetMode ?? process.env.FLEET_MODE === "1";
+  const fleetDailyCap = positiveInteger(options.fleetDailyCap ?? process.env.FLEET_DAILY_CAP, 30, "FLEET_DAILY_CAP");
+  const fleetPerProjectCap = positiveInteger(
+    options.fleetPerProjectCap ?? process.env.FLEET_PER_PROJECT_CAP,
+    1,
+    "FLEET_PER_PROJECT_CAP",
+  );
+  const fleetAdoptTtlMin = positiveInteger(
+    options.fleetAdoptTtlMin ?? process.env.FLEET_ADOPT_TTL_MIN,
+    20,
+    "FLEET_ADOPT_TTL_MIN",
+  );
   const fixtureSeedProjectId = "demo-seed";
   const allowedOrigins = new Set(
     options.allowedOrigins ??
@@ -376,6 +418,13 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
         .filter(Boolean),
   );
   const store = new EventStore(options.databasePath ?? process.env.DB_PATH ?? "missiongraph.sqlite");
+  const fleet = new FleetQueue(store, {
+    ...(configuredSeedProjectId === undefined ? {} : { seedProjectId: configuredSeedProjectId }),
+    dailyCap: fleetDailyCap,
+    perProjectCap: fleetPerProjectCap,
+    adoptTtlMin: fleetAdoptTtlMin,
+    id,
+  });
   const app = Fastify({ logger: options.logger ?? false });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -391,6 +440,101 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       )
       .header("access-control-max-age", "86400");
     if (request.method === "OPTIONS") return reply.code(204).send();
+  });
+
+  app.get("/api/p/:project/fleet-status", async (request, reply) => {
+    const project = (request.params as { project: string }).project;
+    if (!visitorAuthorized(store, request, project)) {
+      return fleetError(reply, 401, "unauthorized", "A valid visitor token is required.");
+    }
+    if (!fleetMode) {
+      return reply.send({ enabled: false, queue_depth: 0, daily_remaining: 0, project_remaining: 0 });
+    }
+    try {
+      return reply.send({ enabled: true, ...fleet.status(project, now()) });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/p/:project/fleet-requests", async (request, reply) => {
+    if (!fleetMode) return fleetError(reply, 404, "fleet_disabled", "The live fleet is disabled.");
+    const project = (request.params as { project: string }).project;
+    if (!visitorAuthorized(store, request, project)) {
+      return fleetError(reply, 401, "unauthorized", "A valid visitor token is required.");
+    }
+    try {
+      const body = record(request.body, "body");
+      if (typeof body.node_id !== "string" || body.node_id.length === 0) {
+        throw new EventValidationError("node_id must not be empty");
+      }
+      const result = fleet.enqueue(project, body.node_id, now());
+      return reply.send({ id: result.request.id, status: "queued", position: result.position });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.get("/api/p/:project/fleet-requests/:request", async (request, reply) => {
+    if (!fleetMode) return fleetError(reply, 404, "fleet_disabled", "The live fleet is disabled.");
+    const { project, request: requestId } = request.params as { project: string; request: string };
+    if (!visitorAuthorized(store, request, project)) {
+      return fleetError(reply, 401, "unauthorized", "A valid visitor token is required.");
+    }
+    try {
+      const result = fleet.get(project, requestId, now());
+      return reply.send(fleetRequestResponse(result.request, result.position));
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/fleet/next", async (request, reply) => {
+    if (!fleetMode) return fleetError(reply, 404, "fleet_disabled", "The live fleet is disabled.");
+    if (!sameSecret(textHeader(request.headers["x-mg-reporter"]), supervisorReporterToken)) {
+      return fleetError(reply, 401, "unauthorized", "A valid supervisor reporter credential is required.");
+    }
+    try {
+      const claimed = fleet.claimNext(now());
+      return claimed ? reply.send(claimed) : reply.code(204).send();
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/fleet/:request/heartbeat", async (request, reply) => {
+    if (!fleetMode) return fleetError(reply, 404, "fleet_disabled", "The live fleet is disabled.");
+    if (!sameSecret(textHeader(request.headers["x-mg-reporter"]), supervisorReporterToken)) {
+      return fleetError(reply, 401, "unauthorized", "A valid supervisor reporter credential is required.");
+    }
+    try {
+      const requestId = (request.params as { request: string }).request;
+      const updated = fleet.heartbeat(requestId, now());
+      return reply.send({ id: updated.id, status: updated.status });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
+  });
+
+  app.post("/api/fleet/:request/complete", async (request, reply) => {
+    if (!fleetMode) return fleetError(reply, 404, "fleet_disabled", "The live fleet is disabled.");
+    if (!sameSecret(textHeader(request.headers["x-mg-reporter"]), supervisorReporterToken)) {
+      return fleetError(reply, 401, "unauthorized", "A valid supervisor reporter credential is required.");
+    }
+    try {
+      const requestId = (request.params as { request: string }).request;
+      const body = record(request.body, "body");
+      if (body.outcome !== "done" && body.outcome !== "failed") {
+        throw new EventValidationError("outcome must be done or failed");
+      }
+      if (body.note !== undefined && typeof body.note !== "string") {
+        throw new EventValidationError("note must be a string");
+      }
+      const updated = fleet.complete(requestId, body.outcome, body.note as string | undefined, now());
+      return reply.send({ id: updated.id, status: updated.status });
+    } catch (error) {
+      return errorReply(error, reply);
+    }
   });
 
   app.post("/api/p/:project/browser-sessions", async (request, reply) => {

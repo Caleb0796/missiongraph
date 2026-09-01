@@ -818,12 +818,24 @@ export class EventStore {
         used_at TEXT NOT NULL,
         PRIMARY KEY (capability_ref, nonce)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS fleet_requests (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        outcome TEXT,
+        note TEXT,
+        created_at TEXT NOT NULL,
+        adopted_at TEXT,
+        finished_at TEXT
+      ) STRICT;
       CREATE INDEX IF NOT EXISTS events_project_node ON events(project_id, node_ref, seq);
       CREATE INDEX IF NOT EXISTS events_project_edge ON events(project_id, edge_ref, seq);
       CREATE INDEX IF NOT EXISTS reporter_credentials_project ON reporter_credentials(project_id, expires_at);
       CREATE INDEX IF NOT EXISTS browser_sessions_project ON browser_sessions(project_id, expires_at);
       CREATE INDEX IF NOT EXISTS human_drafts_project ON human_drafts(project_id, session_id, expires_at);
       CREATE INDEX IF NOT EXISTS human_capabilities_project ON human_capabilities(project_id, session_id, expires_at);
+      CREATE INDEX IF NOT EXISTS fleet_requests_status_created ON fleet_requests(status, created_at);
     `);
   }
 
