@@ -436,6 +436,22 @@ test('pulse reports paused workers from visitor clones', async () => {
   assert.match(pulse, /<Stat label="Paused" value=\{counts\.paused\}/)
 })
 
+test('reset confirms before abandoning the current mission copy', async () => {
+  const pulse = await source('../src/components/PulseBar.tsx')
+  const confirmation = pulse.slice(
+    pulse.indexOf('function confirmReset()'),
+    pulse.indexOf('\n\n  return ('),
+  )
+
+  assert.match(
+    confirmation,
+    /window\.confirm\(\s*'Start over with a fresh copy of the mission\? Your current copy will be abandoned\.'/,
+  )
+  assert.ok(confirmation.indexOf('window.confirm(') < confirmation.indexOf('onReset()'))
+  assert.match(pulse, /onClick=\{confirmReset\}[\s\S]*?>\s*Reset\s*</)
+  assert.doesNotMatch(pulse, /onClick=\{onReset\}/)
+})
+
 test('assigned ready tasks cannot be dispatched twice', async () => {
   const inspector = await source('../src/components/Inspector.tsx')
   const card = await source('../src/components/TaskNodeCard.tsx')
