@@ -536,7 +536,7 @@ async function executeSplit(
       ...(currentParent.state === 'running'
         ? {
             notice:
-              'this task is still executing — the supervisor will re-brief its worker after the split',
+              'The split is recorded and the graph rewired; the running worker keeps its original brief until it exits, after which the supervisor can re-brief the idle thread.',
           }
         : {}),
       proposal: {

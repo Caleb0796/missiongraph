@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
@@ -8,6 +9,11 @@ import {
 } from '../src/webmcp/content-policy.ts'
 import { addTaskWithDependencies } from '../src/webmcp/task-mutations.ts'
 import { buildSplitPlan } from '../src/webmcp/split.ts'
+
+const toolsSource = readFileSync(
+  new URL('../src/webmcp/tools.ts', import.meta.url),
+  'utf8',
+)
 
 const splitParent = {
   id: 'parent',
@@ -216,5 +222,16 @@ test('split fans prerequisites into three children while sharing one terminal', 
   assert.equal(
     plan.batch.filter((item) => item.type === 'EDGE_ADDED').length,
     3,
+  )
+})
+
+test('running split notice describes the deferred idle-thread re-brief', () => {
+  assert.match(
+    toolsSource,
+    /The split is recorded and the graph rewired; the running worker keeps its original brief until it exits, after which the supervisor can re-brief the idle thread\./,
+  )
+  assert.doesNotMatch(
+    toolsSource,
+    /supervisor will re-brief its worker after the split/,
   )
 })
