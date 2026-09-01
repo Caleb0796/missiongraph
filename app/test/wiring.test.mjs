@@ -367,6 +367,14 @@ test('assigned ready tasks cannot be dispatched twice', async () => {
   assert.match(graph, /export function isReadyUnassigned/)
 })
 
+test('each dossier selection opens on its Brief tab', async () => {
+  const inspector = await source('../src/components/Inspector.tsx')
+  assert.match(
+    inspector,
+    /useEffect\(\(\) => \{\s*const timer = window\.setTimeout\(\(\) => setActiveTab\('Brief'\), 0\)[\s\S]*?\}, \[selectedId\]\)/,
+  )
+})
+
 test('judge first-run prompts and WebMCP guidance are wired into the canvas', async () => {
   const canvas = await source('../src/components/GraphCanvas.tsx')
   const pulse = await source('../src/components/PulseBar.tsx')

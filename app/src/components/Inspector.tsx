@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   describeEvent,
   eventTargetsNode,
@@ -50,6 +50,11 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
   const activeSplitDraft = splitDraft?.nodeId === node?.id ? splitDraft : null
   const firstChildTitle = activeSplitDraft?.first ?? ''
   const secondChildTitle = activeSplitDraft?.second ?? ''
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setActiveTab('Brief'), 0)
+    return () => window.clearTimeout(timer)
+  }, [selectedId])
 
   const relevantEvents = useMemo(
     () =>
