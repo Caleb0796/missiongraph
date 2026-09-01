@@ -166,6 +166,7 @@ function MissionBoard() {
   const replayGeneration = useRef(0)
   const replayActive = useRef(false)
   const replayWaitCancel = useRef<(() => void) | null>(null)
+  const confirmationCancelRef = useRef<HTMLButtonElement>(null)
   const { fitView, getViewport, setCenter, setViewport } =
     useReactFlow<TaskFlowNode, Edge>()
   const criticalPath = useMemo(
@@ -499,6 +500,30 @@ function MissionBoard() {
     return () => window.clearTimeout(timeout)
   }, [clearToast, toast])
 
+  useEffect(() => {
+    if (!humanConfirmation && !structuralPreview) return
+    confirmationCancelRef.current?.focus()
+    function handleConfirmationEscape(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      if (humanConfirmation) {
+        denyHumanConfirmation(
+          humanConfirmation.id,
+          humanConfirmation.textHash,
+        )
+      } else {
+        cancelStructural()
+      }
+    }
+    window.addEventListener('keydown', handleConfirmationEscape)
+    return () => window.removeEventListener('keydown', handleConfirmationEscape)
+  }, [
+    cancelStructural,
+    denyHumanConfirmation,
+    humanConfirmation,
+    structuralPreview,
+  ])
+
   const onNodesChange = useCallback((changes: NodeChange<TaskFlowNode>[]) => {
     setNodeDims((current) => {
       let next = current
@@ -751,15 +776,21 @@ function MissionBoard() {
         </div>
         <FlightPanel now={correctedNow} />
         {humanConfirmation && (
-          <section className="structural-confirm" role="dialog" aria-modal="true">
+          <section
+            className="structural-confirm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirmation-title"
+            aria-describedby="confirmation-description"
+          >
             <p className="structural-confirm-kicker">
               {humanConfirmation.kind === 'policy'
                 ? 'Human policy confirmation'
                 : 'Human action confirmation'}
             </p>
-            <h2>{humanConfirmation.title}</h2>
+            <h2 id="confirmation-title">{humanConfirmation.title}</h2>
             <div className="structural-confirm-plan">
-              <p>{humanConfirmation.text}</p>
+              <p id="confirmation-description">{humanConfirmation.text}</p>
               <ul>
                 {humanConfirmation.details.map((detail) => (
                   <li key={detail}>{detail}</li>
@@ -771,6 +802,7 @@ function MissionBoard() {
             </div>
             <div className="structural-confirm-actions">
               <button
+                ref={confirmationCancelRef}
                 type="button"
                 className="action-secondary"
                 onClick={() =>
@@ -800,10 +832,20 @@ function MissionBoard() {
           </section>
         )}
         {!humanConfirmation && structuralPreview && (
-          <section className="structural-confirm" role="dialog" aria-modal="true">
+          <section
+            className="structural-confirm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirmation-title"
+            aria-describedby="confirmation-description"
+          >
             <p className="structural-confirm-kicker">Blast-radius preview</p>
-            <h2>{structuralPreview.title}</h2>
-            {structuralPreview.notice && <p>{structuralPreview.notice}.</p>}
+            <h2 id="confirmation-title">{structuralPreview.title}</h2>
+            <p id="confirmation-description">
+              {structuralPreview.notice
+                ? `${structuralPreview.notice}.`
+                : 'Review this structural change and its blast radius before confirming.'}
+            </p>
             {structuralPreview.proposal && (
               <div className="structural-confirm-plan">
                 <p>
@@ -857,7 +899,12 @@ function MissionBoard() {
               </p>
             )}
             <div className="structural-confirm-actions">
-              <button type="button" className="action-secondary" onClick={cancelStructural}>
+              <button
+                ref={confirmationCancelRef}
+                type="button"
+                className="action-secondary"
+                onClick={cancelStructural}
+              >
                 Cancel
               </button>
               <button type="button" className="action-primary" onClick={confirmStructural}>

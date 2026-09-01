@@ -208,6 +208,19 @@ test('confirmation metadata wraps without sharing the action row layout', async 
   assert.doesNotMatch(styles, /\.structural-confirm > div \{/)
 })
 
+test('confirmation dialogs are named, described, focused, and escape-dismissible', async () => {
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  assert.equal(canvas.match(/aria-labelledby="confirmation-title"/g)?.length, 2)
+  assert.equal(canvas.match(/aria-describedby="confirmation-description"/g)?.length, 2)
+  assert.equal(canvas.match(/id="confirmation-title"/g)?.length, 2)
+  assert.equal(canvas.match(/id="confirmation-description"/g)?.length, 2)
+  assert.equal(canvas.match(/ref=\{confirmationCancelRef\}/g)?.length, 2)
+  assert.match(canvas, /confirmationCancelRef\.current\?\.focus\(\)/)
+  assert.match(canvas, /event\.key !== 'Escape'/)
+  assert.match(canvas, /denyHumanConfirmation\(/)
+  assert.match(canvas, /cancelStructural\(\)/)
+})
+
 test('identity recovery is source-aware and realtime resumes with fenced backoff', async () => {
   const client = await source('../src/transport/client.ts')
   const linkedBranch = client.slice(
