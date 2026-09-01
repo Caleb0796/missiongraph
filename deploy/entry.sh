@@ -40,7 +40,7 @@ if [ "${BRIDGE_ENABLED:-0}" = "1" ]; then
   chmod 700 "$CODEX_HOME" 2>/dev/null || true
   if ! printf '%s' "${OPENAI_API_KEY}" | codex login --with-api-key >/dev/null 2>&1; then
     echo "BRIDGE DISABLED: codex login with the provided OPENAI_API_KEY failed" >&2
-  elif ! probe_output=$(codex exec -s read-only -c 'mcp_servers={}' \
+  elif ! probe_output=$(codex exec -s read-only -c 'mcp_servers={}' --skip-git-repo-check \
       ${MG_CODEX_MODEL:+-m "$MG_CODEX_MODEL"} "reply with ok" </dev/null 2>&1); then
     # Better one clear line here than a stream of adopted tasks dying after a judge confirmed them.
     # The tail of the probe output names the actual API error (quota, model access, auth) without
