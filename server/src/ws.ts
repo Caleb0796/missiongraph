@@ -90,13 +90,23 @@ export function installRealtime(app: FastifyInstance, store: EventStore): void {
       if (event.project_id === project) send({ kind: "event", event });
     };
     store.events.on("event", live);
+    // A quiet mission produces no events for minutes at a time, and HTTP clients
+    // (the bridge's undici fetch included) time out an idle body after ~5 minutes —
+    // observed on the VM as a disconnect/reconnect cycle every five minutes. An SSE
+    // comment line is ignored by every consumer and keeps the stream visibly alive.
+    const keepalive = setInterval(() => {
+      if (!reply.raw.writableEnded) reply.raw.write(": keepalive\n\n");
+    }, 25_000);
     if (fromSeq === undefined) {
       const events = store.listEvents(project);
       send({ kind: "snapshot", state: fold(events), cursor: String(events.at(-1)?.seq ?? 0) });
     } else {
       for (const event of store.listEvents(project, fromSeq)) send({ kind: "event", event });
     }
-    request.raw.once("close", () => store.events.off("event", live));
+    request.raw.once("close", () => {
+      clearInterval(keepalive);
+      store.events.off("event", live);
+    });
   });
 
   app.addHook("onClose", async () => {
