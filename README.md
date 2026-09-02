@@ -34,6 +34,22 @@ People and agents rarely work at the same time, so MissionGraph makes the page t
 - **Audit-first UX**: nodes and edges open into dossiers (Brief / Handoff / Deviations / Decisions / Log — prose first, never bare IDs). Workers must file structured handoffs; deviations feed the rewire radar; everything else lands in the project journal.
 - **Real history only (C5)**: the demo seed every visitor clones is an export of a real run — actual Codex workers, actual handoffs and approvals, with each worker's commit IDs recorded in its handoff. Nothing is fabricated.
 
+## How WebMCP is wired
+
+The production adapter prefers `document.modelContext`; `navigator.modelContext` remains only the legacy fallback. The signal-backed leaf registration is [app/src/webmcp/registry.ts:276](app/src/webmcp/registry.ts#L276):
+
+```ts
+return document.modelContext.registerTool({
+  name: tool.name,
+  description: tool.description,
+  inputSchema: tool.inputSchema,
+  execute: tool.execute,
+  annotations: tool.annotations,
+}, options)
+```
+
+Selection and node or edge state changes recompute the contextual tool set: the signal-backed tier aborts and registers per-tool changes, the compatibility tier replaces the full set with `provideContext`, and the static fallback keeps its initial set registered.
+
 ## Try it
 
 **Browsers**: ChatGPT's built-in browser — native WebMCP; needs the latest app, model GPT-5.6 Sol or Terra (Luna has WebMCP disabled), and Settings → Browser → Permissions → "Enable site tools" turned on. Or Chrome 149+ with `chrome://flags/#enable-webmcp-testing` enabled. The page shows an enable banner when WebMCP is absent (a labeled offline fixture keeps the canvas explorable).

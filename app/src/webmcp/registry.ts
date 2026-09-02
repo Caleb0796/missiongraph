@@ -4,6 +4,7 @@ import { useMissionStore } from '../store/mission-store'
 import {
   detectDynamicRegistrationTier,
   DynamicToolController,
+  type InspectableRegistrationTarget,
 } from './dynamic-tools'
 import {
   RegistrationScope,
@@ -259,6 +260,47 @@ function wrapTool(definition: ToolDefinition): ModelContextTool {
   }
 }
 
+function createRegistrationTarget(
+  runtime: WebMcpRuntime,
+): InspectableRegistrationTarget<ModelContextTool> {
+  const target: InspectableRegistrationTarget<ModelContextTool> = {
+    getTools: () => runtime.modelContext.getTools(),
+    registerTool(tool, options) {
+      if (
+        typeof document !== 'undefined' &&
+        runtime.namespace === 'document' &&
+        document.modelContext &&
+        document.modelContext === runtime.modelContext
+      ) {
+        if (options) {
+          return document.modelContext.registerTool({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            execute: tool.execute,
+            annotations: tool.annotations,
+          }, options)
+        }
+        return document.modelContext.registerTool({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          execute: tool.execute,
+          annotations: tool.annotations,
+        })
+      }
+      return options
+        ? runtime.modelContext.registerTool(tool, options)
+        : runtime.modelContext.registerTool(tool)
+    },
+  }
+  if (typeof runtime.modelContext.provideContext === 'function') {
+    target.provideContext = (context) =>
+      runtime.modelContext.provideContext?.(context)
+  }
+  return target
+}
+
 function registrationErrorMessage(error: unknown) {
   if (error instanceof Error) return `${error.name}: ${error.message}`
   if (
@@ -279,8 +321,9 @@ async function bootstrapWebMcp(
   runtime: WebMcpRuntime,
   scope: RegistrationScope,
 ) {
+  const registrationTarget = createRegistrationTarget(runtime)
   const dynamicToolsTier = await detectDynamicRegistrationTier(
-    runtime.modelContext,
+    registrationTarget,
     wrapTool(helloMissionGraph),
   )
   const registeredTools = await runtime.modelContext.getTools()
@@ -302,11 +345,11 @@ async function bootstrapWebMcp(
         if (dynamicToolsTier === 'abort-controller') {
           const registrationController = new AbortController()
           scope.addCleanup(() => registrationController.abort())
-          await runtime.modelContext.registerTool(tool, {
+          await registrationTarget.registerTool(tool, {
             signal: registrationController.signal,
           })
         } else {
-          await runtime.modelContext.registerTool(tool)
+          await registrationTarget.registerTool(tool)
         }
       }
       existing.add(tool.name)
@@ -314,7 +357,7 @@ async function bootstrapWebMcp(
   }
 
   const nextDynamicController = new DynamicToolController(
-    runtime.modelContext,
+    registrationTarget,
     dynamicToolsTier,
     coreTools,
     {
