@@ -35,8 +35,8 @@ Recording frame: the whole ChatGPT desktop window — conversation (left) and th
 ### 5. Close — why WebMCP — 2:40–3:00 (Impact)
 - **Screen**: full graph + URL, then the end card.
 - **VO**: "That's why WebMCP: the agent already in your browser gets hands on live state that DOM scraping could never reach, and the page mirrors your context back. Human, browser agent, worker fleet — each doing what only they can. Code today; any long mission tomorrow. missiongraph.vercel.app, inside ChatGPT's browser."
-- **End card**: `missiongraph.vercel.app · 25 always-on + 5 contextual WebMCP tools · 315 tests · 19 fleet scenarios · adversarially reviewed`
-  Measured 2026-09-01 after the fleet fixes: server 82 / bridge 109 / app 124 = **315**, plus the 19-scenario fleet contract stub. Re-run the suites on recording day rather than trusting this line.
+- **End card**: `missiongraph.vercel.app · 25 always-on + 5 contextual WebMCP tools · 323 tests · 19 fleet scenarios · adversarially reviewed`
+  Measured 2026-09-02 after the fleet-eligibility fix: server 87 / bridge 109 / app 127 = **323**, plus the 19-scenario fleet contract stub. Re-run the suites on recording day rather than trusting this line.
 
 VO total ≈ 359 words ≈ 2:29 of speech inside 3:00 — the rest is deliberately silent so the judges can read the tool calls.
 
