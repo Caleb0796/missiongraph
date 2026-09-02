@@ -286,6 +286,29 @@ test('list_ready returns client-estimated path distance in live and fixture mode
     listReadySource,
     /connectionMode === 'fixture'[\s\S]*remaining_path_min/,
   )
+  assert.match(listReadySource, /live_fleet_eligible:/)
+  assert.match(
+    listReadySource,
+    /Live fleet runs unchanged seeded tasks only; eligible now:/,
+  )
+})
+
+test('dispatch and list_ready tell the agent which work can run on the live fleet', () => {
+  const listReadyStart = toolsSource.indexOf("name: 'list_ready'")
+  const listReadySource = toolsSource.slice(
+    listReadyStart,
+    toolsSource.indexOf("name: 'list_pending_approvals'", listReadyStart),
+  )
+  const dispatchStart = toolsSource.indexOf("name: 'dispatch'")
+  const dispatchSource = toolsSource.slice(
+    dispatchStart,
+    toolsSource.indexOf("name: 'retry_with_guidance'", dispatchStart),
+  )
+
+  assert.match(listReadySource, /tell the human which will run live versus supervision-only/)
+  assert.match(dispatchSource, /tell the human whether it is live-fleet eligible or supervision-only/)
+  assert.match(dispatchSource, /live_fleet: liveFleetEligible \? 'eligible' : 'supervision_only'/)
+  assert.match(dispatchSource, /live_fleet_reason:/)
 })
 
 test('contextual registration observes selection changes during delayed initial registration', async () => {

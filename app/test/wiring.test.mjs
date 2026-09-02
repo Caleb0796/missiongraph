@@ -652,12 +652,20 @@ test('live fleet dispatch metadata, polling cleanup, and honest copy are wired',
   const fleet = await source('../src/transport/fleet.ts')
   const tools = await source('../src/webmcp/tools.ts')
   const panel = await source('../src/components/FlightPanel.tsx')
+  const inspector = await source('../src/components/Inspector.tsx')
+  const taskNode = await source('../src/components/TaskNodeCard.tsx')
+  const store = await source('../src/store/mission-store.ts')
   const app = await source('../src/App.tsx')
   const postMutation = client.slice(
     client.indexOf('async function postMutation<T'),
     client.indexOf('async function postMutationBatch'),
   )
   assert.match(client, /fleet-status/)
+  assert.match(client, /eligible_node_ids/)
+  assert.match(client, /liveFleet\.refreshEligibility\(state\.cursor\)/)
+  assert.match(store, /liveFleetEligibleNodeIds: string\[\]/)
+  assert.match(inspector, />Live fleet<\/span>/)
+  assert.match(taskNode, />Live fleet<\/span>/)
   assert.match(client, /fleet-requests/)
   assert.match(client, /void liveFleet\.dispatch\(dispatched\.node_id\)/)
   assert.ok(

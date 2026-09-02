@@ -875,7 +875,7 @@ const graphDigest: ToolDefinition = {
 const listReady: ToolDefinition = {
   name: 'list_ready',
   description:
-    'No precondition. List unblocked, unassigned tasks. Next: choose a tasks[].id and call dispatch with it; after the human confirms the staged dispatch in the page, call graph_digest with the returned cursor.',
+    'No precondition: list unblocked, unassigned tasks with live-fleet eligibility so you can tell the human which will run live versus supervision-only before dispatching.',
   inputSchema: emptySchema,
   annotations: { readOnlyHint: true },
   execute() {
@@ -908,14 +908,19 @@ const listReady: ToolDefinition = {
               ? 'fixture-local estimate'
               : 'client estimate against the server critical path',
           projection: 'client estimate against the server critical path',
+          live_fleet_eligible: state.liveFleetEligibleNodeIds.includes(current.id),
         }
       })
+    const eligibleTitles = state.nodes
+      .filter((current) => state.liveFleetEligibleNodeIds.includes(current.id))
+      .map((current) => current.title)
     return {
       data: {
         summary:
           ready.length === 0
             ? 'No unassigned tasks are ready right now.'
             : `${ready.length} unassigned ${ready.length === 1 ? 'task is' : 'tasks are'} ready.`,
+        live_fleet: `Live fleet runs unchanged seeded tasks only; eligible now: ${eligibleTitles.length > 0 ? eligibleTitles.join(', ') : 'none'}.`,
         tasks: ready,
       },
     }
@@ -1063,7 +1068,7 @@ const reject: ToolDefinition = {
 const dispatch: ToolDefinition = {
   name: 'dispatch',
   description:
-    'Precondition: id is a ready, unassigned task returned by list_ready. Call dispatch to stage human confirmation; ask the human to confirm in the page, then call graph_digest with the returned cursor to verify DISPATCHED.',
+    'Precondition: use a ready, unassigned task from list_ready, tell the human whether it is live-fleet eligible or supervision-only, then stage dispatch for confirmation.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1104,6 +1109,9 @@ const dispatch: ToolDefinition = {
     }
     const briefOverride = optionalString(inputs.brief_override, 'brief_override')
     const bypassCap = optionalBoolean(inputs.bypass_cap, 'bypass_cap') ?? true
+    const liveFleetEligible =
+      briefOverride === undefined &&
+      state.liveFleetEligibleNodeIds.includes(id)
     await mutate(
       'DISPATCHED',
       {
@@ -1114,12 +1122,24 @@ const dispatch: ToolDefinition = {
       { actor: 'browser_agent' },
     )
     const fleet = fleetResultForDispatch(id)
+    const mismatchReason =
+      fleet?.status === 'rejected' && fleet.error.code === 'template_mismatch'
+        ? fleet.error.reason
+        : undefined
     return {
       data: withFleetMetadata(
         {
           summary: `Dispatched “${target.title}” to the Codex supervisor.`,
           node_id: id,
           bypass_cap: bypassCap,
+          live_fleet: liveFleetEligible ? 'eligible' : 'supervision_only',
+          live_fleet_reason:
+            mismatchReason ??
+            (liveFleetEligible
+              ? `“${target.title}” came with the demo mission unchanged and can start a live worker when shared capacity is available.`
+              : briefOverride
+                ? `“${target.title}” has a brief override, so this dispatch is supervision-only: no live worker will start.`
+                : `The shared live fleet only runs tasks that came with the demo mission unchanged; “${target.title}” was created or edited in this session, so no live worker will start.`),
         },
         fleet,
       ),

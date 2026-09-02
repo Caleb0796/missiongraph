@@ -122,6 +122,9 @@ function MissionBoard() {
   )
   const projectId = useMissionStore((state) => state.projectId)
   const topologyRevision = useMissionStore((state) => state.topologyRevision)
+  const liveFleetEligibleNodeIds = useMissionStore(
+    (state) => state.liveFleetEligibleNodeIds,
+  )
   const toast = useMissionStore((state) => state.toast)
   const structuralPreview = useMissionStore((state) => state.structuralPreview)
   const humanConfirmation = useMissionStore((state) => state.humanConfirmation)
@@ -316,6 +319,7 @@ function MissionBoard() {
             pauseRequested:
               (node as typeof node & { pause_requested?: boolean })
                 .pause_requested ?? false,
+            liveFleetEligible: liveFleetEligibleNodeIds.includes(node.id),
             overlayText: explainOverlays[node.id]?.text,
           },
         }
@@ -328,6 +332,7 @@ function MissionBoard() {
       explainOverlays,
       highlightedIds,
       idleNodeIds,
+      liveFleetEligibleNodeIds,
       nodeDims,
       nodes,
       positions,

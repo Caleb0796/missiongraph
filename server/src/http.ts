@@ -699,10 +699,20 @@ export function createServer(options: ServerOptions = {}): MissionGraphServer {
       return fleetError(reply, 401, "unauthorized", "A valid visitor token is required.");
     }
     if (!fleetMode) {
-      return reply.send({ enabled: false, queue_depth: 0, daily_remaining: 0, project_remaining: 0 });
+      return reply.send({
+        enabled: false,
+        queue_depth: 0,
+        daily_remaining: 0,
+        project_remaining: 0,
+        eligible_node_ids: [],
+      });
     }
     try {
-      return reply.send({ enabled: true, ...fleet.status(project, now()) });
+      return reply.send({
+        enabled: true,
+        ...fleet.status(project, now()),
+        eligible_node_ids: fleet.eligibleNodeIds(project),
+      });
     } catch (error) {
       return errorReply(error, reply);
     }

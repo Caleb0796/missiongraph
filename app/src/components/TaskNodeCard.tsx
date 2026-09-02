@@ -17,6 +17,7 @@ export interface TaskNodeData extends Record<string, unknown> {
   previewPausing: boolean
   recordType: 'task' | 'group'
   pauseRequested: boolean
+  liveFleetEligible: boolean
   overlayText?: string
 }
 
@@ -90,6 +91,9 @@ export function TaskNodeCard({ id, data, selected }: NodeProps<TaskFlowNode>) {
           </span>
         ))}
         {data.approval && <span className="mission-approval">Approval</span>}
+        {data.liveFleetEligible && (
+          <span className="mission-live-fleet">Live fleet</span>
+        )}
         {data.displayState === 'ready' && assigned && (
           <span className="mission-tag">queued</span>
         )}

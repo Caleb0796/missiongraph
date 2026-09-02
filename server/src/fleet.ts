@@ -199,6 +199,10 @@ export class FleetQueue {
     };
   }
 
+  eligibleNodeIds(projectId: string): string[] {
+    return this.eligibilityProjection(projectId).eligibleNodes.map((node) => node.id);
+  }
+
   claimNext(at: Date): {
     request_id: string;
     project_id: string;
@@ -319,8 +323,8 @@ export class FleetQueue {
     projectId: string,
     requestedNodeId: string,
   ): FleetEligibility {
-    const events = this.store.listEvents(projectId);
-    const state = fold(events);
+    const projection = this.eligibilityProjection(projectId);
+    const { events, state, baseline, templateHashes } = projection;
     const requested = state.nodes[requestedNodeId];
     if (!requested || requested.record_type !== "task") {
       return { eligible: false, code: "node_not_found", message: `Node ${requestedNodeId} does not exist.` };
@@ -329,7 +333,7 @@ export class FleetQueue {
       return {
         eligible: false,
         code: "template_mismatch",
-        message: "The seed template project itself is not fleet-eligible.",
+        message: "The seed project is the demo mission template, so it cannot dispatch work to the shared live fleet.",
       };
     }
     const hasWorkerLifecycle = events.some(
@@ -352,31 +356,24 @@ export class FleetQueue {
       return {
         eligible: false,
         code: "template_mismatch",
-        message: "A DISPATCHED brief_override is not fleet-eligible; dispatch the canonical template title and brief.",
+        message: `A custom brief (brief_override) was supplied for '${requested.title}'. The shared live fleet only runs unchanged seeded tasks, so this dispatch is supervision-only: no live worker will start.`,
       };
     }
-    const templateEvents = this.options.seedProjectId && this.store.hasProject(this.options.seedProjectId)
-      ? this.store.listEvents(this.options.seedProjectId)
-      : [];
-    const templateState = fold(templateEvents);
-    const requestedHash = templateHash(requested);
-    const matchesTemplate = Object.values(templateState.nodes).some(
-      (template) => template.record_type === "task" && templateHash(template) === requestedHash,
-    );
-    if (!matchesTemplate) {
-      return {
-        eligible: false,
-        code: "template_mismatch",
-        message: "The node does not match the seed template registry.",
-      };
-    }
-    const baseline = this.store.cloneBaseline(projectId);
     const creation = events.find((event) => createsNode(event, requestedNodeId));
+    const suggestion = this.seededTaskSuggestion(projection.eligibleNodes);
     if (baseline === undefined || !creation || creation.seq > baseline) {
       return {
         eligible: false,
         code: "template_mismatch",
-        message: "Only tasks created as part of the visitor clone are fleet-eligible.",
+        message: `The shared live fleet only runs tasks that came with the demo mission unchanged. '${requested.title}' was created in this session, so it is dispatched in supervision-only mode: no live worker will start.${suggestion}`,
+      };
+    }
+    const requestedHash = templateHash(requested);
+    if (!templateHashes.has(requestedHash)) {
+      return {
+        eligible: false,
+        code: "template_mismatch",
+        message: `'${requested.title}' was edited after cloning (its title or brief no longer matches the seeded task), so it is dispatched in supervision-only mode: no live worker will start.${suggestion}`,
       };
     }
     const authorizedDispatch = events.find((event) => {
@@ -405,6 +402,51 @@ export class FleetQueue {
       };
     }
     return { eligible: true, node: requested };
+  }
+
+  private eligibilityProjection(projectId: string) {
+    const events = this.store.listEvents(projectId);
+    const state = fold(events);
+    const baseline = this.store.cloneBaseline(projectId);
+    const templateEvents = this.options.seedProjectId && this.store.hasProject(this.options.seedProjectId)
+      ? this.store.listEvents(this.options.seedProjectId)
+      : [];
+    const templateState = fold(templateEvents);
+    const templateHashes = new Set(
+      Object.values(templateState.nodes)
+        .filter((node) => node.record_type === "task")
+        .map(templateHash),
+    );
+    const createdAt = new Map<string, number>();
+    for (const event of events) {
+      if (event.type === "TASK_ADDED") createdAt.set(event.payload.node.id, event.seq);
+      if (event.type === "TASK_SPLIT") {
+        for (const child of event.payload.children) createdAt.set(child.id, event.seq);
+      }
+    }
+    const eligibleNodes = projectId === this.options.seedProjectId || baseline === undefined
+      ? []
+      : Object.values(state.nodes)
+        .filter(
+          (node) =>
+            node.record_type === "task" &&
+            node.state === "queued" &&
+            (createdAt.get(node.id) ?? Number.POSITIVE_INFINITY) <= baseline &&
+            templateHashes.has(templateHash(node)),
+        )
+        .sort(
+          (left, right) =>
+            (createdAt.get(left.id) ?? 0) - (createdAt.get(right.id) ?? 0) ||
+            left.id.localeCompare(right.id),
+        );
+    return { events, state, baseline, templateHashes, eligibleNodes };
+  }
+
+  private seededTaskSuggestion(eligibleNodes: GraphNode[]): string {
+    const titles = eligibleNodes.slice(0, 3).map((node) => node.title);
+    return titles.length === 0
+      ? ""
+      : ` Seeded tasks that can still run live: ${titles.join(", ")}.`;
   }
 
   private requireEligible(projectId: string, requestedNodeId: string): GraphNode {

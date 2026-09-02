@@ -272,6 +272,7 @@ interface FleetStatusResponse {
   queue_depth: number
   daily_remaining: number
   project_remaining: number
+  eligible_node_ids: string[]
 }
 
 interface FleetRequestResponse {
@@ -318,8 +319,19 @@ const liveFleet = new LiveFleetCoordinator({
       ),
   },
   onDisplay: (display) => useMissionStore.getState().setLiveFleet(display),
+  onEligibility: (nodeIds) =>
+    useMissionStore.getState().setLiveFleetEligibleNodeIds(nodeIds),
   schedule: (callback, milliseconds) => window.setTimeout(callback, milliseconds),
   cancel: (timer) => window.clearTimeout(timer as number),
+})
+
+useMissionStore.subscribe((state, previousState) => {
+  if (
+    state.projectId !== previousState.projectId ||
+    state.cursor !== previousState.cursor
+  ) {
+    void liveFleet.refreshEligibility(state.cursor)
+  }
 })
 
 function stableValue(value: unknown): unknown {
@@ -1884,6 +1896,7 @@ async function connectProject(client: ClientIdentity, source: IdentitySource) {
   )
   const store = useMissionStore.getState()
   store.applySnapshot(snapshot.state, snapshot.cursor, client.project)
+  await liveFleet.refreshEligibility(snapshot.cursor)
   await refreshServerDigest(candidate)
   await loadChangesSince('0', candidate)
   openRealtime(candidate)
