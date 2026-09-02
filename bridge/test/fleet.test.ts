@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -26,12 +27,24 @@ interface LedgerEvent {
   payload: Record<string, unknown>;
 }
 
+interface ReporterCall {
+  projectId: string;
+  authorization: string | undefined;
+  body: {
+    actor: string;
+    type: string;
+    payload: Record<string, unknown>;
+    idem_key: string;
+  };
+}
+
 class FleetStub {
   readonly nextTimes: number[] = [];
   readonly heartbeatTimes: number[] = [];
   readonly completionCalls: CompletionCall[] = [];
   readonly credentialProjects: string[] = [];
   readonly credentialActors: string[] = [];
+  readonly reporterCalls: ReporterCall[] = [];
   readonly claims: (FleetClaim | undefined)[] = [];
   readonly missingProjects = new Set<string>();
   readonly historicalLedgerEvents: LedgerEvent[] = [];
@@ -61,6 +74,7 @@ class FleetStub {
   heartbeatConflictAfter: number | undefined;
   completeMissing = false;
   completeConflict = false;
+  reportStatus = 200;
   stallNext = false;
   stallComplete = false;
   stallCredential = false;
@@ -152,8 +166,19 @@ class FleetStub {
         expires: "2099-08-30T10:15:00.000Z",
       });
     }
-    if (request.method === "POST" && /^\/api\/p\/[^/]+\/report$/.test(url.pathname)) {
-      return this.json(response, 200, { seq: 1 });
+    const report = url.pathname.match(/^\/api\/p\/([^/]+)\/report$/);
+    if (request.method === "POST" && report) {
+      const body = await this.body(request) as ReporterCall["body"];
+      this.reporterCalls.push({
+        projectId: decodeURIComponent(report[1]!),
+        authorization: request.headers.authorization,
+        body,
+      });
+      if (this.reportStatus !== 200) return this.json(response, this.reportStatus, { error: "report failed" });
+      const seq = [...this.historicalLedgerEvents, ...this.ledgerEvents]
+        .reduce((latest, event) => Math.max(latest, event.seq), 0) + 1;
+      this.ledgerEvents.push({ ...body, seq });
+      return this.json(response, 200, { seq });
     }
     if (request.method === "GET" && /^\/api\/p\/[^/]+\/export$/.test(url.pathname)) {
       if (request.headers["x-mg-token"] !== "adopted-visitor-token") {
@@ -164,6 +189,22 @@ class FleetStub {
         : [...this.historicalLedgerEvents, ...this.ledgerEvents];
       this.ledgerReads += 1;
       return this.json(response, 200, { v: 1, events });
+    }
+    if (request.method === "GET" && /^\/api\/p\/[^/]+\/snapshot$/.test(url.pathname)) {
+      if (request.headers["x-mg-token"] !== "adopted-visitor-token") {
+        return this.json(response, 401, { error: "unauthorized" });
+      }
+      const state = [...this.historicalLedgerEvents, ...this.ledgerEvents]
+        .filter(
+          (event) =>
+            event.type === "NODE_STATE_CHANGED" &&
+            event.payload.node_id === "adopted-node" &&
+            typeof event.payload.to === "string",
+        )
+        .at(-1)?.payload.to;
+      return this.json(response, 200, {
+        state: { nodes: { "adopted-node": { state } } },
+      });
     }
     this.json(response, 404, { error: { code: "not_found", message: "missing" } });
   }
@@ -216,6 +257,18 @@ function claim(brief = "Implement the adopted task."): FleetClaim {
     node: { title: "Adopted title", brief, estimate: 2 },
     visitor_token: "adopted-visitor-token",
   };
+}
+
+function lostWorkerIdemKey(): string {
+  return createHash("sha256")
+    .update("adopted-project")
+    .update("\0")
+    .update("adopted-node")
+    .update("\0")
+    .update("request-1")
+    .update("\0")
+    .update("fleet-lost-worker-state-v1")
+    .digest("hex");
 }
 
 async function createHarness(
@@ -340,6 +393,40 @@ describe("FleetAdoptionLoop", () => {
     expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
   });
 
+  it("reports a cleanly exited fleet worker that left its node running", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.ledgerEvents.splice(1);
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toMatchObject({
+      outcome: "failed",
+      note: expect.stringContaining("Fleet worker exited cleanly without required server ledger reports"),
+    });
+    expect(stub.reporterCalls).toEqual([
+      {
+        projectId: "adopted-project",
+        authorization: "Bearer credential-adopted-project",
+        body: {
+          actor: "worker:adopted-node",
+          type: "NODE_STATE_CHANGED",
+          payload: {
+            node_id: "adopted-node",
+            from: "running",
+            to: "failed",
+            detail: expect.stringMatching(
+              /^Fleet worker was lost before it filed its reports \(bridge restarted or worker exited early\): Fleet worker exited cleanly/,
+            ),
+          },
+          idem_key: lostWorkerIdemKey(),
+        },
+      },
+    ]);
+  });
+
   it("preserves a cleanly exiting worker's reported terminal failure", async () => {
     const stub = await startedStub();
     stub.claims.push(claim());
@@ -366,6 +453,41 @@ describe("FleetAdoptionLoop", () => {
       outcome: "failed",
       note: "Fleet worker reported terminal NODE_STATE_CHANGED to failed: Authoritative tests failed.",
     });
+    expect(stub.reporterCalls).toEqual([]);
+  });
+
+  it("does not add a failed state after the worker already reported review", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.ledgerEvents.splice(2);
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toMatchObject({
+      outcome: "failed",
+      note: expect.stringContaining("v1 HANDOFF_FILED"),
+    });
+    expect(stub.reporterCalls).toEqual([]);
+  });
+
+  it("completes and detaches when the lost-worker state report fails", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.ledgerEvents.splice(1);
+    stub.reportStatus = 500;
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.reporterCalls).toHaveLength(1);
+    expect(stub.completionCalls[0]?.body.outcome).toBe("failed");
+    expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
+    expect(harness.logger.warningMessages).toContainEqual(
+      expect.stringContaining("failed to report lost fleet worker adopted-node: reporter POST failed (500)"),
+    );
   });
 
   it("ignores a complete same-node lifecycle that predates this adoption", async () => {
@@ -482,6 +604,7 @@ describe("FleetAdoptionLoop", () => {
 
   it("fails a persisted adoption on restart when no worker process survived", async () => {
     const stub = await startedStub();
+    stub.ledgerEvents.splice(1);
     const harness = await createHarness(stub, { fleetPollMs: 500 }, async (state) => {
       state.state.fleet_adoption = {
         ...claim(),
@@ -489,6 +612,7 @@ describe("FleetAdoptionLoop", () => {
         status: "adopted",
         adopted_at: new Date().toISOString(),
       };
+      Object.assign(state.state.fleet_adoption, { ledger_seq_at_adoption: 0 });
       await state.save();
     });
     harness.start();
@@ -497,7 +621,57 @@ describe("FleetAdoptionLoop", () => {
     expect(stub.nextTimes).toEqual([]);
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
-      note: expect.stringContaining("restart found no live process"),
+      note: expect.stringContaining("was lost after a bridge restart"),
+    });
+    expect(stub.credentialProjects).toEqual(["adopted-project"]);
+    expect(stub.reporterCalls).toHaveLength(1);
+  });
+
+  it("reports a recovered fleet worker whose tracked process was lost", async () => {
+    const stub = await startedStub();
+    stub.ledgerEvents.splice(1);
+    stub.ledgerReads = 1;
+    const harness = await createHarness(stub, { fleetPollMs: 500 }, async (state) => {
+      const adopted = claim();
+      state.state.fleet_adoption = {
+        ...adopted,
+        worker_key: "fleet:request-1",
+        status: "running",
+        adopted_at: new Date(Date.now() - 100).toISOString(),
+        started_at: new Date(Date.now() - 100).toISOString(),
+      };
+      Object.assign(state.state.fleet_adoption, { ledger_seq_at_adoption: 0 });
+      state.state.workers["fleet:request-1"] = {
+        status: "dead",
+        thread_id: "lost-thread",
+        worktree: join(dirname(state.path), "lost-worktree"),
+        branch: "work/lost",
+        reporter_credential: "credential-adopted-project",
+        reporter_expires: "2099-08-30T10:15:00.000Z",
+        node_id: adopted.node_id,
+        project_id: adopted.project_id,
+        fleet_request_id: adopted.request_id,
+      };
+      await state.save();
+    });
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toMatchObject({
+      outcome: "failed",
+      note: expect.stringContaining("Fleet worker was lost after a bridge restart or its tracked process disappeared"),
+    });
+    expect(stub.reporterCalls).toHaveLength(1);
+    expect(stub.reporterCalls[0]).toMatchObject({
+      projectId: "adopted-project",
+      authorization: "Bearer credential-adopted-project",
+      body: {
+        actor: "worker:adopted-node",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "adopted-node", from: "running", to: "failed" },
+        idem_key: lostWorkerIdemKey(),
+      },
     });
   });
 

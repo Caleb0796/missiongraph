@@ -131,7 +131,10 @@ export class ActionExecutor {
       const identity = workerIdentity(worker);
       if (worker.status === "idle" || worker.status === "dead") {
         await this.reconcileDetachedFlagship(nodeId, worker, true);
-        if (worker.reporter_credential || worker.reporter_expires || worker.reporter_config_path) {
+        if (
+          !this.isActiveFleetAdoption(nodeId, worker) &&
+          (worker.reporter_credential || worker.reporter_expires || worker.reporter_config_path)
+        ) {
           await this.clearReporterCredential(worker);
           changed = true;
         }
@@ -147,7 +150,7 @@ export class ActionExecutor {
         worker.status = "dead";
         delete worker.pid;
         delete worker.process_start_time;
-        await this.clearReporterCredential(worker);
+        await this.clearReporterCredentialAfterWorkerStops(nodeId, worker);
         changed = true;
         recovered.push({
           act: "note",
@@ -159,7 +162,7 @@ export class ActionExecutor {
         worker.status = "dead";
         delete worker.pid;
         delete worker.process_start_time;
-        await this.clearReporterCredential(worker);
+        await this.clearReporterCredentialAfterWorkerStops(nodeId, worker);
         changed = true;
         recovered.push({
           act: "note",
@@ -173,7 +176,7 @@ export class ActionExecutor {
           worker.status = "dead";
           delete worker.pid;
           delete worker.process_start_time;
-          await this.clearReporterCredential(worker);
+          await this.clearReporterCredentialAfterWorkerStops(nodeId, worker);
           changed = true;
           recovered.push({
             act: "note",
@@ -519,7 +522,7 @@ export class ActionExecutor {
         delete state.process_start_time;
         this.running.delete(workerKey);
         this.releaseLease(workerKey);
-        await this.clearReporterCredential(state);
+        await this.clearReporterCredentialAfterWorkerStops(workerKey, state);
         await this.stateStore.save();
         throw error;
       }
@@ -532,7 +535,7 @@ export class ActionExecutor {
         state.status = "dead";
         delete state.pid;
         delete state.process_start_time;
-        await this.clearReporterCredential(state);
+        await this.clearReporterCredentialAfterWorkerStops(workerKey, state);
         await this.stateStore.save();
       }
       await unlink(reporterConfigPath).catch((unlinkError: NodeJS.ErrnoException) => {
@@ -556,7 +559,7 @@ export class ActionExecutor {
         if (current) {
           delete current.pid;
           delete current.process_start_time;
-          await this.clearReporterCredential(current);
+          await this.clearReporterCredentialAfterWorkerStops(nodeId, current);
           current.status = current.thread_id ? "idle" : "dead";
           await this.stateStore.save();
         }
@@ -625,7 +628,7 @@ export class ActionExecutor {
     delete current.pid;
     delete current.process_start_time;
     this.clearRenewal(nodeId);
-    await this.clearReporterCredential(current);
+    await this.clearReporterCredentialAfterWorkerStops(nodeId, current);
     current.status = current.thread_id ? "idle" : "dead";
     await this.stateStore.save();
   }
@@ -689,12 +692,12 @@ export class ActionExecutor {
           delete worker.pid;
           delete worker.process_start_time;
           this.clearRenewal(nodeId);
-          await this.clearReporterCredential(worker);
+          await this.clearReporterCredentialAfterWorkerStops(nodeId, worker);
           worker.status = "idle";
           await this.stateStore.save();
         } else if (!running) {
           this.clearRenewal(nodeId);
-          await this.clearReporterCredential(worker);
+          await this.clearReporterCredentialAfterWorkerStops(nodeId, worker);
           await this.stateStore.save();
         }
       } finally {
@@ -797,7 +800,7 @@ export class ActionExecutor {
     if (!worker || worker.status === "dead") {
       this.logger.warn(`kill_worker ignored because node ${nodeId} has no tracked active process`);
       if (worker) {
-        await this.clearReporterCredential(worker);
+        await this.clearReporterCredentialAfterWorkerStops(nodeId, worker);
         await this.stateStore.save();
       }
       this.releaseLease(nodeId);
@@ -815,7 +818,7 @@ export class ActionExecutor {
     this.running.delete(nodeId);
     this.clearRenewal(nodeId);
     try {
-      await this.clearReporterCredential(worker);
+      await this.clearReporterCredentialAfterWorkerStops(nodeId, worker);
       worker.status = worker.thread_id ? "idle" : "dead";
       await this.stateStore.save();
     } finally {
@@ -884,6 +887,23 @@ export class ActionExecutor {
   private reporterFor(worker: WorkerState): ReporterClient {
     if (!worker.project_id || worker.project_id === this.config.projectId) return this.reporter;
     return new ReporterClient({ ...this.config, projectId: worker.project_id }, this.dryRun);
+  }
+
+  private isActiveFleetAdoption(workerKey: string, worker: WorkerState): boolean {
+    const adoption = this.stateStore.state.fleet_adoption;
+    return (
+      worker.fleet_request_id !== undefined &&
+      adoption?.worker_key === workerKey &&
+      adoption.request_id === worker.fleet_request_id
+    );
+  }
+
+  private async clearReporterCredentialAfterWorkerStops(
+    workerKey: string,
+    worker: WorkerState,
+  ): Promise<void> {
+    if (this.isActiveFleetAdoption(workerKey, worker)) return;
+    await this.clearReporterCredential(worker);
   }
 
   private async clearReporterCredential(worker: WorkerState): Promise<void> {

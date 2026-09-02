@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 
 import type { RunningCodex } from "./codex.js";
 import type { BridgeConfig } from "./config.js";
 import type { ActionExecutor } from "./actions.js";
 import { processMatches, readProcessStartTime, type ProcessStartTimeLookup } from "./process.js";
+import { ReporterClient, reporterPayload } from "./reporter.js";
 import type { FleetAdoptionState, StateStore } from "./state.js";
 import { ExecutionSlot, type ExecutionLease } from "./slot.js";
 import type { Logger } from "./types.js";
@@ -40,9 +42,19 @@ function claimValue(value: unknown): FleetClaim {
 }
 
 const fleetRequestTimeoutMs = 30_000;
+const lostWorkerReportTag = "fleet-lost-worker-state-v1";
+const lostWorkerDetailPrefix =
+  "Fleet worker was lost before it filed its reports (bridge restarted or worker exited early): ";
+const lostWorkerNoteLimit = 200;
+const terminalWorkerStates = new Set(["review", "failed", "paused"]);
 
 function requestSignal(signal: AbortSignal, timeoutMs = fleetRequestTimeoutMs): AbortSignal {
   return AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
+}
+
+function lostWorkerDetail(note: string | undefined): string {
+  const summary = (note ?? "No completion note was recorded.").replace(/\s+/g, " ").trim();
+  return `${lostWorkerDetailPrefix}${summary.slice(0, lostWorkerNoteLimit)}`;
 }
 
 async function staleFleetResponse(response: Response): Promise<boolean> {
@@ -192,11 +204,12 @@ class FleetClient {
     worktree: string,
     branch: string,
     signal: AbortSignal,
+    exitDescription = "Fleet worker exited cleanly",
   ): Promise<FleetCompletion> {
     if (!Number.isSafeInteger(ledgerSeqAtAdoption) || ledgerSeqAtAdoption! < 0) {
       return {
         outcome: "failed",
-        note: "Fleet worker exited cleanly without required server ledger reports: adoption ledger sequence.",
+        note: `${exitDescription} without required server ledger reports: adoption ledger sequence.`,
       };
     }
     const response = await fetch(
@@ -260,10 +273,53 @@ class FleetClient {
     if (missing.length > 0) {
       return {
         outcome: "failed",
-        note: `Fleet worker exited cleanly without required server ledger reports: ${missing.join(", ")}.`,
+        note: `${exitDescription} without required server ledger reports: ${missing.join(", ")}.`,
       };
     }
     return { outcome: "done" };
+  }
+
+  async shouldReportLostWorker(
+    projectId: string,
+    nodeId: string,
+    visitorToken: string,
+    ledgerSeqAtAdoption: number | undefined,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(ledgerSeqAtAdoption) || ledgerSeqAtAdoption! < 0) return false;
+    const exportResponse = await fetch(
+      `${this.config.serverUrl}/api/p/${encodeURIComponent(projectId)}/export`,
+      {
+        headers: { "x-mg-token": visitorToken },
+        signal: requestSignal(signal),
+      },
+    );
+    if (!exportResponse.ok) {
+      throw new Error(`fleet ledger export GET failed (${exportResponse.status}): ${await exportResponse.text()}`);
+    }
+    const actor = `worker:${nodeId}`;
+    const terminalReported = protocolEvents(await exportResponse.json()).some(
+      (event) =>
+        event.seq > ledgerSeqAtAdoption! &&
+        event.actor === actor &&
+        event.type === "NODE_STATE_CHANGED" &&
+        event.payload.node_id === nodeId &&
+        event.payload.to !== undefined &&
+        terminalWorkerStates.has(event.payload.to),
+    );
+    if (terminalReported) return false;
+    const snapshotResponse = await fetch(
+      `${this.config.serverUrl}/api/p/${encodeURIComponent(projectId)}/snapshot`,
+      {
+        headers: { "x-mg-token": visitorToken },
+        signal: requestSignal(signal),
+      },
+    );
+    if (!snapshotResponse.ok) {
+      throw new Error(`fleet snapshot GET failed (${snapshotResponse.status}): ${await snapshotResponse.text()}`);
+    }
+    const body = await snapshotResponse.json() as { state?: { nodes?: Record<string, { state?: unknown }> } };
+    return body.state?.nodes?.[nodeId]?.state === "running";
   }
 }
 
@@ -534,11 +590,19 @@ export class FleetAdoptionLoop {
     }
     const worker = this.stateStore.state.workers[adoption.worker_key];
     if (!worker) {
-      await this.beginCompletion(adoption, "failed", "Bridge restart found no live process for the adopted claim.");
+      await this.beginCompletion(
+        adoption,
+        "failed",
+        "Fleet worker was lost after a bridge restart because no tracked process survived.",
+      );
       return;
     }
     if (worker.status !== "live" || !worker.pid || !worker.process_start_time) {
-      const completion = await this.verifyProtocolCompletion(adoption, this.abort.signal);
+      const completion = await this.verifyProtocolCompletion(
+        adoption,
+        this.abort.signal,
+        "Fleet worker was lost after a bridge restart or its tracked process disappeared",
+      );
       await this.beginCompletion(adoption, completion.outcome, completion.note);
       return;
     }
@@ -549,7 +613,11 @@ export class FleetAdoptionLoop {
       return;
     }
     if (!await processMatches({ pid: worker.pid, starttime: worker.process_start_time }, this.processStartTime)) {
-      const completion = await this.verifyProtocolCompletion(adoption, this.abort.signal);
+      const completion = await this.verifyProtocolCompletion(
+        adoption,
+        this.abort.signal,
+        "Fleet worker was lost after a bridge restart or its tracked process disappeared",
+      );
       await this.beginCompletion(adoption, completion.outcome, completion.note);
       return;
     }
@@ -566,6 +634,7 @@ export class FleetAdoptionLoop {
   private async verifyProtocolCompletion(
     adoption: FleetAdoptionState,
     signal: AbortSignal,
+    exitDescription?: string,
   ): Promise<FleetCompletion> {
     const worker = this.stateStore.state.workers[adoption.worker_key];
     if (!worker) {
@@ -583,6 +652,7 @@ export class FleetAdoptionLoop {
         worker.worktree,
         worker.branch,
         signal,
+        exitDescription,
       );
     } catch (error) {
       return {
@@ -606,11 +676,52 @@ export class FleetAdoptionLoop {
 
   private async finishCompletion(adoption: FleetAdoptionState): Promise<void> {
     if (!adoption.outcome) throw new Error("persisted fleet completion is missing its outcome");
+    if (adoption.outcome === "failed") {
+      await this.reportLostWorker(adoption).catch((error: unknown) => {
+        this.logger.warn(
+          `failed to report lost fleet worker ${adoption.node_id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }
     if (!await this.client.complete(adoption.request_id, adoption.outcome, this.abort.signal, adoption.note)) {
       await this.abandon(adoption, adoption.note ?? "Fleet claim disappeared before completion.");
       return;
     }
     await this.detach(adoption);
+  }
+
+  private async reportLostWorker(adoption: FleetAdoptionState): Promise<void> {
+    if (!await this.client.shouldReportLostWorker(
+      adoption.project_id,
+      adoption.node_id,
+      adoption.visitor_token,
+      (adoption as ScopedFleetAdoptionState).ledger_seq_at_adoption,
+      this.abort.signal,
+    )) return;
+    const actor = `worker:${adoption.node_id}` as const;
+    const projectConfig = {
+      ...this.config,
+      projectId: adoption.project_id,
+      visitorToken: adoption.visitor_token,
+    };
+    const credential = this.stateStore.state.workers[adoption.worker_key]?.reporter_credential ??
+      (await new ReporterClient(projectConfig).issue(actor, this.abort.signal)).token;
+    const idemKey = createHash("sha256")
+      .update(adoption.project_id)
+      .update("\0")
+      .update(adoption.node_id)
+      .update("\0")
+      .update(adoption.request_id)
+      .update("\0")
+      .update(lostWorkerReportTag)
+      .digest("hex");
+    const reporter = new ReporterClient({ ...projectConfig, reporterCredential: credential });
+    await reporter.post(reporterPayload(actor, "NODE_STATE_CHANGED", {
+      node_id: adoption.node_id,
+      from: "running",
+      to: "failed",
+      detail: lostWorkerDetail(adoption.note),
+    }, idemKey));
   }
 
   private async abandon(adoption: FleetAdoptionState, note: string): Promise<void> {
