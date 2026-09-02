@@ -47,7 +47,8 @@ const lostWorkerDetailPrefix =
   "Fleet worker was lost before it filed its reports (bridge restarted or worker exited early): ";
 const lostWorkerNoteLimit = 200;
 const lostWorkerCredentialMinValidityMs = 60_000;
-const terminalWorkerStates = new Set(["review", "failed", "paused"]);
+const lostWorkerReportMaxRetries = 3;
+const lostWorkerReportRetryMs = 2_000;
 
 function requestSignal(signal: AbortSignal, timeoutMs = fleetRequestTimeoutMs): AbortSignal {
   return AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
@@ -84,6 +85,28 @@ function isLostWorkerTransitionConflict(error: unknown): boolean {
   );
 }
 
+function isRetryableLostWorkerReport(error: unknown): boolean {
+  if (error instanceof ReporterRequestError) return error.status >= 500;
+  return error instanceof TypeError ||
+    (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError"));
+}
+
+async function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const abort = () => {
+      clearTimeout(timer);
+      rejectPromise(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolvePromise();
+    }, ms);
+    timer.unref();
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
 async function staleFleetResponse(response: Response): Promise<boolean> {
   if (response.status === 404) return true;
   if (response.status !== 409) return false;
@@ -108,6 +131,12 @@ interface FleetCompletion {
   note?: string;
 }
 
+interface FleetSnapshotState {
+  nodes: Record<string, { state?: unknown }>;
+  handoffs: Record<string, { commits?: unknown }>;
+  approvals: Record<string, { node_id?: unknown; status?: unknown; created_seq?: unknown }>;
+}
+
 interface ScopedFleetAdoptionState extends FleetAdoptionState {
   ledger_seq_at_adoption?: number;
 }
@@ -127,9 +156,32 @@ async function commitExistsOnBranch(
   branch: string,
   signal: AbortSignal,
 ): Promise<boolean> {
-  if (!/^[0-9a-f]{7,64}$/i.test(commit)) return false;
+  if (!/^[0-9a-f]{40}$/i.test(commit)) return false;
   if (!await gitSucceeds(["cat-file", "-e", `${commit}^{commit}`], worktree, signal)) return false;
   return await gitSucceeds(["merge-base", "--is-ancestor", commit, branch], worktree, signal);
+}
+
+function sameCommits(left: unknown, right: readonly string[]): boolean {
+  return Array.isArray(left) &&
+    left.length === right.length &&
+    left.every((commit, index) => typeof commit === "string" && commit === right[index]);
+}
+
+function snapshotState(value: unknown): FleetSnapshotState {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("fleet snapshot did not match the MissionGraph contract");
+  }
+  const state = (value as { state?: unknown }).state;
+  if (typeof state !== "object" || state === null || Array.isArray(state)) {
+    throw new Error("fleet snapshot did not match the MissionGraph contract");
+  }
+  const candidate = state as Partial<FleetSnapshotState>;
+  for (const field of [candidate.nodes, candidate.handoffs, candidate.approvals]) {
+    if (typeof field !== "object" || field === null || Array.isArray(field)) {
+      throw new Error("fleet snapshot did not match the MissionGraph contract");
+    }
+  }
+  return candidate as FleetSnapshotState;
 }
 
 function protocolEvents(value: unknown): FleetProtocolEvent[] {
@@ -230,6 +282,7 @@ class FleetClient {
     ledgerSeqAtAdoption: number | undefined,
     worktree: string,
     branch: string,
+    branchBase: string | undefined,
     signal: AbortSignal,
     exitDescription = "Fleet worker exited cleanly",
   ): Promise<FleetCompletion> {
@@ -285,18 +338,55 @@ class FleetClient {
       ? commits as string[]
       : undefined;
     const invalidCommits: string[] = [];
+    let includesPostBaseCommit = branchBase === undefined;
     for (const commit of commitList ?? []) {
-      if (!await commitExistsOnBranch(commit, worktree, branch, signal)) invalidCommits.push(commit);
+      if (!await commitExistsOnBranch(commit, worktree, branch, signal)) {
+        invalidCommits.push(commit);
+      } else if (branchBase && !await gitSucceeds(["merge-base", "--is-ancestor", commit, branchBase], worktree, signal)) {
+        includesPostBaseCommit = true;
+      }
     }
-    const missing = [
+    const missing: string[] = [
       ...(runningState && terminalState ? [] : ["ordered NODE_STATE_CHANGED running→review|failed"]),
       ...(handoff ? [] : ["v1 HANDOFF_FILED"]),
       ...(commitList ? [] : ["non-empty HANDOFF_FILED commits"]),
       ...(invalidCommits.length === 0 ? [] : [`valid HANDOFF_FILED commits (${invalidCommits.join(", ")})`]),
+      ...(includesPostBaseCommit ? [] : ["at least one post-base HANDOFF_FILED commit"]),
       ...(approvals.length === 1 && handoff && approvals[0]!.seq > handoff.seq
         ? []
         : ["exactly one ordered APPROVAL_CREATED"]),
     ];
+    if (missing.length > 0) {
+      return {
+        outcome: "failed",
+        note: `${exitDescription} without required server ledger reports: ${missing.join(", ")}.`,
+      };
+    }
+    const snapshotResponse = await fetch(
+      `${this.config.serverUrl}/api/p/${encodeURIComponent(projectId)}/snapshot`,
+      {
+        headers: { "x-mg-token": visitorToken },
+        signal: requestSignal(signal),
+      },
+    );
+    if (!snapshotResponse.ok) {
+      throw new Error(`fleet snapshot GET failed (${snapshotResponse.status}): ${await snapshotResponse.text()}`);
+    }
+    const authoritative = snapshotState(await snapshotResponse.json());
+    const pendingApprovals = Object.values(authoritative.approvals).filter(
+      (approval) => approval.node_id === nodeId && approval.status === "pending",
+    );
+    missing.push(
+      ...(authoritative.nodes[nodeId]?.state === "review" ? [] : ["authoritative node state review"]),
+      ...(commitList && sameCommits(authoritative.handoffs[nodeId]?.commits, commitList)
+        ? []
+        : ["authoritative effective handoff commits"]),
+      ...(handoff && pendingApprovals.length === 1 &&
+        Number.isSafeInteger(pendingApprovals[0]!.created_seq) &&
+        (pendingApprovals[0]!.created_seq as number) > handoff.seq
+        ? []
+        : ["exactly one authoritative pending approval created after the handoff"]),
+    );
     if (missing.length > 0) {
       return {
         outcome: "failed",
@@ -310,31 +400,8 @@ class FleetClient {
     projectId: string,
     nodeId: string,
     visitorToken: string,
-    ledgerSeqAtAdoption: number | undefined,
     signal: AbortSignal,
   ): Promise<boolean> {
-    if (!Number.isSafeInteger(ledgerSeqAtAdoption) || ledgerSeqAtAdoption! < 0) return false;
-    const exportResponse = await fetch(
-      `${this.config.serverUrl}/api/p/${encodeURIComponent(projectId)}/export`,
-      {
-        headers: { "x-mg-token": visitorToken },
-        signal: requestSignal(signal),
-      },
-    );
-    if (!exportResponse.ok) {
-      throw new Error(`fleet ledger export GET failed (${exportResponse.status}): ${await exportResponse.text()}`);
-    }
-    const actor = `worker:${nodeId}`;
-    const terminalReported = protocolEvents(await exportResponse.json()).some(
-      (event) =>
-        event.seq > ledgerSeqAtAdoption! &&
-        event.actor === actor &&
-        event.type === "NODE_STATE_CHANGED" &&
-        event.payload.node_id === nodeId &&
-        event.payload.to !== undefined &&
-        terminalWorkerStates.has(event.payload.to),
-    );
-    if (terminalReported) return false;
     const snapshotResponse = await fetch(
       `${this.config.serverUrl}/api/p/${encodeURIComponent(projectId)}/snapshot`,
       {
@@ -345,8 +412,7 @@ class FleetClient {
     if (!snapshotResponse.ok) {
       throw new Error(`fleet snapshot GET failed (${snapshotResponse.status}): ${await snapshotResponse.text()}`);
     }
-    const body = await snapshotResponse.json() as { state?: { nodes?: Record<string, { state?: unknown }> } };
-    return body.state?.nodes?.[nodeId]?.state === "running";
+    return snapshotState(await snapshotResponse.json()).nodes[nodeId]?.state === "running";
   }
 }
 
@@ -678,6 +744,7 @@ export class FleetAdoptionLoop {
         (adoption as ScopedFleetAdoptionState).ledger_seq_at_adoption,
         worker.worktree,
         worker.branch,
+        worker.branch_base,
         signal,
         exitDescription,
       );
@@ -705,18 +772,19 @@ export class FleetAdoptionLoop {
     if (!adoption.outcome) throw new Error("persisted fleet completion is missing its outcome");
     if (adoption.outcome === "failed") {
       try {
-        await this.reportLostWorker(adoption);
+        const completion = await this.reportLostWorker(adoption);
+        if (completion) await this.replaceCompletion(adoption, completion);
       } catch (error) {
         const completion = isLostWorkerTransitionConflict(error)
           ? await this.verifyProtocolCompletion(adoption, this.abort.signal)
           : undefined;
-        if (completion?.outcome === "done") {
-          adoption.outcome = "done";
-          delete adoption.note;
-          await this.stateStore.save();
+        if (completion) {
+          await this.replaceCompletion(adoption, completion);
         } else {
-          this.logger.warn(
-            `failed to report lost fleet worker ${adoption.node_id}: ${error instanceof Error ? error.message : String(error)}`,
+          // A completing adoption owns the fleet's single execution slot. After bounded
+          // reporting retries, detach deliberately so one unreachable project cannot block every judge.
+          this.logger.error(
+            `failed to report lost fleet worker ${adoption.node_id} for project ${adoption.project_id}: ${error instanceof Error ? error.message : String(error)}`,
           );
         }
       }
@@ -728,14 +796,20 @@ export class FleetAdoptionLoop {
     await this.detach(adoption);
   }
 
-  private async reportLostWorker(adoption: FleetAdoptionState): Promise<void> {
+  private async replaceCompletion(adoption: FleetAdoptionState, completion: FleetCompletion): Promise<void> {
+    adoption.outcome = completion.outcome;
+    if (completion.note) adoption.note = completion.note;
+    else delete adoption.note;
+    await this.stateStore.save();
+  }
+
+  private async reportLostWorker(adoption: FleetAdoptionState): Promise<FleetCompletion | undefined> {
     if (!await this.client.shouldReportLostWorker(
       adoption.project_id,
       adoption.node_id,
       adoption.visitor_token,
-      (adoption as ScopedFleetAdoptionState).ledger_seq_at_adoption,
       this.abort.signal,
-    )) return;
+    )) return await this.verifyProtocolCompletion(adoption, this.abort.signal);
     const actor = `worker:${adoption.node_id}` as const;
     const projectConfig = {
       ...this.config,
@@ -759,15 +833,22 @@ export class FleetAdoptionLoop {
       to: "failed",
       detail: lostWorkerDetail(adoption.note),
     }, lostWorkerIdemKey(adoption.project_id, adoption.node_id, adoption.request_id));
-    try {
-      await new ReporterClient({ ...projectConfig, reporterCredential: credential }).post(event, this.abort.signal);
-    } catch (error) {
-      if (!(error instanceof ReporterRequestError) || error.status !== 401) throw error;
-      const freshCredential = await issuer.issue(actor, this.abort.signal);
-      await new ReporterClient({
-        ...projectConfig,
-        reporterCredential: freshCredential.token,
-      }).post(event, this.abort.signal);
+    let refreshedCredential = false;
+    for (let attempt = 0; attempt <= lostWorkerReportMaxRetries; attempt += 1) {
+      try {
+        await new ReporterClient({ ...projectConfig, reporterCredential: credential }).post(event, this.abort.signal);
+        return;
+      } catch (error) {
+        this.abort.signal.throwIfAborted();
+        if (error instanceof ReporterRequestError && error.status === 401 && !refreshedCredential) {
+          if (attempt === lostWorkerReportMaxRetries) throw error;
+          credential = (await issuer.issue(actor, this.abort.signal)).token;
+          refreshedCredential = true;
+          continue;
+        }
+        if (!isRetryableLostWorkerReport(error) || attempt === lostWorkerReportMaxRetries) throw error;
+        await abortableDelay(lostWorkerReportRetryMs, this.abort.signal);
+      }
     }
   }
 

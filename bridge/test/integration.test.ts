@@ -7,7 +7,12 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { MissionGraphBridge } from "../src/bridge.js";
+import { ActionExecutor } from "../src/actions.js";
+import { CodexClient } from "../src/codex.js";
+import { FleetAdoptionLoop, type FleetClaim } from "../src/fleet.js";
 import { ReporterClient, reporterPayload } from "../src/reporter.js";
+import { ExecutionSlot } from "../src/slot.js";
+import { StateStore } from "../src/state.js";
 import { config, initializeRepo, TestLogger } from "./helpers.js";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -734,27 +739,45 @@ describe("bridge dry-run integration", () => {
   );
 
   it(
-    "deduplicates a replayed lost-worker report through the real reporter ingress",
+    "restarts a persisted completing adoption without duplicating its real lost-worker ledger event",
     async () => {
       const root = await mkdtemp(join(tmpdir(), "missiongraph-lost-worker-replay-"));
       const port = await freePort();
       const reporterToken = "lost-worker-replay-reporter-token";
       const serverUrl = `http://127.0.0.1:${port}`;
-      const server = spawn(process.execPath, [join(repositoryRoot, "server/node_modules/tsx/dist/cli.mjs"), "src/http.ts"], {
-        cwd: join(repositoryRoot, "server"),
-        env: {
-          ...process.env,
-          REPORTER_TOKEN: reporterToken,
-          DB_PATH: join(root, "lost-worker-replay.sqlite"),
-          PORT: String(port),
-        },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      const databasePath = join(root, "lost-worker-replay.sqlite");
+      const serverEnvironment = {
+        ...process.env,
+        REPORTER_TOKEN: reporterToken,
+        DB_PATH: databasePath,
+        PORT: String(port),
+        FLEET_MODE: "1",
+        FLEET_DAILY_CAP: "10",
+        FLEET_PER_PROJECT_CAP: "1",
+        FLEET_ADOPT_TTL_MIN: "2",
+      };
+      let server: ChildProcess | undefined;
       let serverStderr = "";
-      server.stderr?.on("data", (chunk: Buffer) => {
-        serverStderr += chunk.toString();
-      });
+      const startServer = (seedProjectId?: string): ChildProcess => {
+        const child = spawn(
+          process.execPath,
+          [join(repositoryRoot, "server/node_modules/tsx/dist/cli.mjs"), "src/http.ts"],
+          {
+            cwd: join(repositoryRoot, "server"),
+            env: {
+              ...serverEnvironment,
+              ...(seedProjectId === undefined ? {} : { SEED_PROJECT_ID: seedProjectId }),
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        child.stderr?.on("data", (chunk: Buffer) => {
+          serverStderr += chunk.toString();
+        });
+        return child;
+      };
       try {
+        server = startServer();
         await serverWhenReady(serverUrl);
         const seedResponse = await fetch(`${serverUrl}/api/import-seed`, {
           method: "POST",
@@ -788,37 +811,152 @@ describe("bridge dry-run integration", () => {
           throw new Error(`seed import failed (${seedResponse.status}): ${await seedResponse.text()}`);
         }
         const seed = await seedResponse.json() as { project_id: string; token: string };
-        const projectConfig = {
-          ...config(root),
-          serverUrl,
-          projectId: seed.project_id,
-          visitorToken: seed.token,
-          reporterCredential: reporterToken,
+        await stopProcess(server);
+        server = startServer(seed.project_id);
+        await serverWhenReady(serverUrl);
+        const clone = await cloneWhenReady(serverUrl);
+        const snapshotResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(clone.project)}/snapshot`, {
+          headers: { "x-mg-token": clone.token },
+        });
+        if (!snapshotResponse.ok) {
+          throw new Error(`clone snapshot failed (${snapshotResponse.status}): ${await snapshotResponse.text()}`);
+        }
+        const snapshot = await snapshotResponse.json() as {
+          state: { nodes: Record<string, { id: string; title: string }> };
         };
-        const actor = "worker:replay-node" as const;
-        const credential = await new ReporterClient(projectConfig).issue(actor);
-        const reporter = new ReporterClient({ ...projectConfig, reporterCredential: credential.token });
+        const node = Object.values(snapshot.state.nodes).find((candidate) => candidate.title === "Replay node");
+        if (!node) throw new Error("seeded clone did not contain the replay node");
+        await confirmedMutation(
+          serverUrl,
+          clone.project,
+          clone.token,
+          "DISPATCHED",
+          { node_id: node.id, bypass_cap: true },
+          "lost-worker-replay-dispatch",
+        );
+        const enqueueResponse = await fetch(
+          `${serverUrl}/api/p/${encodeURIComponent(clone.project)}/fleet-requests`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-mg-token": clone.token },
+            body: JSON.stringify({ node_id: node.id }),
+          },
+        );
+        if (!enqueueResponse.ok) {
+          throw new Error(`fleet enqueue failed (${enqueueResponse.status}): ${await enqueueResponse.text()}`);
+        }
+        const claimResponse = await fetch(`${serverUrl}/api/fleet/next`, {
+          method: "POST",
+          headers: { "x-mg-reporter": reporterToken },
+        });
+        if (!claimResponse.ok) {
+          throw new Error(`fleet claim failed (${claimResponse.status}): ${await claimResponse.text()}`);
+        }
+        const claim = await claimResponse.json() as FleetClaim;
+        const repoPath = join(root, "target-repo");
+        await initializeRepo(repoPath);
+        const statePath = join(root, "lost-worker-state.json");
+        const bridgeConfig = {
+          ...config(root, repoPath),
+          serverUrl,
+          projectId: clone.project,
+          visitorToken: clone.token,
+          reporterCredential: reporterToken,
+          statePath,
+          fleetMode: true,
+          fleetPollMs: 20,
+          fleetHeartbeatMs: 30,
+          fleetRunTtlMs: 5_000,
+        };
+        const actor = `worker:${claim.node_id}` as const;
+        const credential = await new ReporterClient(bridgeConfig).issue(actor);
+        const reporter = new ReporterClient({ ...bridgeConfig, reporterCredential: credential.token });
         await reporter.post(reporterPayload(actor, "NODE_STATE_CHANGED", {
-          node_id: "replay-node",
+          node_id: claim.node_id,
           from: "queued",
           to: "running",
         }, "98e5caf5-8135-4d05-b083-a217e9843246"));
-        const replayedReport = reporterPayload(actor, "NODE_STATE_CHANGED", {
-          node_id: "replay-node",
-          from: "running",
-          to: "failed",
-          detail: "Fleet worker was lost before it filed its reports.",
-        }, "7e893545-18ea-5b37-85f7-26f5956e4c31");
 
-        const firstSeq = await reporter.post(replayedReport);
-        const replaySeq = await new ReporterClient({
-          ...projectConfig,
-          reporterCredential: credential.token,
-        }).post(replayedReport);
+        const processStartTime = async (pid: number): Promise<string | undefined> =>
+          pid === process.pid ? "lost-worker-replay-bridge" : undefined;
+        let state = await StateStore.open(statePath, bridgeConfig.projectId, processStartTime);
+        state.state.fleet_adoption = {
+          ...claim,
+          worker_key: `fleet:${claim.request_id}`,
+          status: "completing",
+          adopted_at: new Date().toISOString(),
+          outcome: "failed",
+          note: "Fleet worker disappeared before protocol completion.",
+        };
+        Object.assign(state.state.fleet_adoption, { ledger_seq_at_adoption: 2 });
+        await state.save();
+        await state.close();
 
-        expect(replaySeq).toBe(firstSeq);
-        const ledgerResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(seed.project_id)}/export`, {
-          headers: { "x-mg-token": seed.token },
+        const logger = new TestLogger();
+        let codex: CodexClient | undefined;
+        let actions: ActionExecutor | undefined;
+        let loop: FleetAdoptionLoop | undefined;
+        const startLoop = async (): Promise<void> => {
+          state = await StateStore.open(statePath, bridgeConfig.projectId, processStartTime);
+          const slot = new ExecutionSlot();
+          codex = new CodexClient(bridgeConfig, logger, true, processStartTime);
+          actions = new ActionExecutor(bridgeConfig, state, codex, logger, true, processStartTime, slot);
+          await actions.initialize();
+          loop = new FleetAdoptionLoop(bridgeConfig, state, actions, slot, logger, processStartTime);
+          loop.start();
+        };
+        const stopLoop = async (): Promise<void> => {
+          await loop?.stop();
+          await codex?.stop();
+          await actions?.terminateAll();
+          await actions?.stop();
+          await state.close();
+          loop = undefined;
+          codex = undefined;
+          actions = undefined;
+        };
+
+        const nativeFetch = globalThis.fetch;
+        let completionStarted!: () => void;
+        const completionRequest = new Promise<void>((resolvePromise) => { completionStarted = resolvePromise; });
+        globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+          if (String(input).includes(`/api/fleet/${encodeURIComponent(claim.request_id)}/complete`)) {
+            completionStarted();
+            return await new Promise<Response>((_resolvePromise, rejectPromise) => {
+              const signal = init?.signal;
+              const abort = () => rejectPromise(signal?.reason ?? new Error("completion aborted"));
+              if (signal?.aborted) abort();
+              else signal?.addEventListener("abort", abort, { once: true });
+            });
+          }
+          return await nativeFetch(input, init);
+        }) as typeof fetch;
+        try {
+          await startLoop();
+          await completionRequest;
+          await stopLoop();
+        } finally {
+          globalThis.fetch = nativeFetch;
+          if (loop) await stopLoop();
+        }
+
+        const persistedAfterRestart = JSON.parse(await readFile(statePath, "utf8")) as {
+          fleet_adoption?: { status?: string };
+        };
+        expect(persistedAfterRestart.fleet_adoption?.status).toBe("completing");
+
+        try {
+          await startLoop();
+          for (let attempt = 0; attempt < 200 && state.state.fleet_adoption !== undefined; attempt += 1) {
+            await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+          }
+          expect(state.state.fleet_adoption).toBeUndefined();
+        } finally {
+          if (loop) await stopLoop();
+        }
+
+        const ledgerResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(clone.project)}/export`, {
+          headers: { "x-mg-token": clone.token },
         });
         if (!ledgerResponse.ok) {
           throw new Error(`ledger export failed (${ledgerResponse.status}): ${await ledgerResponse.text()}`);
@@ -826,14 +964,19 @@ describe("bridge dry-run integration", () => {
         const ledger = await ledgerResponse.json() as {
           events: { idem_key: string; type: string; payload: Record<string, unknown> }[];
         };
-        expect(ledger.events.filter((event) => event.idem_key === replayedReport.idem_key)).toEqual([
+        expect(ledger.events.filter((event) =>
+          event.type === "NODE_STATE_CHANGED" &&
+          event.payload.node_id === claim.node_id &&
+          event.payload.to === "failed"
+        )).toEqual([
           expect.objectContaining({
             type: "NODE_STATE_CHANGED",
-            payload: expect.objectContaining({ node_id: "replay-node", to: "failed" }),
+            payload: expect.objectContaining({ node_id: claim.node_id, to: "failed" }),
           }),
         ]);
+        expect(logger.errorMessages).toEqual([]);
       } finally {
-        await stopProcess(server);
+        if (server) await stopProcess(server);
         await rm(root, { recursive: true, force: true });
       }
       expect(serverStderr).not.toContain("Error:");

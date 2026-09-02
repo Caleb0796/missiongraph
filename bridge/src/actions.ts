@@ -34,6 +34,26 @@ async function runGit(args: string[], cwd: string, signal?: AbortSignal): Promis
   });
 }
 
+async function gitOutput(args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  return await new Promise<string>((resolvePromise, rejectPromise) => {
+    const child = spawn("git", args, { cwd, signal, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", rejectPromise);
+    child.once("close", (code) => {
+      if (code === 0) resolvePromise(stdout.trim());
+      else rejectPromise(new Error(`git ${args.join(" ")} failed (${code}): ${stderr.trim()}`));
+    });
+  });
+}
+
 function slug(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "node";
 }
@@ -486,6 +506,7 @@ export class ActionExecutor {
       await mkdir(root, { recursive: true });
       await runGit(["worktree", "add", worktree, "-b", branch], this.config.targetRepoPath, launchSignal);
       launchSignal.throwIfAborted();
+      if (fleet) state.branch_base = await gitOutput(["rev-parse", "HEAD"], worktree, launchSignal);
       state.reporter_credential = credential.token;
       state.reporter_expires = credential.expires;
       await this.stateStore.save();
