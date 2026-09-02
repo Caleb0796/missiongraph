@@ -65,14 +65,14 @@ pnpm dev
 
 ## Testing
 
-319 tests across the three packages (CI runs them on pushes to `main`/`track/**` and on pull requests):
+323 tests across the three packages (CI runs them on pushes to `main`/`track/**` and on pull requests):
 
 Only unchanged seeded tasks run on the live fleet; tasks you create or edit are dispatched in supervision-only mode, and both the page and the agent say which is which.
 
 ```sh
-cd server && pnpm test   # 84 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, actor-aware ingress rules, field limits and per-IP rate limits, and the fleet queue
+cd server && pnpm test   # 87 — event store/reducer/digest, HTTP auth and CORS, atomic batches/seed round-trip, browser sessions, nonce-bound human-presence capabilities, the identifier grammar, actor-aware ingress rules, field limits and per-IP rate limits, and the fleet queue
 cd bridge && pnpm test   # 109 — decision validation, crash replay, PID/lock safety and lock leases, credential renewal, secret-free worker environments, SSE reconnection, worktree cleanup, adoption-scoped completion evidence, SIGTERM reconciliation, and human-confirmed dispatch integrations against the real server
-cd app    && pnpm test   # 126 — tool envelopes and untrusted-content labels, atomic add_task, full split rewiring, self-describing policy handshake, identity fencing/recovery, confirmation dialogs (folded binding details, keyboard access), first-run and replay UX, late WebMCP injection, tier detection, fleet-off dispatch invariants, and real-server HTTP paths
+cd app    && pnpm test   # 127 — tool envelopes and untrusted-content labels, atomic add_task, full split rewiring, self-describing policy handshake, identity fencing/recovery, confirmation dialogs (folded binding details, keyboard access), first-run and replay UX, late WebMCP injection, tier detection, fleet-off dispatch invariants, and real-server HTTP paths
 ```
 
 The fleet contract has its own scenario harness on top of those: `node eval/fleet/run.mjs --stub` runs 19
