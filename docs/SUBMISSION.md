@@ -31,7 +31,7 @@ A human-presence capability layer separates agent proposals from human authoriza
 
 Every tool result carries `cursor` + `changes_since` (the digest pattern), so an agent that was away is fully caught up by its next call.
 
-The package suites pass 294 tests (server 82 / bridge 88 / app 124); the fleet stub passes 19 acceptance scenarios.
+The package suites pass 315 tests (server 82 / bridge 109 / app 124); the fleet stub passes 19 acceptance scenarios.
 
 ## Challenges / what we're proud of
 
