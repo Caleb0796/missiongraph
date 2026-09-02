@@ -28,6 +28,11 @@ import {
 } from '../transport/client'
 import { withFleetMetadata } from '../transport/fleet'
 import { policyConfirmationNextStep } from './agent-guidance'
+import {
+  canonicalizeTitle,
+  dispatchLiveFleetReason,
+  listReadyLiveFleetSummary,
+} from './content-policy'
 import type { ToolDefinition, ToolOutcome } from './registry'
 import { buildSplitPlan, type SplitSubtask } from './split'
 import { addTaskWithDependencies } from './task-mutations'
@@ -920,7 +925,7 @@ const listReady: ToolDefinition = {
           ready.length === 0
             ? 'No unassigned tasks are ready right now.'
             : `${ready.length} unassigned ${ready.length === 1 ? 'task is' : 'tasks are'} ready.`,
-        live_fleet: `Live fleet runs unchanged seeded tasks only; eligible now: ${eligibleTitles.length > 0 ? eligibleTitles.join(', ') : 'none'}.`,
+        live_fleet: listReadyLiveFleetSummary(eligibleTitles),
         tasks: ready,
       },
     }
@@ -1126,20 +1131,21 @@ const dispatch: ToolDefinition = {
       fleet?.status === 'rejected' && fleet.error.code === 'template_mismatch'
         ? fleet.error.reason
         : undefined
+    const renderedTitle = canonicalizeTitle(target.title)
     return {
       data: withFleetMetadata(
         {
-          summary: `Dispatched “${target.title}” to the Codex supervisor.`,
+          summary: `Dispatched “${renderedTitle}” to the Codex supervisor.`,
           node_id: id,
           bypass_cap: bypassCap,
           live_fleet: liveFleetEligible ? 'eligible' : 'supervision_only',
           live_fleet_reason:
             mismatchReason ??
-            (liveFleetEligible
-              ? `“${target.title}” came with the demo mission unchanged and can start a live worker when shared capacity is available.`
-              : briefOverride
-                ? `“${target.title}” has a brief override, so this dispatch is supervision-only: no live worker will start.`
-                : `The shared live fleet only runs tasks that came with the demo mission unchanged; “${target.title}” was created or edited in this session, so no live worker will start.`),
+            dispatchLiveFleetReason(
+              target.title,
+              liveFleetEligible,
+              briefOverride !== undefined,
+            ),
         },
         fleet,
       ),

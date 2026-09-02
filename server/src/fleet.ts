@@ -49,6 +49,17 @@ const workerLifecycleTypes = new Set([
   "APPROVAL_CREATED",
 ]);
 
+function canonicalizeTitle(title: string): string {
+  const singleLine = title
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  const characters = Array.from(singleLine);
+  return characters.length <= 80
+    ? singleLine
+    : `${characters.slice(0, 79).join("").trimEnd()}…`;
+}
+
 function templateHash(node: Pick<GraphNode, "title" | "brief">): string {
   return createHash("sha256").update(`${node.title}\n${node.brief}`).digest("hex");
 }
@@ -356,7 +367,7 @@ export class FleetQueue {
       return {
         eligible: false,
         code: "template_mismatch",
-        message: `A custom brief (brief_override) was supplied for '${requested.title}'. The shared live fleet only runs unchanged seeded tasks, so this dispatch is supervision-only: no live worker will start.`,
+        message: `A custom brief (brief_override) was supplied for '${canonicalizeTitle(requested.title)}'. The shared live fleet only runs unchanged seeded tasks, so this dispatch is supervision-only: no live worker will start.`,
       };
     }
     const creation = events.find((event) => createsNode(event, requestedNodeId));
@@ -365,7 +376,7 @@ export class FleetQueue {
       return {
         eligible: false,
         code: "template_mismatch",
-        message: `The shared live fleet only runs tasks that came with the demo mission unchanged. '${requested.title}' was created in this session, so it is dispatched in supervision-only mode: no live worker will start.${suggestion}`,
+        message: `The shared live fleet only runs tasks that came with the demo mission unchanged. '${canonicalizeTitle(requested.title)}' was created in this session, so it is dispatched in supervision-only mode: no live worker will start.${suggestion}`,
       };
     }
     const requestedHash = templateHash(requested);
@@ -373,7 +384,7 @@ export class FleetQueue {
       return {
         eligible: false,
         code: "template_mismatch",
-        message: `'${requested.title}' was edited after cloning (its title or brief no longer matches the seeded task), so it is dispatched in supervision-only mode: no live worker will start.${suggestion}`,
+        message: `'${canonicalizeTitle(requested.title)}' was edited after cloning (its title or brief no longer matches the seeded task), so it is dispatched in supervision-only mode: no live worker will start.${suggestion}`,
       };
     }
     const authorizedDispatch = events.find((event) => {
@@ -418,10 +429,19 @@ export class FleetQueue {
         .map(templateHash),
     );
     const createdAt = new Map<string, number>();
+    const workerHistoryNodeIds = new Set<string>();
+    const briefOverrideNodeIds = new Set<string>();
     for (const event of events) {
       if (event.type === "TASK_ADDED") createdAt.set(event.payload.node.id, event.seq);
       if (event.type === "TASK_SPLIT") {
         for (const child of event.payload.children) createdAt.set(child.id, event.seq);
+      }
+      const eventNodeId = nodeId(event);
+      if (eventNodeId && workerLifecycleTypes.has(event.type)) {
+        workerHistoryNodeIds.add(eventNodeId);
+      }
+      if (event.type === "DISPATCHED" && event.payload.brief_override !== undefined) {
+        briefOverrideNodeIds.add(event.payload.node_id);
       }
     }
     const eligibleNodes = projectId === this.options.seedProjectId || baseline === undefined
@@ -432,7 +452,9 @@ export class FleetQueue {
             node.record_type === "task" &&
             node.state === "queued" &&
             (createdAt.get(node.id) ?? Number.POSITIVE_INFINITY) <= baseline &&
-            templateHashes.has(templateHash(node)),
+            templateHashes.has(templateHash(node)) &&
+            !workerHistoryNodeIds.has(node.id) &&
+            !briefOverrideNodeIds.has(node.id),
         )
         .sort(
           (left, right) =>
@@ -443,7 +465,7 @@ export class FleetQueue {
   }
 
   private seededTaskSuggestion(eligibleNodes: GraphNode[]): string {
-    const titles = eligibleNodes.slice(0, 3).map((node) => node.title);
+    const titles = eligibleNodes.slice(0, 3).map((node) => canonicalizeTitle(node.title));
     return titles.length === 0
       ? ""
       : ` Seeded tasks that can still run live: ${titles.join(", ")}.`;
