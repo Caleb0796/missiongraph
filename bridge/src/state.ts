@@ -35,6 +35,7 @@ export interface WorkerState {
   thread_id?: string;
   worktree: string;
   branch: string;
+  branch_base?: string;
   reporter_credential?: string;
   reporter_expires?: string;
   reporter_config_path?: string;
@@ -218,6 +219,7 @@ function stateValue(value: unknown, projectId: string): BridgeState {
       worker === null ||
       typeof worker.worktree !== "string" ||
       typeof worker.branch !== "string" ||
+      (worker.branch_base !== undefined && !/^[0-9a-f]{40}$/i.test(worker.branch_base)) ||
       (worker.node_id !== undefined && typeof worker.node_id !== "string") ||
       (worker.project_id !== undefined && typeof worker.project_id !== "string") ||
       (worker.fleet_request_id !== undefined && typeof worker.fleet_request_id !== "string")

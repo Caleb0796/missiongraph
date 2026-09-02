@@ -54,6 +54,12 @@ describe("reporter contract", () => {
     expect(brief).toContain("NODE_STATE_CHANGED");
     expect(brief).toContain("WORKER_LOG");
     expect(brief).toContain("HANDOFF_FILED");
+    expect(brief).toContain(
+      '"commits":["<full 40-character commit SHA — copy the exact output of git rev-parse HEAD>"]',
+    );
+    expect(brief).toContain(
+      "Never abbreviate, guess, or pad a commit SHA; run git rev-parse HEAD and paste it.",
+    );
     expect(brief).toContain("APPROVAL_CREATED exactly once");
   });
 

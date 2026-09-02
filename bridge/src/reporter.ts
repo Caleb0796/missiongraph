@@ -17,6 +17,18 @@ export interface ReporterCredential {
   expires: string;
 }
 
+export class ReporterRequestError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | undefined,
+    readonly responseMessage: string | undefined,
+    responseBody: string,
+  ) {
+    super(`reporter POST failed (${status}): ${responseBody}`);
+    this.name = "ReporterRequestError";
+  }
+}
+
 export function reporterPayload(
   actor: ReporterEvent["actor"],
   type: string,
@@ -69,10 +81,13 @@ export class ReporterClient {
     return body as ReporterCredential;
   }
 
-  async post(event: ReporterEvent): Promise<number> {
+  async post(event: ReporterEvent, signal?: AbortSignal): Promise<number> {
     const body = this.dryRun && event.type === "JOURNAL_NOTE" && typeof event.payload.text === "string"
       ? { ...event, payload: { ...event.payload, text: `DRY-RUN SIMULATION: ${event.payload.text}` } }
       : event;
+    const boundedSignal = signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(reporterRequestTimeoutMs)])
+      : AbortSignal.timeout(reporterRequestTimeoutMs);
     const response = await fetch(this.url, {
       method: "POST",
       headers: {
@@ -80,8 +95,28 @@ export class ReporterClient {
         "content-type": "application/json",
       },
       body: JSON.stringify(body),
+      signal: boundedSignal,
     });
-    if (!response.ok) throw new Error(`reporter POST failed (${response.status}): ${await response.text()}`);
+    if (!response.ok) {
+      const responseBody = await response.text();
+      let parsed: { error?: string | { code?: unknown; message?: unknown } } = {};
+      try {
+        parsed = JSON.parse(responseBody) as typeof parsed;
+      } catch {
+        // Keep the original response body in the error when an upstream proxy returns non-JSON.
+      }
+      const error = parsed.error;
+      throw new ReporterRequestError(
+        response.status,
+        typeof error === "object" && error !== null && typeof error.code === "string" ? error.code : undefined,
+        typeof error === "string"
+          ? error
+          : typeof error === "object" && error !== null && typeof error.message === "string"
+            ? error.message
+            : undefined,
+        responseBody,
+      );
+    }
     const responseBody = (await response.json()) as { seq?: unknown };
     if (!Number.isSafeInteger(responseBody.seq)) throw new Error("reporter POST response did not contain a sequence");
     return responseBody.seq as number;
