@@ -1,11 +1,11 @@
 # Devpost submission draft (fill-in for the human submitter)
 
 **Project name**: MissionGraph
-**Tagline**: Mission control for graph-parallel agent engineering — supervise a real Codex fleet by exception, through one shared living graph.
+**Tagline**: A web page as the durable meeting place for people and agents who work at different times: state, authority and the record live on the page. Today's crew is a real Codex fleet, via WebMCP in ChatGPT.
 
 ## Inspiration
 
-Parallel agent fleets are fast — and illegible. Linear chat loops are legible — and slow. Running real multi-agent projects, we kept hitting the same wall: no shared picture of what's running, what's blocked, what changed while you were away, and no auditable trail of who decided what.
+People and agents rarely work at the same time. Agents run while you are away, you drop in when you can, and today's WebMCP is pull-only — a page cannot wake an agent. So the collaboration needs a place that is always there: the web page itself, holding the shared state, the authority to act, and the record of what happened. MissionGraph is that page, built for long, intermittent missions: the browser agent is caught up on every return, humans grant a policy once instead of approving every step, the page mirrors human context back to the agent as tools, and everything consequential is on the ledger. Our first tenant is the hardest one we know — a fleet of real Codex workers building software — but the substrate is not code-specific.
 
 ## What it does
 

@@ -1,6 +1,6 @@
 # MissionGraph
 
-**Mission control for graph-parallel agent engineering.** A live task-DAG canvas where a human, their browser agent (via [WebMCP](https://developer.chrome.com/docs/ai/webmcp)), and a fleet of Codex worker sessions run a software project together — and every decision, handoff, and deviation stays on the record.
+**A web page as the durable meeting place for people and agents who work at different times.** A live task-DAG canvas where a human, their browser agent (via [WebMCP](https://developer.chrome.com/docs/ai/webmcp)), and a fleet of Codex worker sessions run a long mission together — the page holds the state, the authority to act, and the record; agents come and go and are caught up on every return. Every decision, handoff, and deviation stays on the ledger.
 
 > *The intelligence already sits in the visitor's browser — their own agent, with their context and their authority. WebMCP gives that agent hands on shared, live project state that DOM manipulation could never reach (a canvas DAG), and gives the page a way to mirror human context back (selection → dynamic tools). Human + browser agent + worker fleet each do what only they can: judgment, narration + policy execution, throughput.*
 
@@ -8,7 +8,7 @@ Live: **https://missiongraph.vercel.app** · WebMCP Challenge entry (Devpost)
 
 ## What humans and agents can do together here that they couldn't before
 
-Parallel agent fleets are fast — and illegible. A linear chat loop is legible — and slow. MissionGraph makes **supervision-by-exception of a parallel agent fleet** possible through one shared living graph:
+People and agents rarely work at the same time, so MissionGraph makes the page the place they meet. Its first tenant: parallel agent fleets are fast — and illegible; a linear chat loop is legible — and slow. MissionGraph makes **supervision-by-exception of a parallel agent fleet** possible through one shared living graph:
 
 - **S1 · Genesis** — describe the mission in a paragraph; your browser agent plans it as a dependency DAG on the canvas (`plan_seed`), you drag, it splits oversized nodes; the critical path ignites.
 - **S2 · Flight** — real Codex workers execute in parallel. Ask your agent to *catch you up* (`graph_digest` narrates everything you missed), state a one-sentence approval policy and let the agent clear the review queue under it (`policy_ref` on every agent approval — auditable), staff the idle branch the radar found.
