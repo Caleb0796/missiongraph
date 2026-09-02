@@ -5,7 +5,7 @@ import type { RunningCodex } from "./codex.js";
 import type { BridgeConfig } from "./config.js";
 import type { ActionExecutor } from "./actions.js";
 import { processMatches, readProcessStartTime, type ProcessStartTimeLookup } from "./process.js";
-import { ReporterClient, reporterPayload } from "./reporter.js";
+import { ReporterClient, ReporterRequestError, reporterPayload } from "./reporter.js";
 import type { FleetAdoptionState, StateStore } from "./state.js";
 import { ExecutionSlot, type ExecutionLease } from "./slot.js";
 import type { Logger } from "./types.js";
@@ -46,6 +46,7 @@ const lostWorkerReportTag = "fleet-lost-worker-state-v1";
 const lostWorkerDetailPrefix =
   "Fleet worker was lost before it filed its reports (bridge restarted or worker exited early): ";
 const lostWorkerNoteLimit = 200;
+const lostWorkerCredentialMinValidityMs = 60_000;
 const terminalWorkerStates = new Set(["review", "failed", "paused"]);
 
 function requestSignal(signal: AbortSignal, timeoutMs = fleetRequestTimeoutMs): AbortSignal {
@@ -55,6 +56,32 @@ function requestSignal(signal: AbortSignal, timeoutMs = fleetRequestTimeoutMs): 
 function lostWorkerDetail(note: string | undefined): string {
   const summary = (note ?? "No completion note was recorded.").replace(/\s+/g, " ").trim();
   return `${lostWorkerDetailPrefix}${summary.slice(0, lostWorkerNoteLimit)}`;
+}
+
+function lostWorkerIdemKey(projectId: string, nodeId: string, requestId: string): string {
+  const bytes = createHash("sha256")
+    .update(projectId)
+    .update("\0")
+    .update(nodeId)
+    .update("\0")
+    .update(requestId)
+    .update("\0")
+    .update(lostWorkerReportTag)
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function isLostWorkerTransitionConflict(error: unknown): boolean {
+  return (
+    error instanceof ReporterRequestError &&
+    error.status === 400 &&
+    error.code === "invalid_event" &&
+    error.responseMessage?.includes(", not running") === true
+  );
 }
 
 async function staleFleetResponse(response: Response): Promise<boolean> {
@@ -245,7 +272,7 @@ class FleetClient {
         note: `Fleet worker reported terminal NODE_STATE_CHANGED to failed${detail ? `: ${detail}` : "."}`,
       };
     }
-    const handoff = events.find(
+    const handoff = events.findLast(
       (event) =>
         terminalState !== undefined &&
         event.seq > terminalState.seq &&
@@ -677,11 +704,22 @@ export class FleetAdoptionLoop {
   private async finishCompletion(adoption: FleetAdoptionState): Promise<void> {
     if (!adoption.outcome) throw new Error("persisted fleet completion is missing its outcome");
     if (adoption.outcome === "failed") {
-      await this.reportLostWorker(adoption).catch((error: unknown) => {
-        this.logger.warn(
-          `failed to report lost fleet worker ${adoption.node_id}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
+      try {
+        await this.reportLostWorker(adoption);
+      } catch (error) {
+        const completion = isLostWorkerTransitionConflict(error)
+          ? await this.verifyProtocolCompletion(adoption, this.abort.signal)
+          : undefined;
+        if (completion?.outcome === "done") {
+          adoption.outcome = "done";
+          delete adoption.note;
+          await this.stateStore.save();
+        } else {
+          this.logger.warn(
+            `failed to report lost fleet worker ${adoption.node_id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
     }
     if (!await this.client.complete(adoption.request_id, adoption.outcome, this.abort.signal, adoption.note)) {
       await this.abandon(adoption, adoption.note ?? "Fleet claim disappeared before completion.");
@@ -704,24 +742,33 @@ export class FleetAdoptionLoop {
       projectId: adoption.project_id,
       visitorToken: adoption.visitor_token,
     };
-    const credential = this.stateStore.state.workers[adoption.worker_key]?.reporter_credential ??
-      (await new ReporterClient(projectConfig).issue(actor, this.abort.signal)).token;
-    const idemKey = createHash("sha256")
-      .update(adoption.project_id)
-      .update("\0")
-      .update(adoption.node_id)
-      .update("\0")
-      .update(adoption.request_id)
-      .update("\0")
-      .update(lostWorkerReportTag)
-      .digest("hex");
-    const reporter = new ReporterClient({ ...projectConfig, reporterCredential: credential });
-    await reporter.post(reporterPayload(actor, "NODE_STATE_CHANGED", {
+    const issuer = new ReporterClient(projectConfig);
+    const worker = this.stateStore.state.workers[adoption.worker_key];
+    const expires = Date.parse(worker?.reporter_expires ?? "");
+    let credential = worker?.reporter_credential;
+    if (
+      !credential ||
+      !Number.isFinite(expires) ||
+      expires - Date.now() < lostWorkerCredentialMinValidityMs
+    ) {
+      credential = (await issuer.issue(actor, this.abort.signal)).token;
+    }
+    const event = reporterPayload(actor, "NODE_STATE_CHANGED", {
       node_id: adoption.node_id,
       from: "running",
       to: "failed",
       detail: lostWorkerDetail(adoption.note),
-    }, idemKey));
+    }, lostWorkerIdemKey(adoption.project_id, adoption.node_id, adoption.request_id));
+    try {
+      await new ReporterClient({ ...projectConfig, reporterCredential: credential }).post(event, this.abort.signal);
+    } catch (error) {
+      if (!(error instanceof ReporterRequestError) || error.status !== 401) throw error;
+      const freshCredential = await issuer.issue(actor, this.abort.signal);
+      await new ReporterClient({
+        ...projectConfig,
+        reporterCredential: freshCredential.token,
+      }).post(event, this.abort.signal);
+    }
   }
 
   private async abandon(adoption: FleetAdoptionState, note: string): Promise<void> {

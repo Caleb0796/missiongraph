@@ -25,6 +25,7 @@ interface LedgerEvent {
   actor: string;
   type: string;
   payload: Record<string, unknown>;
+  idem_key?: string;
 }
 
 interface ReporterCall {
@@ -45,6 +46,8 @@ class FleetStub {
   readonly credentialProjects: string[] = [];
   readonly credentialActors: string[] = [];
   readonly reporterCalls: ReporterCall[] = [];
+  readonly unauthorizedReporterTokens = new Set<string>();
+  readonly lateLedgerEventsOnReport: LedgerEvent[] = [];
   readonly claims: (FleetClaim | undefined)[] = [];
   readonly missingProjects = new Set<string>();
   readonly historicalLedgerEvents: LedgerEvent[] = [];
@@ -78,9 +81,11 @@ class FleetStub {
   stallNext = false;
   stallComplete = false;
   stallCredential = false;
+  stallReport = false;
   private releaseNextResponse: (() => void) | undefined;
   private releaseCompleteResponse: (() => void) | undefined;
   private releaseCredentialResponse: (() => void) | undefined;
+  private releaseReportResponse: (() => void) | undefined;
   private server: Server | undefined;
   url = "";
 
@@ -102,6 +107,7 @@ class FleetStub {
     this.releaseNextResponse?.();
     this.releaseCompleteResponse?.();
     this.releaseCredentialResponse?.();
+    this.releaseReportResponse?.();
   }
 
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -149,6 +155,9 @@ class FleetStub {
     }
     const credential = url.pathname.match(/^\/api\/p\/([^/]+)\/reporter-credentials$/);
     if (request.method === "POST" && credential) {
+      if (request.headers.authorization !== "Bearer reporter-token") {
+        return this.json(response, 401, { error: "unauthorized" });
+      }
       const project = decodeURIComponent(credential[1]!);
       this.credentialProjects.push(project);
       const body = await this.body(request) as { actor: string };
@@ -168,13 +177,48 @@ class FleetStub {
     }
     const report = url.pathname.match(/^\/api\/p\/([^/]+)\/report$/);
     if (request.method === "POST" && report) {
+      const projectId = decodeURIComponent(report[1]!);
       const body = await this.body(request) as ReporterCall["body"];
       this.reporterCalls.push({
-        projectId: decodeURIComponent(report[1]!),
+        projectId,
         authorization: request.headers.authorization,
         body,
       });
+      if (this.stallReport) {
+        await new Promise<void>((resolvePromise) => { this.releaseReportResponse = resolvePromise; });
+        this.releaseReportResponse = undefined;
+      }
+      const token = request.headers.authorization?.slice("Bearer ".length);
+      if (
+        request.headers.authorization !== `Bearer credential-${projectId}` ||
+        (token !== undefined && this.unauthorizedReporterTokens.has(token))
+      ) {
+        return this.json(response, 401, { error: "unauthorized" });
+      }
       if (this.reportStatus !== 200) return this.json(response, this.reportStatus, { error: "report failed" });
+      const existing = [...this.historicalLedgerEvents, ...this.ledgerEvents]
+        .find((event) => event.idem_key === body.idem_key);
+      if (existing) return this.json(response, 200, { seq: existing.seq });
+      if (this.lateLedgerEventsOnReport.length > 0) {
+        this.ledgerEvents.push(...this.lateLedgerEventsOnReport.splice(0));
+      }
+      if (body.actor !== "worker:adopted-node" || body.payload.node_id !== "adopted-node") {
+        return this.json(response, 403, { error: "worker credential is bound to a different node" });
+      }
+      if (
+        body.type === "NODE_STATE_CHANGED" &&
+        body.payload.from === "running" &&
+        body.payload.to === "failed"
+      ) {
+        const state = [...this.historicalLedgerEvents, ...this.ledgerEvents]
+          .filter((event) => event.type === "NODE_STATE_CHANGED" && event.payload.node_id === "adopted-node")
+          .at(-1)?.payload.to;
+        if (state !== "running") {
+          return this.json(response, 400, {
+            error: { code: "invalid_event", message: `node adopted-node is ${String(state)}, not running` },
+          });
+        }
+      }
       const seq = [...this.historicalLedgerEvents, ...this.ledgerEvents]
         .reduce((latest, event) => Math.max(latest, event.seq), 0) + 1;
       this.ledgerEvents.push({ ...body, seq });
@@ -260,7 +304,7 @@ function claim(brief = "Implement the adopted task."): FleetClaim {
 }
 
 function lostWorkerIdemKey(): string {
-  return createHash("sha256")
+  const bytes = createHash("sha256")
     .update("adopted-project")
     .update("\0")
     .update("adopted-node")
@@ -268,7 +312,12 @@ function lostWorkerIdemKey(): string {
     .update("request-1")
     .update("\0")
     .update("fleet-lost-worker-state-v1")
-    .digest("hex");
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 async function createHarness(
@@ -289,7 +338,7 @@ async function createHarness(
   await initializeRepo(bridgeConfig.targetRepoPath);
   const head = spawnSync("git", ["-C", bridgeConfig.targetRepoPath, "rev-parse", "HEAD"], { encoding: "utf8" });
   if (head.status !== 0) throw new Error(head.stderr);
-  for (const event of stub.ledgerEvents) {
+  for (const event of [...stub.ledgerEvents, ...stub.lateLedgerEventsOnReport]) {
     const handoff = event.payload.handoff as { commits?: unknown[] } | undefined;
     if (handoff?.commits?.[0] === "TEST_REPO_HEAD") handoff.commits = [head.stdout.trim()];
   }
@@ -359,6 +408,34 @@ async function startedStub(): Promise<FleetStub> {
   return stub;
 }
 
+async function persistLostWorker(
+  state: StateStore,
+  reporterCredential: string,
+  reporterExpires: string | undefined,
+): Promise<void> {
+  const adopted = claim();
+  state.state.fleet_adoption = {
+    ...adopted,
+    worker_key: "fleet:request-1",
+    status: "running",
+    adopted_at: new Date(Date.now() - 100).toISOString(),
+    started_at: new Date(Date.now() - 100).toISOString(),
+  };
+  Object.assign(state.state.fleet_adoption, { ledger_seq_at_adoption: 0 });
+  state.state.workers["fleet:request-1"] = {
+    status: "dead",
+    thread_id: "lost-thread",
+    worktree: join(dirname(state.path), "lost-worktree"),
+    branch: "work/lost",
+    reporter_credential: reporterCredential,
+    ...(reporterExpires === undefined ? {} : { reporter_expires: reporterExpires }),
+    node_id: adopted.node_id,
+    project_id: adopted.project_id,
+    fleet_request_id: adopted.request_id,
+  };
+  await state.save();
+}
+
 describe("FleetAdoptionLoop", () => {
   it("leaves flagship execution uncoordinated when fleet mode is off", () => {
     const slot = new ExecutionSlot(false);
@@ -390,7 +467,101 @@ describe("FleetAdoptionLoop", () => {
     expect(stub.credentialActors).toEqual(["worker:adopted-node"]);
     expect(stub.heartbeatTimes.length).toBeGreaterThanOrEqual(1);
     expect(stub.completionCalls).toEqual([{ requestId: "request-1", body: { outcome: "done" } }]);
+    expect(stub.reporterCalls).toEqual([]);
     expect(harness.state.state.workers["fleet:request-1"]).toBeUndefined();
+  });
+
+  it("uses the last handoff when a stale fabricated SHA is replaced before approval", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.ledgerEvents.splice(0, stub.ledgerEvents.length,
+      {
+        seq: 94,
+        actor: "worker:adopted-node",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "adopted-node", from: "queued", to: "running" },
+      },
+      {
+        seq: 95,
+        actor: "worker:adopted-node",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "adopted-node", from: "running", to: "review", detail: "committed as 7eb50f5" },
+      },
+      {
+        seq: 96,
+        actor: "worker:adopted-node",
+        type: "HANDOFF_FILED",
+        payload: {
+          node_id: "adopted-node",
+          handoff: { v: 1, commits: ["7eb50f5d68be72b2c725fa6d7cd6c49f63729aec"] },
+        },
+      },
+      {
+        seq: 97,
+        actor: "worker:adopted-node",
+        type: "HANDOFF_FILED",
+        payload: { node_id: "adopted-node", handoff: { v: 1, commits: ["TEST_REPO_HEAD"] } },
+      },
+      {
+        seq: 98,
+        actor: "worker:adopted-node",
+        type: "APPROVAL_CREATED",
+        payload: { node_id: "adopted-node" },
+      },
+    );
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toEqual({ outcome: "done" });
+    expect(stub.reporterCalls).toEqual([]);
+  });
+
+  it("fails protocol verification when the last replacement handoff has an invalid commit", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    const approval = stub.ledgerEvents.pop()!;
+    stub.ledgerEvents.push(
+      {
+        seq: 4,
+        actor: "worker:adopted-node",
+        type: "HANDOFF_FILED",
+        payload: { node_id: "adopted-node", handoff: { v: 1, commits: ["a".repeat(40)] } },
+      },
+      { ...approval, seq: 5 },
+    );
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toMatchObject({
+      outcome: "failed",
+      note: expect.stringContaining(`valid HANDOFF_FILED commits (${"a".repeat(40)})`),
+    });
+    expect(stub.reporterCalls).toEqual([]);
+  });
+
+  it("fails protocol verification when approval precedes the effective handoff", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.ledgerEvents.push({
+      seq: 5,
+      actor: "worker:adopted-node",
+      type: "HANDOFF_FILED",
+      payload: { node_id: "adopted-node", handoff: { v: 1, commits: ["TEST_REPO_HEAD"] } },
+    });
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toMatchObject({
+      outcome: "failed",
+      note: expect.stringContaining("exactly one ordered APPROVAL_CREATED"),
+    });
+    expect(stub.reporterCalls).toEqual([]);
   });
 
   it("reports a cleanly exited fleet worker that left its node running", async () => {
@@ -425,6 +596,9 @@ describe("FleetAdoptionLoop", () => {
         },
       },
     ]);
+    expect(stub.reporterCalls[0]?.body.idem_key).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
   });
 
   it("preserves a cleanly exiting worker's reported terminal failure", async () => {
@@ -468,6 +642,27 @@ describe("FleetAdoptionLoop", () => {
     expect(stub.completionCalls[0]?.body).toMatchObject({
       outcome: "failed",
       note: expect.stringContaining("v1 HANDOFF_FILED"),
+    });
+    expect(stub.reporterCalls).toEqual([]);
+  });
+
+  it("does not add a failed state after the worker already reported paused", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.ledgerEvents.splice(1, stub.ledgerEvents.length - 1, {
+      seq: 2,
+      actor: "worker:adopted-node",
+      type: "NODE_STATE_CHANGED",
+      payload: { node_id: "adopted-node", from: "running", to: "paused" },
+    });
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.completionCalls[0]?.body).toMatchObject({
+      outcome: "failed",
+      note: expect.stringContaining("ordered NODE_STATE_CHANGED running→review|failed"),
     });
     expect(stub.reporterCalls).toEqual([]);
   });
@@ -673,6 +868,87 @@ describe("FleetAdoptionLoop", () => {
         idem_key: lostWorkerIdemKey(),
       },
     });
+  });
+
+  it.each([
+    { condition: "missing", expires: undefined },
+    { condition: "invalid", expires: "not-a-date" },
+    { condition: "expiring", expires: new Date(Date.now() + 30_000).toISOString() },
+  ])("mints a fresh lost-worker credential when persisted expiry is $condition", async ({ expires }) => {
+    const stub = await startedStub();
+    stub.ledgerEvents.splice(1);
+    stub.ledgerReads = 1;
+    const harness = await createHarness(stub, { fleetPollMs: 500 }, async (state) => {
+      await persistLostWorker(state, "persisted-credential", expires);
+    });
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.credentialProjects).toEqual(["adopted-project"]);
+    expect(stub.credentialActors).toEqual(["worker:adopted-node"]);
+    expect(stub.reporterCalls).toHaveLength(1);
+    expect(stub.reporterCalls[0]?.authorization).toBe("Bearer credential-adopted-project");
+    expect(stub.completionCalls[0]?.body.outcome).toBe("failed");
+  });
+
+  it("retries a 401 lost-worker report once with a fresh node-bound credential", async () => {
+    const stub = await startedStub();
+    stub.ledgerEvents.splice(1);
+    stub.ledgerReads = 1;
+    stub.unauthorizedReporterTokens.add("revoked-credential");
+    const harness = await createHarness(stub, { fleetPollMs: 500 }, async (state) => {
+      await persistLostWorker(state, "revoked-credential", "2099-08-30T10:15:00.000Z");
+    });
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.reporterCalls.map((call) => call.authorization)).toEqual([
+      "Bearer revoked-credential",
+      "Bearer credential-adopted-project",
+    ]);
+    expect(stub.reporterCalls[0]?.body.idem_key).toBe(stub.reporterCalls[1]?.body.idem_key);
+    expect(stub.credentialProjects).toEqual(["adopted-project"]);
+    expect(stub.ledgerEvents.filter((event) => event.idem_key === lostWorkerIdemKey())).toHaveLength(1);
+    expect(stub.completionCalls[0]?.body.outcome).toBe("failed");
+  });
+
+  it("promotes a failed completion when a late worker protocol wins the report race", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.ledgerEvents.splice(1);
+    stub.lateLedgerEventsOnReport.push(
+      {
+        seq: 2,
+        actor: "worker:adopted-node",
+        type: "NODE_STATE_CHANGED",
+        payload: { node_id: "adopted-node", from: "running", to: "review" },
+      },
+      {
+        seq: 3,
+        actor: "worker:adopted-node",
+        type: "HANDOFF_FILED",
+        payload: { node_id: "adopted-node", handoff: { v: 1, commits: ["TEST_REPO_HEAD"] } },
+      },
+      {
+        seq: 4,
+        actor: "worker:adopted-node",
+        type: "APPROVAL_CREATED",
+        payload: { node_id: "adopted-node" },
+      },
+    );
+    const harness = await createHarness(stub);
+    harness.start();
+
+    await waitFor(() => stub.completionCalls.length === 1 && harness.state.state.fleet_adoption === undefined);
+
+    expect(stub.reporterCalls).toHaveLength(1);
+    expect(stub.ledgerEvents.filter((event) => event.payload.to === "failed")).toEqual([]);
+    expect(stub.completionCalls[0]?.body).toEqual({ outcome: "done" });
+    expect(harness.logger.warningMessages).not.toContainEqual(
+      expect.stringContaining("failed to report lost fleet worker"),
+    );
   });
 
   it("evaluates protocol evidence before failing a recovered worker whose process disappears", async () => {
@@ -969,6 +1245,26 @@ describe("FleetAdoptionLoop", () => {
       // "Promptly" here means "did not wait for the indefinitely stalled request" — the
       // stall never resolves on its own, so a generous bound stays a strict behavioral
       // test while surviving loaded CI runners (150ms flaked there).
+      new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 1_000)),
+    ]);
+    stub.releaseStalls();
+    await stopping;
+
+    expect(stoppedPromptly).toBe(true);
+  });
+
+  it("aborts a stalled lost-worker report during shutdown", async () => {
+    const stub = await startedStub();
+    stub.claims.push(claim());
+    stub.ledgerEvents.splice(1);
+    stub.stallReport = true;
+    const harness = await createHarness(stub, { fleetPollMs: 500 });
+    harness.start();
+    await waitFor(() => stub.reporterCalls.length === 1);
+
+    const stopping = harness.loop.stop();
+    const stoppedPromptly = await Promise.race([
+      stopping.then(() => true),
       new Promise<false>((resolvePromise) => setTimeout(() => resolvePromise(false), 1_000)),
     ]);
     stub.releaseStalls();

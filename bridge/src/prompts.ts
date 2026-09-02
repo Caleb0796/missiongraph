@@ -104,7 +104,8 @@ Report NODE_STATE_CHANGED queued→running before editing. Send WORKER_LOG tail 
 On failure, report NODE_STATE_CHANGED running→failed with a useful detail and stop. On success, run authoritative tests, commit, then report in this order:
 1. NODE_STATE_CHANGED running→review.
 2. HANDOFF_FILED with exactly this CONTRACTS §2 shape, filled with real evidence:
-{"actor":"worker:<node_id>","type":"HANDOFF_FILED","payload":{"node_id":"<node_id>","handoff":{"v":1,"summary":"prose summary first","files":["relative/path"],"commits":["git commit id"],"tests":"green|red|none","downstream_notes":"useful context","deviations":[],"artifacts":[]}},"idem_key":"<unique UUID>"}
+{"actor":"worker:<node_id>","type":"HANDOFF_FILED","payload":{"node_id":"<node_id>","handoff":{"v":1,"summary":"prose summary first","files":["relative/path"],"commits":["<full 40-character commit SHA — copy the exact output of git rev-parse HEAD>"],"tests":"green|red|none","downstream_notes":"useful context","deviations":[],"artifacts":[]}},"idem_key":"<unique UUID>"}
+Never abbreviate, guess, or pad a commit SHA; run git rev-parse HEAD and paste it.
 3. APPROVAL_CREATED exactly once, with a prose summary, actual diff_stats, and test status.
 
 Filing HANDOFF_FILED is part of task completion. Do not claim completion until the server accepts every required report.`;

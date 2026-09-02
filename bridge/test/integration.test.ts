@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { MissionGraphBridge } from "../src/bridge.js";
+import { ReporterClient, reporterPayload } from "../src/reporter.js";
 import { config, initializeRepo, TestLogger } from "./helpers.js";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -730,5 +731,113 @@ describe("bridge dry-run integration", () => {
       expect(serverStderr).not.toContain("Error:");
     },
     30_000,
+  );
+
+  it(
+    "deduplicates a replayed lost-worker report through the real reporter ingress",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "missiongraph-lost-worker-replay-"));
+      const port = await freePort();
+      const reporterToken = "lost-worker-replay-reporter-token";
+      const serverUrl = `http://127.0.0.1:${port}`;
+      const server = spawn(process.execPath, [join(repositoryRoot, "server/node_modules/tsx/dist/cli.mjs"), "src/http.ts"], {
+        cwd: join(repositoryRoot, "server"),
+        env: {
+          ...process.env,
+          REPORTER_TOKEN: reporterToken,
+          DB_PATH: join(root, "lost-worker-replay.sqlite"),
+          PORT: String(port),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let serverStderr = "";
+      server.stderr?.on("data", (chunk: Buffer) => {
+        serverStderr += chunk.toString();
+      });
+      try {
+        await serverWhenReady(serverUrl);
+        const seedResponse = await fetch(`${serverUrl}/api/import-seed`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${reporterToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            v: 1,
+            events: [{
+              seq: 1,
+              project_id: "lost-worker-replay-source",
+              ts: "2026-09-02T04:30:00.000Z",
+              actor: "human",
+              type: "TASK_ADDED",
+              payload: {
+                node: {
+                  id: "replay-node",
+                  title: "Replay node",
+                  brief: "Verify lost-worker report replay.",
+                  estimate_min: 1,
+                  tags: ["integration"],
+                  state: "queued",
+                },
+              },
+              idem_key: "d322bc3b-74a6-43c4-ac55-ac1d19e1001a",
+            }],
+          }),
+        });
+        if (!seedResponse.ok) {
+          throw new Error(`seed import failed (${seedResponse.status}): ${await seedResponse.text()}`);
+        }
+        const seed = await seedResponse.json() as { project_id: string; token: string };
+        const projectConfig = {
+          ...config(root),
+          serverUrl,
+          projectId: seed.project_id,
+          visitorToken: seed.token,
+          reporterCredential: reporterToken,
+        };
+        const actor = "worker:replay-node" as const;
+        const credential = await new ReporterClient(projectConfig).issue(actor);
+        const reporter = new ReporterClient({ ...projectConfig, reporterCredential: credential.token });
+        await reporter.post(reporterPayload(actor, "NODE_STATE_CHANGED", {
+          node_id: "replay-node",
+          from: "queued",
+          to: "running",
+        }, "98e5caf5-8135-4d05-b083-a217e9843246"));
+        const replayedReport = reporterPayload(actor, "NODE_STATE_CHANGED", {
+          node_id: "replay-node",
+          from: "running",
+          to: "failed",
+          detail: "Fleet worker was lost before it filed its reports.",
+        }, "7e893545-18ea-5b37-85f7-26f5956e4c31");
+
+        const firstSeq = await reporter.post(replayedReport);
+        const replaySeq = await new ReporterClient({
+          ...projectConfig,
+          reporterCredential: credential.token,
+        }).post(replayedReport);
+
+        expect(replaySeq).toBe(firstSeq);
+        const ledgerResponse = await fetch(`${serverUrl}/api/p/${encodeURIComponent(seed.project_id)}/export`, {
+          headers: { "x-mg-token": seed.token },
+        });
+        if (!ledgerResponse.ok) {
+          throw new Error(`ledger export failed (${ledgerResponse.status}): ${await ledgerResponse.text()}`);
+        }
+        const ledger = await ledgerResponse.json() as {
+          events: { idem_key: string; type: string; payload: Record<string, unknown> }[];
+        };
+        expect(ledger.events.filter((event) => event.idem_key === replayedReport.idem_key)).toEqual([
+          expect.objectContaining({
+            type: "NODE_STATE_CHANGED",
+            payload: expect.objectContaining({ node_id: "replay-node", to: "failed" }),
+          }),
+        ]);
+      } finally {
+        await stopProcess(server);
+        await rm(root, { recursive: true, force: true });
+      }
+      expect(serverStderr).not.toContain("Error:");
+    },
+    10_000,
   );
 });
