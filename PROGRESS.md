@@ -152,3 +152,4 @@ Ratification record: the human approved this addendum as the implementation basi
 - README and submission copy now record that the bounded public judge fleet admits human-confirmed dispatches first-in-first-out.
 - Render production now requires the Standard tier (1 CPU / 2 GB): the 512 MB Starter instance was OOM-killed during real worker runs at 16:10 and 20:58 PDT; the Blueprint `plan:` value is updated separately.
 - README, submission, setup, deployment, and progress documentation were reconciled without changing the frozen contracts or the video voice-over.
+- 2026-09-01: Render plan `1c-2g` aligned in the Blueprint; `FLEET_DAILY_CAP` 5→20 (`FLEET_GLOBAL_DAILY_CAP` adjusted accordingly) so late judges do not hit `capacity_unavailable`.

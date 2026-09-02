@@ -6,7 +6,8 @@ services:
     runtime: docker
     dockerfilePath: ./deploy/Dockerfile
     dockerContext: .
-    plan: starter
+    # Standard instance (1 CPU / 2 GB); Starter was OOM-killed twice during real worker runs.
+    plan: 1c-2g
     autoDeploy: false
     healthCheckPath: /api/health
     disk:
@@ -67,13 +68,17 @@ services:
       # Dashboard-owned for the same reason as BRIDGE_ENABLED (set to 1 for judging).
       - key: FLEET_MODE
         sync: false
-      # Worst-case spend is bounded by daily cap x judging days, so keep the cap low and ALSO set
-      # a hard spend limit on the API key itself — that limit is the backstop that does not
+      # Worst-case spend is bounded by 20 accepted requests per UTC day x judging days, so ALSO
+      # set a hard spend limit on the API key itself — that limit is the backstop that does not
       # depend on this code being correct.
       - key: FLEET_DAILY_CAP
-        value: "5"
+        value: "20"
       - key: FLEET_PER_PROJECT_CAP
         value: "1"
+      - key: FLEET_ENQUEUE_HOURLY_CAP
+        value: "3"
+      - key: FLEET_GLOBAL_DAILY_CAP
+        value: "40"
       - key: FLEET_ADOPT_TTL_MIN
         value: "20"
       - key: FLEET_RUN_TTL_MIN
