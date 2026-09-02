@@ -13,6 +13,7 @@ const enabled = {
   queue_depth: 2,
   daily_remaining: 20,
   project_remaining: 1,
+  eligible_node_ids: ['node-a'],
 }
 
 function fakeTimers() {
@@ -47,6 +48,7 @@ function fakeTimers() {
 function harness(overrides = {}) {
   const calls = []
   const displays = []
+  const eligibility = []
   const timers = fakeTimers()
   const transport = {
     status: async (session) => {
@@ -66,12 +68,30 @@ function harness(overrides = {}) {
   const coordinator = new LiveFleetCoordinator({
     transport,
     onDisplay: (display) => displays.push(display),
+    onEligibility: (nodeIds) => eligibility.push(nodeIds),
     schedule: timers.schedule,
     cancel: timers.cancel,
   })
   coordinator.activate({ project: 'project-a', token: 'token-a', sessionId: 'session-a' })
-  return { calls, coordinator, displays, timers }
+  return { calls, coordinator, displays, eligibility, timers }
 }
+
+test('fleet eligibility is fetched once per cursor and refreshed without polling', async () => {
+  const { calls, coordinator, eligibility } = harness()
+
+  await coordinator.refreshEligibility('10')
+  await coordinator.refreshEligibility('10')
+  await coordinator.refreshEligibility('11')
+
+  assert.deepEqual(
+    calls.filter(([name]) => name === 'status'),
+    [
+      ['status', 'project-a', 'session-a'],
+      ['status', 'project-a', 'session-a'],
+    ],
+  )
+  assert.deepEqual(eligibility, [[], ['node-a'], ['node-a']])
+})
 
 test('fleet-enabled dispatch probes status, creates the request, and returns metadata', async () => {
   const { calls, coordinator, displays, timers } = harness()
@@ -216,7 +236,7 @@ test('enqueue errors resolve without failing dispatch and show one honest line',
   assert.match(liveFleetDisplayText(displays.at(-1)), /capacity unavailable/i)
 })
 
-test('template mismatch stays non-failing but is explicit in tool data and UI copy', async () => {
+test('template mismatch stays non-failing but is explicit in tool data and supervision-only UI copy', async () => {
   const reason = 'This dispatched task does not match the fleet template.'
   const { coordinator, displays } = harness({
     create: async () => {
@@ -243,8 +263,8 @@ test('template mismatch stays non-failing but is explicit in tool data and UI co
       error: { code: 'template_mismatch', reason },
     },
   })
-  assert.match(copy, /not eligible/i)
-  assert.match(copy, /template_mismatch/)
+  assert.equal(copy, `Live fleet: supervision-only for this task — ${reason}`)
+  assert.doesNotMatch(copy, /template_mismatch/)
   assert.doesNotMatch(copy, /busy/i)
 })
 

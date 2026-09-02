@@ -170,6 +170,7 @@ interface MissionState {
   cameraRequest: CameraRequest | null
   toast: Toast | null
   liveFleet: LiveFleetDisplay | null
+  liveFleetEligibleNodeIds: string[]
   structuralPreview: StructuralPreview | null
   humanConfirmation: HumanConfirmation | null
   contextualToolsDegraded: boolean
@@ -229,6 +230,7 @@ interface MissionState {
   requestCamera: (ids: string[]) => void
   showExplainOverlay: (id: string, text: string, ttlSeconds: number) => void
   setLiveFleet: (liveFleet: LiveFleetDisplay | null) => void
+  setLiveFleetEligibleNodeIds: (nodeIds: string[]) => void
   showToast: (message: string, tone?: Toast['tone'], caption?: string) => void
   clearToast: () => void
 }
@@ -543,6 +545,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   cameraRequest: null,
   toast: null,
   liveFleet: null,
+  liveFleetEligibleNodeIds: [],
   structuralPreview: null,
   humanConfirmation: null,
   contextualToolsDegraded: false,
@@ -610,6 +613,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         humanConfirmation: projectChanged ? null : state.humanConfirmation,
         explainOverlays: projectChanged ? {} : state.explainOverlays,
         liveFleet: projectChanged ? null : state.liveFleet,
+        liveFleetEligibleNodeIds: projectChanged
+          ? []
+          : state.liveFleetEligibleNodeIds,
         selectedId:
           projectChanged || !selectedExists ? null : state.selectedId,
         connectionMode: 'live',
@@ -981,6 +987,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       humanConfirmation: null,
       explainOverlays: {},
       liveFleet: null,
+      liveFleetEligibleNodeIds: [],
       selectedId: null,
       topologyRevision: get().topologyRevision + 1,
     })
@@ -1365,6 +1372,9 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   },
   setLiveFleet(liveFleet) {
     set({ liveFleet })
+  },
+  setLiveFleetEligibleNodeIds(liveFleetEligibleNodeIds) {
+    set({ liveFleetEligibleNodeIds })
   },
   showToast(message, tone = 'info', caption) {
     set({

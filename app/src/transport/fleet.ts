@@ -46,6 +46,7 @@ interface FleetStatusResponse {
   queue_depth: number
   daily_remaining: number
   project_remaining: number
+  eligible_node_ids: string[]
 }
 
 interface FleetRequestResponse extends FleetMetadata {
@@ -61,6 +62,7 @@ interface FleetTransport {
 interface FleetCoordinatorOptions {
   transport: FleetTransport
   onDisplay: (display: LiveFleetDisplay | null) => void
+  onEligibility?: (nodeIds: string[]) => void
   schedule?: (callback: () => void, milliseconds: number) => unknown
   cancel?: (timer: unknown) => void
   pollMilliseconds?: number
@@ -74,7 +76,7 @@ interface ActiveFleetRequest {
 export function liveFleetDisplayText(display: LiveFleetDisplay) {
   if (display.phase === 'degraded') {
     if (display.error?.code === 'template_mismatch') {
-      return `Live fleet: task not eligible (${display.error.code}) — ${display.error.reason}`
+      return `Live fleet: supervision-only for this task — ${display.error.reason}`
     }
     if (
       display.error?.code === 'fleet_daily_cap' ||
@@ -125,10 +127,12 @@ export function isFleetWorkerEvent(event: MissionEvent) {
 export class LiveFleetCoordinator {
   private readonly transport: FleetTransport
   private readonly onDisplay: FleetCoordinatorOptions['onDisplay']
+  private readonly onEligibility: NonNullable<FleetCoordinatorOptions['onEligibility']>
   private readonly schedule: NonNullable<FleetCoordinatorOptions['schedule']>
   private readonly cancel: NonNullable<FleetCoordinatorOptions['cancel']>
   private readonly pollMilliseconds: number
   private readonly statusBySession = new Map<string, Promise<FleetStatusResponse>>()
+  private readonly eligibilityRefreshes = new Map<string, Promise<void>>()
   private readonly dispatches = new Map<string, Promise<FleetDispatchMetadata | null>>()
   private readonly results = new Map<string, FleetDispatchMetadata | null>()
   private session: FleetSession | null = null
@@ -137,10 +141,12 @@ export class LiveFleetCoordinator {
   private generation = 0
   private mounted = true
   private degradationShown = false
+  private eligibilityCursor: string | null = null
 
   constructor(options: FleetCoordinatorOptions) {
     this.transport = options.transport
     this.onDisplay = options.onDisplay
+    this.onEligibility = options.onEligibility ?? (() => {})
     this.schedule = options.schedule ?? ((callback, milliseconds) => setTimeout(callback, milliseconds))
     this.cancel = options.cancel ?? ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>))
     this.pollMilliseconds = options.pollMilliseconds ?? 10_000
@@ -161,7 +167,36 @@ export class LiveFleetCoordinator {
     this.session = session
     this.dispatches.clear()
     this.results.clear()
+    this.eligibilityCursor = null
+    this.onEligibility([])
     this.generation++
+  }
+
+  refreshEligibility(cursor: string): Promise<void> {
+    if (!this.mounted || !this.session) return Promise.resolve()
+    const session = this.session
+    const generation = this.generation
+    this.eligibilityCursor = cursor
+    const key = `${this.sessionKey(session)}:${cursor}`
+    const existing = this.eligibilityRefreshes.get(key)
+    if (existing) return existing
+    const pending = this.probe(session, cursor)
+      .then((status) => {
+        if (
+          !this.isCurrent(session, generation) ||
+          this.eligibilityCursor !== cursor
+        ) {
+          return
+        }
+        this.onEligibility(
+          status.enabled ? (status.eligible_node_ids ?? []) : [],
+        )
+      })
+      .catch(() => {
+        // Eligibility is advisory; retain the last successful projection.
+      })
+    this.eligibilityRefreshes.set(key, pending)
+    return pending
   }
 
   dispatch(nodeId: string) {
@@ -192,8 +227,8 @@ export class LiveFleetCoordinator {
     return `${session.project}:${session.sessionId}`
   }
 
-  private probe(session: FleetSession) {
-    const key = this.sessionKey(session)
+  private probe(session: FleetSession, cursor = this.eligibilityCursor ?? 'session') {
+    const key = `${this.sessionKey(session)}:${cursor}`
     const cached = this.statusBySession.get(key)
     if (cached) return cached
     const pending = this.transport.status(session)

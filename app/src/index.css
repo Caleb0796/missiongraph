@@ -625,6 +625,7 @@ a:focus-visible {
 
 .mission-tag,
 .mission-approval,
+.mission-live-fleet,
 .mission-idle {
   border: 1px solid #2a3949;
   border-radius: 4px;
@@ -637,6 +638,7 @@ a:focus-visible {
 }
 
 .mission-approval { border-color: rgb(239 184 94 / 38%); color: #e5b86e; }
+.mission-live-fleet { border-color: rgb(85 209 228 / 38%); color: #71d5e2; }
 .mission-idle { margin-left: auto; border-color: rgb(88 174 242 / 34%); color: #73bdf5; }
 
 .mission-handle {
@@ -694,6 +696,7 @@ a:focus-visible {
 .inspector-heading { flex: 0 0 auto; padding: 24px 22px 17px; }
 
 .inspector-status,
+.inspector-live-fleet,
 .inspector-risk {
   border: 1px solid #2d3d4e;
   border-radius: 999px;
@@ -711,6 +714,7 @@ a:focus-visible {
 .inspector-status--done { border-color: rgb(85 201 149 / 35%); color: #71d0a4; }
 .inspector-status--failed { border-color: rgb(242 100 117 / 35%); color: #f17d8b; }
 .inspector-status--ready { border-color: rgb(88 174 242 / 35%); color: #78bdf1; }
+.inspector-live-fleet { border-color: rgb(85 209 228 / 35%); color: #71d5e2; }
 .inspector-risk--schema { border-color: rgb(242 100 117 / 30%); color: #e98894; }
 
 .inspector-tabs {

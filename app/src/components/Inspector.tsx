@@ -39,6 +39,9 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
   const handoffs = useMissionStore((state) => state.handoffs)
   const storedDeviations = useMissionStore((state) => state.deviations)
   const workerLogs = useMissionStore((state) => state.workerLogs)
+  const liveFleetEligibleNodeIds = useMissionStore(
+    (state) => state.liveFleetEligibleNodeIds,
+  )
   const [activeTab, setActiveTab] = useState<Tab>('Brief')
   const [splitDraft, setSplitDraft] = useState<{
     nodeId: string
@@ -182,6 +185,9 @@ export function Inspector({ nodes, edges, events }: InspectorProps) {
                 ? 'Schema exception'
                 : 'Pending review'}
             </span>
+          )}
+          {node && liveFleetEligibleNodeIds.includes(node.id) && (
+            <span className="inspector-live-fleet">Live fleet</span>
           )}
           {edge && (
             <span className="inspector-risk">
