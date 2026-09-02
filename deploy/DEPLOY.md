@@ -60,9 +60,9 @@ Flip `BRIDGE_ENABLED=1` **last**, after every other variable is in place: while 
 
 ### Judge fleet (a clone may borrow the bridge for ONE human-confirmed, template-bound task)
 
-Set `FLEET_MODE=1` on the same service to open the fleet routes and the bridge's adoption loop; `FLEET_DAILY_CAP`, `FLEET_PER_PROJECT_CAP`, `FLEET_ADOPT_TTL_MIN` and `FLEET_RUN_TTL_MIN` carry the defaults declared in `render.yaml`. With `FLEET_MODE` unset or `0`, the status route reports `enabled: false`, request and worker routes return `fleet_disabled`, and the bridge never polls, so the merged code is inert.
+Set `FLEET_MODE=1` on the same service to open the fleet routes and the bridge's adoption loop; the Blueprint sets `FLEET_DAILY_CAP=20`, `FLEET_PER_PROJECT_CAP=1`, `FLEET_ENQUEUE_HOURLY_CAP=3`, and `FLEET_GLOBAL_DAILY_CAP=40`, while `FLEET_ADOPT_TTL_MIN` and `FLEET_RUN_TTL_MIN` carry the lease defaults declared in `render.yaml`. With `FLEET_MODE` unset or `0`, the status route reports `enabled: false`, request and worker routes return `fleet_disabled`, and the bridge never polls, so the merged code is inert.
 
-Worst-case spend is bounded by `FLEET_DAILY_CAP` × judging days. Set a hard spend limit on the API key itself as well — that limit is the only backstop that does not depend on this code being correct.
+Worst-case spend is bounded by twenty accepted requests per UTC day × judging days. Set a hard spend limit on the API key itself as well — that limit is the only backstop that does not depend on this code being correct.
 
 Supervisor policy stays at two automatic critical-path workers + one explicit-dispatch slot (GOAL_PLAN §13); do not raise it for the public demo.
 
