@@ -8,7 +8,7 @@ Human-account steps run in the owner's browser (Render/Vercel dashboards). Secre
 
 Render dashboard → **New → Blueprint** → select this repo → it reads the repo-root `render.yaml`. Before first deploy confirm:
 
-- Plan: starter (one bounded instance, autoscaling off — spend control).
+- Production on Render requires the Standard tier (1 CPU / 2 GB) because the 512 MB Starter instance was OOM-killed twice while a real Codex worker ran alongside the server and bridge, at 2026-09-01 16:10 and 20:58 PDT. The Blueprint `plan:` value is updated separately. Run one bounded instance with autoscaling off.
 - Disk `mg-data` mounted at `/data` (SQLite + bridge state + target repo live there).
 - `REPORTER_TOKEN` auto-generated (this is the supervisor-scope secret).
 - `ALLOWED_ORIGINS=https://missiongraph.vercel.app` (CORS is fail-closed).

@@ -101,6 +101,7 @@ sh -c 'set -eu
 
 Before deploying the server and bridge to a VM:
 
+- Production on Render requires the Standard tier (1 CPU / 2 GB) because the 512 MB Starter instance was OOM-killed twice while a real Codex worker ran alongside the server and bridge, at 2026-09-01 16:10 and 20:58 PDT. The Blueprint `plan:` value is updated separately.
 - Set a provider-level monthly hard budget or the lowest available spend alert, disable autoscaling, and run one bounded instance.
 - Set an OpenAI/Codex account or project spend limit separately; the VM budget does not cap model usage.
 - Keep the supervisor policy at two automatic critical-path workers plus the single explicit-dispatch slot. Do not increase it for the public demo.

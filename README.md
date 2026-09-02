@@ -30,9 +30,9 @@ Parallel agent fleets are fast — and illegible. A linear chat loop is legible 
 
 - **One event ledger** is the single source of truth. Every actor is labeled (`human`, `browser_agent`, `supervisor`, `worker:<id>`); every state you see is a fold of the ledger; any client resumes from any cursor.
 - **Digest pattern**: every tool result carries `cursor` + `changes_since`, so a browser agent that was away five minutes is fully caught up by its next call — the page never needs to wake it.
-- **Supervisor = brain, server = hands**: the Codex supervisor only ever emits structured decisions (spawn / pause / resume / rebrief / kill / note); the bridge executes them mechanically, so *every scheduling decision is an auditable recorded turn*.
+- **Supervisor = brain, server = hands**: the Codex supervisor only ever emits structured decisions (spawn / pause / resume / rebrief / kill / note); the bridge executes them mechanically, so *every scheduling decision is an auditable recorded turn*. The bounded public judge fleet admits human-confirmed dispatches first-in-first-out.
 - **Audit-first UX**: nodes and edges open into dossiers (Brief / Handoff / Deviations / Decisions / Log — prose first, never bare IDs). Workers must file structured handoffs; deviations feed the rewire radar; everything else lands in the project journal.
-- **Real history only (C5)**: the demo seed every visitor clones is an export of a *real* run — actual Codex workers, actual commits, actual approvals. Nothing is fabricated.
+- **Real history only (C5)**: the demo seed every visitor clones is an export of a real run — actual Codex workers, actual handoffs and approvals, with each worker's commit IDs recorded in its handoff. Nothing is fabricated.
 
 ## Try it
 
@@ -77,7 +77,7 @@ The fleet contract has its own scenario harness on top of those: `node eval/flee
 acceptance scenarios against an in-process mirror of the server, and `--real` runs them against a live
 server and bridge.
 
-Beyond unit/integration tests, every milestone went through an **adversarial review loop** (independent reviewer session → findings → fix round → fix-verification round) and a **live functional arbitration** on the real stack — 50+ P1/P2 findings found and closed this way, with the full trail in [PROGRESS.md](PROGRESS.md).
+Beyond unit/integration tests, every milestone went through an **adversarial review loop** (independent reviewer session → findings → fix round → fix-verification round) and a **live functional arbitration** on the real stack — 70+ P1/P2 findings were found and fixed, with the full trail in [PROGRESS.md](PROGRESS.md).
 
 ## Repository layout
 
