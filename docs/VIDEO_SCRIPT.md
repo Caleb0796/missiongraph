@@ -38,15 +38,15 @@ Recording frame: the whole ChatGPT desktop window — conversation (left) and th
 
 ### 5. Close — 2:32–2:55 (Impact)
 - **Screen**: full graph + URL, then the end card.
-- **VO 5** (58 words): "People and agents don't work at the same time, so they meet on a page. The page keeps the state, the permissions and the record, and WebMCP hands all of it to the agent in your browser. Today's crew is a Codex fleet on the OpenAI API, and on the live site you can dispatch one yourself. missiongraph.vercel.app."
+- **VO 5** (59 words): "People and agents don't work at the same time, so they meet on a page. WebMCP hands that page's state, permissions and record to the agent in your browser. The page runs no model of its own. The work is done by a Codex fleet on your own account, and the live site hosts one you can try. missiongraph.vercel.app."
 - **End card**: `missiongraph.vercel.app · 25 always-on + 5 contextual WebMCP tools · live Codex fleet (GPT-5.6 Sol · OpenAI API) · 323 tests · 19 fleet scenarios · adversarially reviewed`
   Measured 2026-09-02 after the fleet-eligibility fix: server 87 / bridge 109 / app 127 = **323**, plus the 19-scenario fleet contract stub. Re-run the suites on recording day rather than trusting this line.
 
-VO total ≈ 376 words ≈ 2:36 of speech inside 3:00; the rest is deliberately silent so the judges can read the tool calls.
+VO total ≈ 377 words ≈ 2:36 of speech inside 3:00; the rest is deliberately silent so the judges can read the tool calls.
 
 ## Claims the frame must back
 - "GPT-5.6 Sol on our fleet" (VO 2) is true only if the local bridge runs with `MG_CODEX_MODEL=gpt-5.6-sol` (the laptop default; SETUP.md). The public Render fleet runs the same model at medium effort through an OpenAI API key (render.yaml).
-- "on the live site you can dispatch one yourself" (VO 5): the public fleet accepts unchanged seeded tasks, up to twenty accepted requests per UTC day, one per project (docs/SUBMISSION.md testing note).
+- "on your own account" and "the live site hosts one you can try" (VO 5): the bridge spawns the local `codex` CLI (bridge/src/codex.ts) and therefore uses the login of the machine it runs on; the server makes no model calls. The public Render fleet is the hosted exception for judges: unchanged seeded tasks only, up to twenty accepted requests per UTC day, one per project (docs/SUBMISSION.md testing note).
 - "registers twenty-five tools with document.modelContext" (VO 0): app/src/webmcp/registry.ts makes the literal `document.modelContext.registerTool` call; 25 always-on tools plus 5 contextual.
 - Never say the page pushes or wakes the agent; page→agent is tool results and `toolchange` only.
 

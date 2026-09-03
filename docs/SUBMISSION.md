@@ -1,7 +1,7 @@
 # Devpost submission draft (fill-in for the human submitter)
 
 **Project name**: MissionGraph
-**Tagline**: A web page as the durable meeting place for people and agents who work at different times: state, authority and the record live on the page. Today's crew is a real Codex fleet, via WebMCP in ChatGPT.
+**Tagline**: A web page where people and agents who work at different times meet: state, authority and the record live on the page. Your agent comes in through WebMCP in ChatGPT. A real Codex fleet does the work.
 
 ## Inspiration
 
@@ -20,6 +20,8 @@ Three scenarios: S1 Genesis (co-planning a paragraph into a DAG), S2 Flight (co-
 ## Why WebMCP (the challenge question)
 
 The intelligence already sits in the visitor's browser — their own agent, with their context and their authority. WebMCP gives that agent hands on shared, live project state that DOM manipulation could never reach (a canvas DAG behind an event ledger), and gives the page a way to mirror human context back (selection → dynamically registered tools via `toolchange`). Human + browser agent + worker fleet each do what only they can: judgment, narration + policy execution, throughput.
+
+The page and the server run no model. The visitor's agent comes in through WebMCP with its own model and its own authority. The fleet that does the work runs on the mission owner's Codex, wherever the bridge daemon runs. The public site hosts one fleet so judges can watch a real worker; it is capped at twenty dispatches a day, and its API key exists only on that server.
 
 What people and agents can do together that was difficult or impossible before: **supervision-by-exception of a parallel agent fleet through one shared living graph** — with a complete audit trail.
 
