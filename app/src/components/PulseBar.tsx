@@ -103,7 +103,7 @@ export function PulseBar({
             {eta} min
           </strong>
         </div>
-        <Stat label="Ready" value={readyCount} tone="bg-blue-400" />
+        <Stat label="Ready now" value={readyCount} tone="bg-blue-400" />
         <Stat label="Running" value={counts.running} tone="bg-cyan-400" />
         <Stat label="Paused" value={counts.paused} tone="bg-sky-300" />
         <Stat label="Review" value={counts.review} tone="bg-amber-300" />

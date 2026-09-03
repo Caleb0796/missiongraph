@@ -6,6 +6,7 @@ import {
   getCriticalPath,
   getDisplayState,
   isNonIdle,
+  isReadyUnassigned,
   isSplitParent,
   remainingPathWeight,
   wouldCreateCycle,
@@ -802,11 +803,7 @@ function digestData() {
       delay_impact_min: item.delayImpactMin,
     }))
   const ready = activeNodes
-    .filter(
-      (current) =>
-        getDisplayState(current, state.nodes, state.edges) === 'ready' &&
-        !(current as TaskNode & { assigned?: boolean }).assigned,
-    )
+    .filter((current) => isReadyUnassigned(current, state.nodes, state.edges))
     .map((current) => ({
       id: current.id,
       title: current.title,
@@ -818,7 +815,7 @@ function digestData() {
         left.id.localeCompare(right.id),
     )
   return {
-    summary: `The graph has ${activeNodes.length} active tasks and ${state.nodes.length - activeNodes.length} split-parent history records; ${counts.running} are running, ${counts.review} await review, ${counts.failed} failed, and ${counts.done} are done.`,
+    summary: `The graph has ${activeNodes.length} active tasks and ${state.nodes.length - activeNodes.length} split-parent history records; ${counts.running} are running, ${counts.review} await review, ${counts.failed} failed, and ${counts.done} are done. ${ready.length} ${ready.length === 1 ? 'is' : 'are'} ready and unassigned.`,
     counts_by_state: counts,
     critical_path: {
       node_ids: critical.nodeIds,
@@ -829,6 +826,7 @@ function digestData() {
       id: current.id,
       title: current.title,
       state: getDisplayState(current, state.nodes, state.edges),
+      assigned: (current as TaskNode & { assigned?: boolean }).assigned ?? false,
     })),
     split_parents: state.nodes
       .filter(isSplitParent)
@@ -887,11 +885,7 @@ const listReady: ToolDefinition = {
     const state = useMissionStore.getState()
     const critical = currentCriticalPath()
     const ready = state.nodes
-      .filter(
-        (current) =>
-          getDisplayState(current, state.nodes, state.edges) === 'ready' &&
-          !(current as TaskNode & { assigned?: boolean }).assigned,
-      )
+      .filter((current) => isReadyUnassigned(current, state.nodes, state.edges))
       .map((current) => {
         const remainingPath = remainingPathWeight(
           current.id,

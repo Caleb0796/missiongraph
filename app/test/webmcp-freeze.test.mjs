@@ -26,6 +26,10 @@ const registrySource = readFileSync(
   new URL('../src/webmcp/registry.ts', import.meta.url),
   'utf8',
 )
+const pulseSource = readFileSync(
+  new URL('../src/components/PulseBar.tsx', import.meta.url),
+  'utf8',
+)
 
 const splitParent = {
   id: 'parent',
@@ -322,6 +326,39 @@ test('list_ready returns client-estimated path distance in live and fixture mode
     listReadySource,
     /live_fleet: listReadyLiveFleetSummary\(eligibleTitles\)/,
   )
+})
+
+test('graph_digest distinguishes complete state counts from ready-unassigned work', () => {
+  const digestStart = toolsSource.indexOf('function digestData()')
+  const digestSource = toolsSource.slice(
+    digestStart,
+    toolsSource.indexOf("name: 'graph_digest'", digestStart),
+  )
+  const listReadyStart = toolsSource.indexOf("name: 'list_ready'")
+  const listReadySource = toolsSource.slice(
+    listReadyStart,
+    toolsSource.indexOf("name: 'list_pending_approvals'", listReadyStart),
+  )
+
+  assert.match(
+    digestSource,
+    /counts\[display as keyof typeof counts\]\+\+/,
+  )
+  assert.doesNotMatch(digestSource, /display === 'ready' &&/)
+  assert.match(
+    digestSource,
+    /\.filter\(\(current\) => isReadyUnassigned\(current, state\.nodes, state\.edges\)\)/,
+  )
+  assert.match(
+    digestSource,
+    /assigned: \(current as TaskNode & \{ assigned\?: boolean \}\)\.assigned \?\? false/,
+  )
+  assert.match(digestSource, /\$\{ready\.length\}.*ready and unassigned\./)
+  assert.match(
+    listReadySource,
+    /\.filter\(\(current\) => isReadyUnassigned\(current, state\.nodes, state\.edges\)\)/,
+  )
+  assert.match(pulseSource, /<Stat label="Ready now" value=\{readyCount\}/)
 })
 
 test('dispatch and list_ready tell the agent which work can run on the live fleet', () => {
