@@ -592,12 +592,10 @@ a:focus-visible {
   position: absolute;
   inset: -3px;
   pointer-events: none;
-  border: 1px solid transparent;
-  border-top-color: #65deeb;
-  border-right-color: rgb(101 222 235 / 34%);
+  border: 1px solid rgb(101 222 235 / 34%);
   border-radius: 11px;
   content: "";
-  animation: running-ring 2.2s linear infinite;
+  animation: running-halo 2.2s ease-in-out infinite;
 }
 
 .mission-node--split-parent::after { display: none; }
@@ -930,7 +928,7 @@ a:focus-visible {
 .tool-console-error { margin: 8px 0 0; border: 1px solid #6e3944; border-radius: 6px; background: #29171d; padding: 8px; color: #efa8b3; font-size: 10.5px; line-height: 1.45; }
 .tool-console-output { min-height: 0; flex: 1; overflow: auto; margin: 0; border: 1px solid #223548; border-radius: 7px; background: #070e16; padding: 10px; color: #8fe0b9; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; line-height: 1.5; white-space: pre-wrap; }
 
-@keyframes running-ring { to { transform: rotate(360deg); } }
+@keyframes running-halo { 50% { border-color: rgb(101 222 235 / 58%); box-shadow: 0 0 14px rgb(101 222 235 / 18%); opacity: 0.78; } }
 @keyframes live-breathe { 50% { opacity: 0.45; transform: scale(0.82); } }
 @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
 @keyframes preview-pause { 50% { box-shadow: 0 0 0 5px rgb(242 100 117 / 18%), 0 0 40px rgb(242 100 117 / 30%); } }

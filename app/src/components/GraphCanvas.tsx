@@ -810,7 +810,7 @@ function MissionBoard() {
           deleteKeyCode={null}
           minZoom={0.25}
           maxZoom={1.7}
-          defaultEdgeOptions={{ zIndex: 1 }}
+          defaultEdgeOptions={{ zIndex: 0 }}
           proOptions={{ hideAttribution: true }}
           colorMode="dark"
         >

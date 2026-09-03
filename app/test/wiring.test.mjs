@@ -587,6 +587,34 @@ test('M5 visual wiring exposes blast radius, relayout, split ancestry, and pause
   assert.match(canvas, /setLayoutRetry\(\(current\) => current \+ 1\)/)
 })
 
+test('canvas edges stay behind cards and the running halo never rotates through them', async () => {
+  const canvas = await source('../src/components/GraphCanvas.tsx')
+  const styles = await source('../src/index.css')
+  const runningIndicator = styles.slice(
+    styles.indexOf('.mission-node--running::after'),
+    styles.indexOf('.mission-node--split-parent::after'),
+  )
+  const runningHalo = styles.slice(
+    styles.indexOf('@keyframes running-halo'),
+    styles.indexOf('@keyframes live-breathe'),
+  )
+
+  assert.match(canvas, /defaultEdgeOptions=\{\{ zIndex: 0 \}\}/)
+  assert.match(
+    runningIndicator,
+    /animation: running-halo 2\.2s ease-in-out infinite;/,
+  )
+  assert.doesNotMatch(runningIndicator, /rotate|running-ring/)
+  assert.match(runningHalo, /@keyframes running-halo/)
+  assert.match(runningHalo, /50% \{[^}]*box-shadow:/)
+  assert.doesNotMatch(runningHalo, /rotate/)
+  assert.doesNotMatch(styles, /@keyframes running-ring/)
+  assert.match(
+    styles,
+    /@media \(prefers-reduced-motion: reduce\) \{[\s\S]*animation-duration: 0\.01ms !important;/,
+  )
+})
+
 test('canvas gates first paint and replays changes with visible cancellable pacing', async () => {
   const canvas = await source('../src/components/GraphCanvas.tsx')
   const pulse = await source('../src/components/PulseBar.tsx')
